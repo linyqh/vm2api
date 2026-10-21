@@ -557,7 +557,7 @@ test('native Google terminal signature events complete successfully through all 
       { models: ['native-model'] },
       {
         readToken: () => ({ access_token: 'test-token', expiry: '2999-01-01T00:00:00Z' }),
-        fetchLicense: async () => 'test-tier',
+        loadProject: async () => 'test-project',
         fetch: async () =>
           new Response(
             [
@@ -579,7 +579,7 @@ test('native Google terminal signature events complete successfully through all 
                 },
               },
             ]
-              .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+              .map((event) => `data: ${JSON.stringify({ response: event })}\n\n`)
               .join(''),
             { headers: { 'content-type': 'text/event-stream' } },
           ),
@@ -626,9 +626,9 @@ test('native function-call signatures replay through Chat into a matching native
     { models: ['native-model'] },
     {
       readToken: () => ({ access_token: 'test-token', expiry: '2999-01-01T00:00:00Z' }),
-      fetchLicense: async () => 'test-tier',
+      loadProject: async () => 'test-project',
       fetch: async (_url, options) => {
-        nativeRequests.push(JSON.parse(options.body))
+        nativeRequests.push(JSON.parse(options.body).request)
         turn++
         const parts =
           turn === 1
@@ -640,7 +640,7 @@ test('native function-call signatures replay through Chat into a matching native
               ]
             : [{ text: '18C' }]
         return new Response(
-          `data: ${JSON.stringify({ candidates: [{ index: 0, content: { role: 'model', parts }, finishReason: 'STOP' }], usageMetadata: { promptTokenCount: 2, candidatesTokenCount: 1, totalTokenCount: 3 } })}\n\n`,
+          `data: ${JSON.stringify({ response: { candidates: [{ index: 0, content: { role: 'model', parts }, finishReason: 'STOP' }], usageMetadata: { promptTokenCount: 2, candidatesTokenCount: 1, totalTokenCount: 3 } } })}\n\n`,
         )
       },
     },

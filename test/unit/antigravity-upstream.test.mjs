@@ -3,7 +3,6 @@ import assert from 'node:assert/strict'
 import {
   antigravityNativeRequest,
   antigravityNativeUsage,
-  antigravityLicenseTier,
   createAntigravityUpstream,
 } from '../../scripts/antigravity-upstream.mjs'
 import { startAntigravityBridge } from '../../scripts/antigravity-bridge.mjs'
@@ -23,7 +22,7 @@ const basic = {
 const token = { access_token: 'PRIVATE_TOKEN_TEST', expiry: new Date(Date.now() + 3600000).toISOString() }
 const config = { models: [basic.model], timeout_ms: 1000 }
 function sse(chunks, { split = false } = {}) {
-  const bytes = Buffer.from(chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\r\n\r\n`).join(''))
+  const bytes = Buffer.from(chunks.map((chunk) => `data: ${JSON.stringify({ response: chunk })}\r\n\r\n`).join(''))
   return new Response(
     new ReadableStream({
       start(controller) {
@@ -38,7 +37,7 @@ function sse(chunks, { split = false } = {}) {
 function upstream(fetchImpl, extra = {}) {
   return createAntigravityUpstream(config, {
     readToken: () => token,
-    fetchLicense: async () => 'account-tier',
+    loadProject: async () => 'account-project',
     fetch: fetchImpl,
     ...extra,
   })
@@ -48,47 +47,49 @@ const result = (parts, finishReason) => ({
 })
 
 test('native request preserves structured roles, system, JSON schema, tool IDs, signatures and inline images', () => {
-  const body = antigravityNativeRequest(
-    {
-      ...basic,
-      tools: [
-        {
-          name: 'lookup',
-          description: 'Lookup',
-          input_schema: { type: 'object', properties: { city: { type: 'string' } } },
-        },
-      ],
-      tool_choice: { type: 'tool', name: 'lookup' },
-      max_tokens: 80,
-      response_format: { type: 'json_schema', schema: { type: 'object' } },
-      messages: [
-        basic.messages[0],
-        {
-          role: 'assistant',
-          content: [
-            { type: 'thinking', thinking: 'thinking', signature: 'aQ==' },
-            { type: 'tool_use', id: 'call-real', name: 'lookup', input: { city: '上海' }, thought_signature: 'c2ln' },
-          ],
-        },
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'tool_result',
-              tool_use_id: 'call-real',
-              content: [
-                { type: 'text', text: '22C' },
-                { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'aQ==' } },
-              ],
-            },
-          ],
-        },
-      ],
-    },
-    'paid-tier',
-  )
-  assert.deepEqual(body.aicode, { experience: basic.model })
-  assert.deepEqual(body.entitlement, { userTier: 'paid-tier' })
+  const body = antigravityNativeRequest({
+    ...basic,
+    tools: [
+      {
+        name: 'lookup',
+        description: 'Lookup',
+        input_schema: { type: 'object', properties: { city: { type: 'string' } } },
+      },
+    ],
+    tool_choice: { type: 'tool', name: 'lookup' },
+    max_tokens: 80,
+    response_format: { type: 'json_schema', schema: { type: 'object' } },
+    messages: [
+      basic.messages[0],
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: 'thinking', signature: 'aQ==' },
+          { type: 'tool_use', id: 'call-real', name: 'lookup', input: { city: '上海' }, thought_signature: 'c2ln' },
+        ],
+      },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'call-real',
+            content: [
+              { type: 'text', text: '22C' },
+              { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'aQ==' } },
+            ],
+          },
+        ],
+      },
+    ],
+  })
+  assert.deepEqual(Object.keys(body).sort(), [
+    'contents',
+    'generationConfig',
+    'systemInstruction',
+    'toolConfig',
+    'tools',
+  ])
   assert.deepEqual(body.systemInstruction, { parts: [{ text: 'system' }] })
   assert.equal(body.contents[1].role, 'model')
   assert.deepEqual(body.contents[1].parts[1], {
@@ -158,15 +159,6 @@ test('usage counts cache once and includes reasoning in output tokens', () => {
   )
 })
 
-test('FetchLicenses protobuf reads entitlement without scraping arbitrary strings', () => {
-  const license = Buffer.from([10, 9, ...Buffer.from('paid-tier')])
-  const message = Buffer.from([10, license.length, ...license])
-  const header = Buffer.alloc(5)
-  header.writeUInt32BE(message.length, 1)
-  assert.equal(antigravityLicenseTier(Buffer.concat([header, message])), 'paid-tier')
-  assert.throws(() => antigravityLicenseTier(Buffer.from([0, 0, 0, 0, 9])))
-})
-
 test('byte-split SSE preserves UTF8, terminal thought signature and exact native payload', async () => {
   let call
   const events = []
@@ -185,9 +177,15 @@ test('byte-split SSE preserves UTF8, terminal thought signature and exact native
   })
   const response = await provider.infer(basic, { onEvent: (event) => events.push(event) })
   assert.equal(response.ok, true)
-  assert.equal(call.url, 'https://aicode.googleapis.com/v1alpha:streamGenerateContent?alt=sse')
+  assert.equal(call.url, 'https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse')
   assert.equal(call.options.redirect, 'error')
-  assert.equal(JSON.parse(call.options.body).aicode.experience, basic.model)
+  assert.match(call.options.headers['user-agent'], /^antigravity\/cli\/1\.4\.4 /)
+  const envelope = JSON.parse(call.options.body)
+  assert.equal(envelope.project, 'account-project')
+  assert.equal(envelope.model, basic.model)
+  assert.equal(envelope.requestType, 'agent')
+  assert.match(envelope.requestId, /^agent\//)
+  assert.deepEqual(envelope.request.contents, [{ role: 'user', parts: [{ text: 'hello' }] }])
   assert.deepEqual(response.content, [{ type: 'text', text: '你好', thought_signature: 'opaque-signature' }])
   assert.equal(response.stop_reason, 'end_turn')
   assert.equal(response.terminalState, 'verified')
@@ -255,6 +253,33 @@ test('401 refresh uses official CLI ownership and retries once without exposing 
   const failed = await upstream(async () => new Response(token.access_token, { status: 403 })).infer(basic)
   assert.equal(failed.status, 403)
   assert.equal(JSON.stringify(failed).includes(token.access_token), false)
+})
+
+test('Cloud Code project comes from loadCodeAssist once per token and missing projects fail closed', async () => {
+  const seen = []
+  const provider = createAntigravityUpstream(config, {
+    readToken: () => token,
+    fetch: async (url, options) => {
+      seen.push(new URL(url).pathname)
+      if (url.endsWith(':loadCodeAssist')) return Response.json({ cloudaicompanionProject: 'aicode-consumers' })
+      assert.equal(JSON.parse(options.body).project, 'aicode-consumers')
+      return sse([result([{ text: 'OK' }], 'STOP')])
+    },
+  })
+  assert.equal((await provider.infer(basic)).ok, true)
+  assert.equal((await provider.infer(basic)).ok, true)
+  assert.deepEqual(seen, [
+    '/v1internal:loadCodeAssist',
+    '/v1internal:streamGenerateContent',
+    '/v1internal:streamGenerateContent',
+  ])
+  const missing = await createAntigravityUpstream(config, {
+    readToken: () => token,
+    fetch: async (url) =>
+      url.endsWith(':loadCodeAssist') ? Response.json({}) : assert.fail('inference must not run without a project'),
+  }).infer(basic)
+  assert.equal(missing.code, 'antigravity_project_unavailable')
+  assert.equal(missing.output_committed, false)
 })
 
 test('caller cancellation aborts upstream and frees slot capacity', async () => {

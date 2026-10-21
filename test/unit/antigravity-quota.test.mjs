@@ -37,7 +37,7 @@ function slotRoot(t, updatedAt = 'auth-1') {
   return root
 }
 
-test('quota summary refreshes an expired token once and falls back to daily when prod sheds load', async () => {
+test('quota summary refreshes an expired token once and falls back to prod when daily sheds load', async () => {
   let token = 'old'
   const calls = []
   const provider = createAntigravityUpstream(
@@ -50,16 +50,16 @@ test('quota summary refreshes an expired token once and falls back to daily when
       fetch: async (url, options) => {
         calls.push([new URL(url).host, options.headers.authorization, options.body])
         if (options.headers.authorization === 'Bearer old') return new Response('', { status: 401 })
-        if (url.startsWith('https://cloudcode-pa.')) return new Response('', { status: 429 })
+        if (url.startsWith('https://daily-cloudcode-pa.')) return new Response('', { status: 429 })
         return Response.json(summary)
       },
     },
   )
   assert.deepEqual(await provider.quota(), { ok: true, summary })
   assert.deepEqual(calls, [
-    ['cloudcode-pa.googleapis.com', 'Bearer old', '{}'],
-    ['cloudcode-pa.googleapis.com', 'Bearer new', '{}'],
+    ['daily-cloudcode-pa.googleapis.com', 'Bearer old', '{}'],
     ['daily-cloudcode-pa.googleapis.com', 'Bearer new', '{}'],
+    ['cloudcode-pa.googleapis.com', 'Bearer new', '{}'],
   ])
 })
 

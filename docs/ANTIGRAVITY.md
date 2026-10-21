@@ -84,6 +84,6 @@ OAuth 会话按操作者、槽位和所属用户隔离，有效期 30 分钟。�
 
 独立运行时通过槽位 Unix socket 与内部 token 接收请求。Linux 控制面默认提供自身 Node 可执行文件；控制面与槽位架构不同或 macOS 开发环境需设置 `KIN_ANTIGRAVITY_NODE_BIN` 为匹配槽位架构和系统库的 Linux Node。
 
-数据面依据官方 CLI 1.4.4 所带 `google.gca.aicode` 协议访问固定的官方 `aicode.googleapis.com` 服务。OAuth 凭证的读取与请求均在槽位内，官方 `agy models` 负责刷新凭证；控制面只接收结构化内容与用量。上游协议变更需要同步更新适配器。
+数据面与官方 CLI 1.4.4 的实际流量一致：推理请求发往 `daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent`，外层为 `{project, requestId, model, userAgent, requestType, request}`，`request` 为 Gemini GenerateContent 结构；`project` 取自同一服务 `loadCodeAssist` 返回的 `cloudaicompanionProject`，并按 token 缓存。请求使用官方 CLI 的 User-Agent，其他客户端标识会被上游拒绝（HTTP 404）。旧的 `aicode.googleapis.com` experience 接口不提供 Gemini 4 Argon，已不再使用。OAuth 凭证的读取与请求均在槽位内，官方 `agy models` 负责刷新凭证；控制面只接收结构化内容与用量。上游协议变更需要同步更新适配器。
 
 测试覆盖请求与流式事件转换、模型目录安全存储、管理员/owner 权限、密钥与账号池隔离、并发及队列、失败切换、取消、usage 和 Responses 续接缓存。生产启用前还需用真实账号验证目标模型的官方上游行为。Claude 的自动凭证刷新、配额探测、定时测试及遥测策略不套用到 Antigravity。

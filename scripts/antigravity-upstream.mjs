@@ -1,17 +1,19 @@
 /** Slot-local adapter for the official Antigravity 1.4.4 subscription service.
- * Protocol provenance: shipped google.gca.aicode prediction/management descriptors;
- * the public service uses v1alpha. OAuth tokens never leave this slot except as
- * Authorization to the fixed official origins. CLI `models` owns token refresh.
+ * Protocol provenance: the official CLI's observed Cloud Code v1internal traffic;
+ * the inner request is the Gemini GenerateContent schema. OAuth tokens never leave
+ * this slot except as Authorization to the fixed official origins. CLI `models` owns token refresh.
  */
 import fs from 'node:fs'
 import path from 'node:path'
-import http2 from 'node:http2'
 import crypto from 'node:crypto'
 import { execFile } from 'node:child_process'
 
-const ORIGIN = 'https://aicode.googleapis.com'
-// The official 1.4.4 client reads its usage summary from Cloud Code; daily serves when prod sheds load.
-const QUOTA_ORIGINS = ['https://cloudcode-pa.googleapis.com', 'https://daily-cloudcode-pa.googleapis.com']
+// Official CLI 1.4.4 sends every inference, quota and project lookup to Cloud Code; the
+// gateway rejects other client identities (HTTP 404), so the CLI's own UA is reproduced.
+const CODE_ASSIST = 'https://daily-cloudcode-pa.googleapis.com'
+const QUOTA_ORIGINS = [CODE_ASSIST, 'https://cloudcode-pa.googleapis.com']
+const USER_AGENT =
+  'antigravity/cli/1.4.4 (aidev_client; os_type=linux; arch=amd64; cl=1003595037; auth_method=consumer)'
 const MIME = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp'])
 export const ANTIGRAVITY_API_CAPABILITIES = Object.freeze({
   text: true,
@@ -49,7 +51,7 @@ function inlineImage(block) {
 }
 
 /** Keep native roles, tool IDs, schemas and multimodal parts intact. Never execute tools. */
-export function antigravityNativeRequest(request, userTier) {
+export function antigravityNativeRequest(request) {
   if (!request || typeof request !== 'object' || !/^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,199}$/.test(request.model || ''))
     reject('invalid_model', 'Invalid Antigravity model')
   if (!Array.isArray(request.messages) || !request.messages.length) reject('invalid_messages', 'Messages are required')
@@ -125,7 +127,7 @@ export function antigravityNativeRequest(request, userTier) {
     if (thinking.type === 'disabled') config.thinkingBudget = 0
     generationConfig.thinkingConfig = config
   }
-  const body = { aicode: { experience: request.model }, entitlement: { userTier }, contents, generationConfig }
+  const body = { contents, generationConfig }
   if (request.system?.length)
     body.systemInstruction = {
       parts: request.system.map((block) => {
@@ -181,106 +183,6 @@ export function antigravityNativeUsage(value) {
   }
 }
 
-// Only length-delimited fields are needed to read FetchLicensesResponse. Unknown
-// fields are skipped according to protobuf wire type rather than guessed strings.
-function protoFields(buffer) {
-  const fields = []
-  let i = 0
-  const integer = () => {
-    let n = 0,
-      shift = 0
-    for (let count = 0; count < 10; count++) {
-      if (i >= buffer.length) throw new Error('invalid protobuf')
-      const x = buffer[i++]
-      n += (x & 127) * 2 ** shift
-      if (!(x & 128)) return n
-      shift += 7
-    }
-    throw new Error('invalid protobuf')
-  }
-  while (i < buffer.length) {
-    const tag = integer(),
-      wire = tag & 7,
-      number = Math.floor(tag / 8)
-    if (!number) throw new Error('invalid protobuf')
-    if (wire === 2) {
-      const size = integer()
-      if (i + size > buffer.length) throw new Error('invalid protobuf')
-      fields.push([number, buffer.subarray(i, i + size)])
-      i += size
-    } else if (wire === 0) integer()
-    else if (wire === 1 || wire === 5) {
-      i += wire === 1 ? 8 : 4
-      if (i > buffer.length) throw new Error('invalid protobuf')
-    } else throw new Error('invalid protobuf')
-  }
-  return fields
-}
-export function antigravityLicenseTier(frame) {
-  if (frame.length < 5 || frame[0] !== 0 || frame.readUInt32BE(1) !== frame.length - 5)
-    throw new Error('invalid license response')
-  const licenses = protoFields(frame.subarray(5)).filter(([n]) => n === 1)
-  for (const [, license] of licenses) {
-    const tier = protoFields(license)
-      .find(([n]) => n === 1)?.[1]
-      .toString('utf8')
-    if (tier && /^[a-zA-Z0-9_.-]{1,100}$/.test(tier)) return tier
-  }
-  reject('antigravity_license_missing', 'No Antigravity subscription entitlement is available', 403)
-}
-function fetchLicense(token, signal) {
-  return new Promise((resolve, rejectPromise) => {
-    const client = http2.connect(ORIGIN)
-    let settled = false,
-      response = [],
-      bytes = 0,
-      status,
-      grpcStatus
-    const finish = (error, value) => {
-      if (settled) return
-      settled = true
-      signal?.removeEventListener('abort', abort)
-      stream.close()
-      client.destroy()
-      error ? rejectPromise(error) : resolve(value)
-    }
-    const stream = client.request({
-      ':method': 'POST',
-      ':path': '/google.gca.aicode.v1alpha.ManagementService/FetchLicenses',
-      authorization: `Bearer ${token}`,
-      'content-type': 'application/grpc',
-      te: 'trailers',
-      'user-agent': 'antigravity/1.4.4',
-    })
-    const abort = () => finish(Object.assign(new Error('Request cancelled'), { name: 'AbortError' }))
-    client.on('error', () => finish(new Error('license unavailable')))
-    stream.on('error', () => finish(new Error('license unavailable')))
-    stream.on('response', (headers) => {
-      status = headers[':status']
-      grpcStatus = headers['grpc-status']
-    })
-    stream.on('trailers', (headers) => {
-      grpcStatus = headers['grpc-status']
-    })
-    stream.on('data', (chunk) => {
-      bytes += chunk.length
-      if (bytes > 1024 * 1024) finish(new Error('license response too large'))
-      else response.push(chunk)
-    })
-    stream.on('end', () => {
-      if (status !== 200 || String(grpcStatus) !== '0')
-        return finish(Object.assign(new Error('license rejected'), { status: String(grpcStatus) === '16' ? 401 : 503 }))
-      try {
-        finish(null, antigravityLicenseTier(Buffer.concat(response)))
-      } catch (error) {
-        finish(error)
-      }
-    })
-    signal?.addEventListener('abort', abort, { once: true })
-    if (signal?.aborted) abort()
-    else stream.end(Buffer.alloc(5))
-  })
-}
 function cliRefresh(config, signal) {
   return new Promise((resolve, rejectPromise) => {
     const home = process.env.HOME || '/home/kincli'
@@ -296,6 +198,28 @@ function cliRefresh(config, signal) {
       },
       (error) => (error ? rejectPromise(new Error('official token refresh failed')) : resolve()),
     )
+  })
+}
+function loadProject(token, fetchImpl, signal) {
+  return fetchImpl(`${CODE_ASSIST}/v1internal:loadCodeAssist`, {
+    method: 'POST',
+    redirect: 'error',
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', 'user-agent': USER_AGENT },
+    body: JSON.stringify({ metadata: { ideType: 'ANTIGRAVITY' } }),
+    signal,
+  }).then(async (response) => {
+    if (!response.ok) {
+      await response.body?.cancel()
+      reject(
+        response.status === 401 ? 'antigravity_auth_expired' : 'antigravity_project_unavailable',
+        `Antigravity project lookup returned HTTP ${response.status}`,
+        response.status === 401 ? 401 : 503,
+      )
+    }
+    const project = (await response.json())?.cloudaicompanionProject
+    if (typeof project !== 'string' || !/^[a-z0-9][a-z0-9-]{0,99}$/.test(project))
+      reject('antigravity_project_unavailable', 'Antigravity account has no assigned project', 503)
+    return project
   })
 }
 function readToken() {
@@ -320,12 +244,12 @@ function readToken() {
 
 export function createAntigravityUpstream(config = {}, dependencies = {}) {
   const fetchImpl = dependencies.fetch || fetch
-  const licenses = dependencies.fetchLicense || fetchLicense
+  const projectOf = dependencies.loadProject || ((access, signal) => loadProject(access, fetchImpl, signal))
   const tokenReader = dependencies.readToken || readToken
   const refresh = dependencies.refresh || cliRefresh
   let refreshWork,
-    tierCache,
-    tierToken,
+    projectCache,
+    projectToken,
     active = new Set(),
     closed = false
   async function token(signal, force = false) {
@@ -338,7 +262,7 @@ export function createAntigravityUpstream(config = {}, dependencies = {}) {
     if (force || !Number.isFinite(Date.parse(value.expiry)) || Date.parse(value.expiry) <= Date.now() + 60_000) {
       refreshWork ||= refresh(config, signal).finally(() => {
         refreshWork = null
-        tierCache = null
+        projectCache = null
       })
       await refreshWork
       value = tokenReader()
@@ -439,26 +363,33 @@ export function createAntigravityUpstream(config = {}, dependencies = {}) {
           .map((row) => (typeof row === 'string' ? row : row.id))
         if (!allowed.includes(request?.model)) reject('model_not_supported', 'Antigravity model is not enabled', 404)
         // Validate all caller-controlled inputs before touching credentials/network.
-        antigravityNativeRequest(request, 'pending')
+        antigravityNativeRequest(request)
         active.add(controller)
         if (signal?.aborted) abort()
         if (controller.signal.aborted) throw Object.assign(new Error('cancelled'), { name: 'AbortError' })
         let access = await token(controller.signal)
-        const tier = tierToken === access && tierCache ? tierCache : await licenses(access, controller.signal)
-        tierCache = tier
-        tierToken = access
-        const body = antigravityNativeRequest(request, tier)
-        const headers = () => ({
-          authorization: `Bearer ${access}`,
-          'content-type': 'application/json',
-          'user-agent': 'antigravity/1.4.4',
-        })
+        const project =
+          projectToken === access && projectCache ? projectCache : await projectOf(access, controller.signal)
+        projectCache = project
+        projectToken = access
+        const native = antigravityNativeRequest(request)
         const send = () =>
-          fetchImpl(`${ORIGIN}/v1alpha:streamGenerateContent?alt=sse`, {
+          fetchImpl(`${CODE_ASSIST}/v1internal:streamGenerateContent?alt=sse`, {
             method: 'POST',
             redirect: 'error',
-            headers: headers(),
-            body: JSON.stringify(body),
+            headers: {
+              authorization: `Bearer ${access}`,
+              'content-type': 'application/json',
+              'user-agent': USER_AGENT,
+            },
+            body: JSON.stringify({
+              project,
+              requestId: `agent/${crypto.randomUUID()}`,
+              model: request.model,
+              userAgent: 'antigravity',
+              requestType: 'agent',
+              request: native,
+            }),
             signal: controller.signal,
           })
         let response = await send()
@@ -488,8 +419,10 @@ export function createAntigravityUpstream(config = {}, dependencies = {}) {
             .map((line) => line.slice(5).trimStart())
             .join('\n')
           if (!data.trim() || data === '[DONE]') return
-          const chunk = JSON.parse(data)
-          if (chunk.error) throw new Error('upstream stream error')
+          const frame = JSON.parse(data)
+          if (frame.error || !frame.response || typeof frame.response !== 'object')
+            throw new Error('upstream stream error')
+          const chunk = frame.response
           if (chunk.usageMetadata) usage = antigravityNativeUsage(chunk.usageMetadata)
           if (chunk.promptFeedback?.blockReason)
             reject('antigravity_content_blocked', 'Antigravity rejected this request', 400)
@@ -576,7 +509,7 @@ export function createAntigravityUpstream(config = {}, dependencies = {}) {
               headers: {
                 authorization: `Bearer ${access}`,
                 'content-type': 'application/json',
-                'user-agent': 'antigravity/1.4.4',
+                'user-agent': USER_AGENT,
               },
               body: '{}',
               signal: controller.signal,

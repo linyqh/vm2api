@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- 修复 Antigravity 调用 `gemini-4-argon-*` 返回 `Antigravity service returned HTTP 404`。适配器原先走 `aicode.googleapis.com` 的 experience 接口，该接口不提供 Argon；现改为与官方 CLI 1.4.4 相同的 Cloud Code `v1internal:streamGenerateContent` 外层与 User-Agent，`project` 取自 `loadCodeAssist`。所有账号模型（Gemini 4 Argon、Gemini 3.8、Claude、GPT-OSS）的文本、工具往返、图片与推理均已实测通过。额度查询改为先请求 daily 端点。
 - Antigravity 槽位显示账号额度。数据来自官方 CLI `/usage` 所用的 `retrieveUserQuotaSummary`，按模型组列出 5 小时与周窗口的剩余比例和重置倒计时，显示在机架卡片、列表和槽位详情中。平台启用后每 10 分钟刷新一次，也可手动刷新（`POST /api/panel/vms/:id/antigravity/quota/refresh`）；失败时保留上次有效额度并标出原因。
 
 已部署机升级：更新 Node 控制面与 `web/dist`，重启一次 Node，并重启各 Antigravity 槽位以加载新的 bridge 脚本。快照写入 `data/antigravity-quota/`；无迁移、无新依赖。
