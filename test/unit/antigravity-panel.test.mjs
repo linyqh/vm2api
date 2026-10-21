@@ -6,6 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { EventEmitter } from 'node:events'
 import { createPanelHandler } from '../../src/lib/admin/panel-routes.mjs'
+import { createRoutingRuntime } from '../../src/lib/admin/routing-runtime.mjs'
 import { prepareAntigravityChat, scopeAntigravitySession } from '../../src/lib/admin/antigravity-panel.mjs'
 import { buildVmDetail } from '../../src/lib/admin/panel-api.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
@@ -54,6 +55,97 @@ function harness(project, who, body, extra = {}) {
     },
   }
 }
+
+test('routing GET exposes Antigravity defaults and only normalized public configuration', async (t) => {
+  const project = fixture(t)
+  const defaults = {
+    enabled: false,
+    cli_bin: 'agy',
+    models: [],
+    max_sessions: 1,
+    idle_ttl_seconds: 600,
+    timeout_ms: 180000,
+  }
+  const h = harness(
+    project,
+    admin,
+    {},
+    {
+      routingConfig: {},
+      stickyRouter: { stats: () => ({}) },
+    },
+  )
+  await h.call('GET', 'routing')
+  assert.equal(h.response.status, 200)
+  assert.deepEqual(h.response.body.data.antigravity, defaults)
+
+  const configured = harness(
+    project,
+    admin,
+    {},
+    {
+      routingConfig: {
+        antigravity: {
+          enabled: true,
+          models: ['antigravity/gemini-example'],
+          token: 'private-cli-token',
+          keyring: { password: 'private-keyring-password' },
+        },
+      },
+      stickyRouter: { stats: () => ({}) },
+    },
+  )
+  await configured.call('GET', 'routing')
+  assert.equal(configured.response.status, 200)
+  assert.deepEqual(configured.response.body.data.antigravity, {
+    ...defaults,
+    enabled: true,
+    models: [{ id: 'gemini-example', display_name: 'gemini-example', vendor: null, enabled: true }],
+  })
+  assert.doesNotMatch(JSON.stringify(configured.response.body), /private-cli-token|private-keyring-password/)
+})
+
+test('routing PUT persists Antigravity settings and GET returns them for the settings panel', async (t) => {
+  const project = fixture(t)
+  const routingConfigPath = path.join(project, 'routing.json')
+  const routingConfig = {}
+  const stickyRouter = { stats: () => ({}), reloadConfig() {} }
+  const runtime = createRoutingRuntime({
+    cfg: { paths: { project } },
+    routingConfigPath,
+    routingConfig,
+    stickyRouter,
+    accountQuota: { reloadConfig() {}, applyTierConcurrency() {}, applyTierRpm() {} },
+  })
+  const expected = {
+    enabled: true,
+    cli_bin: '/home/kincli/.local/bin/agy',
+    models: [{ id: 'gemini-example', display_name: 'Gemini example', vendor: 'google', enabled: true }],
+    max_sessions: 3,
+    idle_ttl_seconds: 900,
+    timeout_ms: 240000,
+  }
+  const h = harness(
+    project,
+    admin,
+    { antigravity: { ...expected, token: 'private-cli-token' } },
+    {
+      cfg: { paths: { project }, limits: { max_body_bytes: 4096 } },
+      routingConfig,
+      stickyRouter,
+      persistRoutingPatch: runtime.persistRoutingPatch,
+    },
+  )
+  await h.call('PUT', 'routing')
+  assert.equal(h.response.status, 200, JSON.stringify(h.response.body))
+  assert.deepEqual(h.response.body.data.antigravity, expected)
+  assert.deepEqual(JSON.parse(fs.readFileSync(routingConfigPath, 'utf8')).antigravity, expected)
+
+  await h.call('GET', 'routing')
+  assert.equal(h.response.status, 200)
+  assert.deepEqual(h.response.body.data.antigravity, expected)
+  assert.doesNotMatch(JSON.stringify(h.response.body), /private-cli-token/)
+})
 
 test('experimental input rejects history, tools, disallowed models and invalid session ids', () => {
   const good = { model: 'antigravity/gemini-example', prompt: 'hello' }
