@@ -498,6 +498,13 @@ export const VmBlade = memo(function VmBlade({
           <BladeCallout vm={vm} accounts={accounts} state={state} />
           <QuotaRow vm={vm} now={now} />
         </div>
+      ) : state === 'official' ? (
+        <div className='grid min-w-0 content-start gap-1.5'>
+          {vm.antigravity_quota?.groups.length ? null : (
+            <BladeCallout vm={vm} accounts={accounts} state={state} />
+          )}
+          <VmUsageWindows vm={vm} now={now} quiet quotaActions />
+        </div>
       ) : (
         <BladeCallout vm={vm} accounts={accounts} state={state} />
       )}

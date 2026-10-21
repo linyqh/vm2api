@@ -93,6 +93,7 @@ import { normalizeCredentialMode } from './lib/oauth/credential-mode.mjs'
 import { ensureWorkerCredential } from './lib/transport/go-worker-client.mjs'
 import { stopAllAntigravityBridges } from './lib/transport/antigravity-bridge-supervisor.mjs'
 import { stopAllAntigravityAuthLogins } from './lib/oauth/antigravity-auth-login.mjs'
+import { createAntigravityQuotaMonitor } from './lib/oauth/antigravity-quota.mjs'
 import { isClaudeVm } from './lib/vm/vm-kind.mjs'
 import { stopAllRustKernels } from './lib/transport/rust-kernel-supervisor.mjs'
 import { createRespond, parseRequestUrl } from './lib/http/respond.mjs'
@@ -177,6 +178,7 @@ let cliNodeGuard = null
 let usageProbeMonitor = null
 let catalogMonitor = null
 let notifyMonitor = null
+let antigravityQuotaMonitor = null
 
 let routingConfig = {}
 
@@ -517,6 +519,12 @@ kernelWatchdog = createKernelWatchdog({
       subject: `KIN · ${title}`,
     }).catch((error) => console.warn('[kernel-watchdog] notify failed', error?.message || error))
   },
+})
+
+antigravityQuotaMonitor = createAntigravityQuotaMonitor({
+  projectRoot: cfg.paths.project,
+  listTargets: () => listVms(cfg.paths.project),
+  getRouting: () => routingConfig,
 })
 
 usageProbeMonitor = createUsageProbeMonitor({
@@ -1272,6 +1280,9 @@ async function shutdown(signal) {
     usageProbeMonitor?.stop?.()
   } catch {}
   try {
+    antigravityQuotaMonitor?.stop?.()
+  } catch {}
+  try {
     catalogMonitor?.stop?.()
   } catch {}
 
@@ -1341,6 +1352,11 @@ server.listen(cfg.port, cfg.host, () => {
   }
   // The KIN_CRS_MOCK harness promises no outbound network; catalogs stay on builtin data there.
   if (process.env.KIN_CRS_MOCK !== '1') {
+    try {
+      antigravityQuotaMonitor?.start?.({ immediate: true })
+    } catch (e) {
+      console.warn('[antigravity-quota] start failed', e?.message || e)
+    }
     try {
       catalogMonitor?.start?.()
     } catch (e) {

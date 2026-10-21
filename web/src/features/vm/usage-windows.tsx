@@ -10,6 +10,7 @@ import { cn } from '@/lib/utils'
 import { isAntigravityVm, isCodexVm } from '@/lib/vm-kind'
 import { vmCostLedger } from '@/lib/vm-usage'
 import { useNow } from '@/hooks/use-now'
+import { AntigravityQuotaWindows } from '@/features/vm/antigravity-quota'
 import { ClaudeResetActions } from '@/features/vm/claude-reset-actions'
 import { OpenaiQuotaActions } from '@/features/vm/openai-quota-actions'
 import { riskFg, UsageMeter } from '@/features/vm/usage-meter'
@@ -120,9 +121,13 @@ export function VmUsageWindows({
 }) {
   if (isAntigravityVm(vm))
     return (
-      <p className={cn('text-xs text-muted-foreground', className)}>
-        Antigravity 模型配额尚未同步
-      </p>
+      <AntigravityQuotaWindows
+        vm={vm}
+        now={now}
+        quiet={quiet}
+        actions={quotaActions}
+        className={className}
+      />
     )
   const hasToken = Boolean(vm.has_token)
   return (

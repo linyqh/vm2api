@@ -59,7 +59,8 @@ OAuth 会话按操作者、槽位和所属用户隔离，有效期 30 分钟。�
 
 | 方法与路径 | 用途 |
 | --- | --- |
-| `GET /api/panel/vms/:id/antigravity/status` | 只读状态；返回认证状态、平台开关和账号模型目录 |
+| `GET /api/panel/vms/:id/antigravity/status` | 只读状态；返回认证状态、平台开关、账号模型目录和最近一次额度快照 `quota` |
+| `POST /api/panel/vms/:id/antigravity/quota/refresh` | 立即查询账号额度，返回分组与窗口剩余比例 |
 | `POST /api/panel/vms/:id/antigravity/oauth/start` | 创建 OAuth 会话，通过轮询取得授权链接 |
 | `GET /api/panel/vms/:id/antigravity/oauth/session?session_id=...` | 读取本人的 OAuth 会话状态 |
 | `POST /api/panel/vms/:id/antigravity/oauth/complete` | 提交 `{session_id,code}` 给官方客户端 |
@@ -72,6 +73,12 @@ OAuth 会话按操作者、槽位和所属用户隔离，有效期 30 分钟。�
 响应使用 `{ok:true,data:{...}}` 或 `{ok:false,error:{code,message}}`。`authenticated: null` 表示尚未确认登录；`ready` 只表示运行时健康，不能证明真实推理已经成功。
 
 面板文本会话模型在会话内固定，进程上下文不跨运行时重启持久化。修改运行时配置后按提示重启对应槽位以应用；平台关闭仍允许清理旧会话。
+
+### 账号额度
+
+额度来自官方 CLI 1.4.4 `/usage` 所用的 `cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary`（prod 返回 429/5xx 时改用 daily），请求和 token 刷新均在槽位内完成，不消耗推理额度。返回按模型组划分（如 Gemini、Claude 与 GPT、单模型周限额），每组含 5 小时或周窗口的剩余比例与重置时间。面板显示剩余百分比，不换算为 Claude 的已用比例。
+
+平台接入启用后，控制面每 10 分钟刷新已授权槽位，账号页和槽位卡片也可手动刷新。快照保存在 `data/antigravity-quota/<slot-id>.json`（目录 700、文件 600），只含分组名、窗口、剩余比例和重置时间，与所属用户、授权版本绑定；更换账号或所属用户后旧额度不再显示。查询失败保留上次有效额度并显示失败原因。额度仅用于展示，不参与调度。新增运行时接口后需重启槽位，使 bridge 加载新脚本。
 
 ## 运行时与验证
 

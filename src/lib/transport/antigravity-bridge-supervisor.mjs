@@ -267,6 +267,12 @@ export async function runAntigravityInference({
   })
 }
 
+export async function fetchAntigravityQuota({ projectRoot, vm, routing = {}, ops = {} } = {}) {
+  const started = await (ops.ensureBridge || ensureAntigravityBridge)({ projectRoot, vm, routing, ops })
+  if (!started.ok) return started
+  return await (ops.callBridge || callAntigravityBridge)({ projectRoot, vm, requestPath: '/quota', timeoutMs: 25_000 })
+}
+
 export async function stopAntigravityBridge(projectRoot, vm) {
   const key = keyOf(projectRoot, vm)
   if (!tracked.has(key)) return { ok: true, skipped: true }

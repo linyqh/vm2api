@@ -394,6 +394,17 @@ export async function startAntigravityBridge(
       })
       return
     }
+    if (req.method === 'GET' && req.url === '/quota') {
+      const controller = new AbortController()
+      const disconnect = () => {
+        if (!res.writableEnded) controller.abort()
+      }
+      res.once('close', disconnect)
+      const result = await upstream.quota({ signal: controller.signal })
+      res.off('close', disconnect)
+      if (!res.destroyed) json(result.ok ? 200 : result.status || 502, result)
+      return
+    }
     if (req.method !== 'POST' || !['/text', '/inference', '/close-session'].includes(req.url))
       return json(404, failure(404, 'not_found', 'Not found'))
     let body = ''

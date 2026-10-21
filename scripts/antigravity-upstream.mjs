@@ -1,7 +1,7 @@
 /** Slot-local adapter for the official Antigravity 1.4.4 subscription service.
  * Protocol provenance: shipped google.gca.aicode prediction/management descriptors;
  * the public service uses v1alpha. OAuth tokens never leave this slot except as
- * Authorization to the fixed official origin. CLI `models` owns token refresh.
+ * Authorization to the fixed official origins. CLI `models` owns token refresh.
  */
 import fs from 'node:fs'
 import path from 'node:path'
@@ -10,6 +10,8 @@ import crypto from 'node:crypto'
 import { execFile } from 'node:child_process'
 
 const ORIGIN = 'https://aicode.googleapis.com'
+// The official 1.4.4 client reads its usage summary from Cloud Code; daily serves when prod sheds load.
+const QUOTA_ORIGINS = ['https://cloudcode-pa.googleapis.com', 'https://daily-cloudcode-pa.googleapis.com']
 const MIME = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp'])
 export const ANTIGRAVITY_API_CAPABILITIES = Object.freeze({
   text: true,
@@ -555,6 +557,71 @@ export function createAntigravityUpstream(config = {}, dependencies = {}) {
         clearTimeout(timer)
         signal?.removeEventListener('abort', abort)
         active.delete(controller)
+      }
+    },
+    async quota({ signal } = {}) {
+      const controller = new AbortController()
+      const abort = () => controller.abort()
+      signal?.addEventListener('abort', abort, { once: true })
+      const timer = setTimeout(abort, 20_000)
+      try {
+        if (closed) reject('antigravity_shutdown', 'Antigravity bridge is shutting down', 503)
+        let access = await token(controller.signal)
+        let response
+        for (const origin of QUOTA_ORIGINS) {
+          const send = () =>
+            fetchImpl(`${origin}/v1internal:retrieveUserQuotaSummary`, {
+              method: 'POST',
+              redirect: 'error',
+              headers: {
+                authorization: `Bearer ${access}`,
+                'content-type': 'application/json',
+                'user-agent': 'antigravity/1.4.4',
+              },
+              body: '{}',
+              signal: controller.signal,
+            })
+          response = await send()
+          if (response.status === 401) {
+            await response.body?.cancel()
+            access = await token(controller.signal, true)
+            response = await send()
+          }
+          if (response.status !== 429 && response.status < 500) break
+          await response.body?.cancel()
+        }
+        if (!response.ok) {
+          await response.body?.cancel()
+          reject(
+            response.status === 401
+              ? 'antigravity_auth_expired'
+              : response.status === 429
+                ? 'antigravity_rate_limited'
+                : 'antigravity_upstream_error',
+            `Antigravity quota service returned HTTP ${response.status}`,
+            response.status,
+          )
+        }
+        const text = await response.text()
+        if (Buffer.byteLength(text) > 1024 * 1024) throw new Error('quota response too large')
+        const summary = JSON.parse(text)
+        if (!summary || typeof summary !== 'object' || Array.isArray(summary)) throw new Error('invalid quota summary')
+        return { ok: true, summary }
+      } catch (error) {
+        const cancelled = signal?.aborted || closed
+        return {
+          ok: false,
+          status: cancelled ? 499 : error.status || 502,
+          code: cancelled ? 'client_cancelled' : error.code || 'antigravity_quota_invalid',
+          message: error.status
+            ? error.message
+            : cancelled
+              ? 'Request cancelled'
+              : 'Antigravity did not return a valid quota summary',
+        }
+      } finally {
+        clearTimeout(timer)
+        signal?.removeEventListener('abort', abort)
       }
     },
   }

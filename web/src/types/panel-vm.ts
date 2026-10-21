@@ -188,6 +188,30 @@ export type VmPhysicalFeatures = {
   runtimes?: string | null
 }
 
+export type AntigravityQuotaBucket = {
+  id: string | null
+  name: string | null
+  description: string | null
+  /** 例如 `5h`、`7d`、`weekly`，由官方返回。 */
+  window: string | null
+  /** 剩余比例 0–1。 */
+  remaining: number | null
+  remaining_amount: number | null
+  disabled: boolean
+  reset_at: string | null
+}
+
+export type AntigravityQuota = {
+  updated_at: string | null
+  description: string | null
+  groups: {
+    name: string | null
+    description: string | null
+    buckets: AntigravityQuotaBucket[]
+  }[]
+  error: { code: string; message: string; at: string } | null
+}
+
 export type Vm = {
   id: string
   name?: string
@@ -210,6 +234,7 @@ export type Vm = {
     updated_at?: string | number | null
     experimental?: boolean
   } | null
+  antigravity_quota?: AntigravityQuota | null
   cred_status?: string | { text?: string; key?: string; tone?: string }
   /**
    * 凭证类型的权威字段（`oauth` / `setup-token` / `official-setup-token` / `apikey`）。

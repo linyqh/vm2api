@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Antigravity 槽位显示账号额度。数据来自官方 CLI `/usage` 所用的 `retrieveUserQuotaSummary`，按模型组列出 5 小时与周窗口的剩余比例和重置倒计时，显示在机架卡片、列表和槽位详情中。平台启用后每 10 分钟刷新一次，也可手动刷新（`POST /api/panel/vms/:id/antigravity/quota/refresh`）；失败时保留上次有效额度并标出原因。
+
+已部署机升级：更新 Node 控制面与 `web/dist`，重启一次 Node，并重启各 Antigravity 槽位以加载新的 bridge 脚本。快照写入 `data/antigravity-quota/`；无迁移、无新依赖。
+
 ## 1.3.208 — 2026-10-21
 
 - 入站清除调用方缓存标记与旧 billing，按面板选中的 official / official_full / zero / custom 档组装提示词，不再强制完整档。固定 system 顺序为 billing、身份句、固定正文；保留 user 的 system-reminder，支持的模型把 Environment 放在消息尾部的 role=system，不支持的模型回落到顶层 system。

@@ -29,6 +29,7 @@ import {
 } from '@/lib/wrap-health'
 import { SlotIdentity } from '@/components/platform-chip'
 import { StatusMark } from '@/components/status-mark'
+import { AntigravityQuotaWindows } from '@/features/vm/antigravity-quota'
 import { ClaudeResetActions } from '@/features/vm/claude-reset-actions'
 import { CodexKernelHealthFields } from '@/features/vm/codex-kernel-health-card'
 import { dataplaneLabel } from '@/features/vm/dataplane-contract'
@@ -185,6 +186,12 @@ export function VmStatusBoard(props: Props) {
           支持 Messages、Chat Completions 与 Responses
           API；账号模型需在槽位测试页同步。
         </p>
+        <div className='max-w-md'>
+          <h3 className='mb-1.5 text-xs font-medium text-muted-foreground'>
+            账号额度
+          </h3>
+          <AntigravityQuotaWindows vm={vm} now={now} actions />
+        </div>
         <VmSchedulingBlock vm={vm} />
         <VmMemoryBlock vm={vm} />
       </section>

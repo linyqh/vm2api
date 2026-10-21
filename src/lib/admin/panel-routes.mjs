@@ -159,6 +159,7 @@ import {
   syncAntigravityModels,
   mergeAntigravityCatalogModels,
 } from '../oauth/antigravity-models.mjs'
+import { readAntigravityQuota, refreshAntigravityQuota } from '../oauth/antigravity-quota.mjs'
 import { closeAntigravityTextSession } from '../transport/antigravity-bridge-client.mjs'
 import { antigravityBridgeStatus, runAntigravityText } from '../transport/antigravity-bridge-supervisor.mjs'
 import {
@@ -1568,6 +1569,21 @@ export function createPanelHandler(ctx) {
         }
         return json(res, 200, panel.ok({ ...result, published_global: body.publish_global === true }))
       }
+      const agQuotaRoute = p.match(/^\/api\/panel\/vms\/([^/]+)\/antigravity\/quota\/refresh$/)
+      if (req.method === 'POST' && agQuotaRoute) {
+        const vm = isValidVmId(agQuotaRoute[1]) ? getVm(cfg.paths.project, agQuotaRoute[1]) : null
+        if (!vm) return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: '槽位不存在' } })
+        const result = await (ctx.refreshAntigravityQuota || refreshAntigravityQuota)({
+          projectRoot: cfg.paths.project,
+          vm,
+          routing: getRouting(),
+          ops: { getVm: () => getVm(cfg.paths.project, vm.id) },
+        })
+        if (!result.ok)
+          return json(res, result.status || 502, { ok: false, error: { code: result.code, message: result.message } })
+        const { ok: _ok, ...quota } = result
+        return json(res, 200, panel.ok(quota))
+      }
       const agRoute = p.match(/^\/api\/panel\/vms\/([^/]+)\/antigravity\/(status|chat|close)$/)
       if (
         agRoute &&
@@ -1598,6 +1614,7 @@ export function createPanelHandler(ctx) {
                 },
               }),
               model_catalog: readAntigravityModelCatalog(projectRoot, vm),
+              quota: readAntigravityQuota(projectRoot, vm),
             }),
           )
         }

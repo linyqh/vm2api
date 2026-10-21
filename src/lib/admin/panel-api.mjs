@@ -50,6 +50,7 @@ import { unitCircuit } from '../pool/unit-circuit.mjs'
 import { accountIdOf, normalizePoolRouting } from '../pool/pool-scheduler.mjs'
 import { codexMaxSessions } from '../pool/codex-slot-pool.mjs'
 import { antigravityPoolRuntime } from '../pool/antigravity-slot-pool.mjs'
+import { readAntigravityQuota } from '../oauth/antigravity-quota.mjs'
 import { resolveCredentialScheduleLevel } from '../pool/credential-weight.mjs'
 import { activeHoursZoneOf, evaluateActiveHours } from '../pool/active-hours.mjs'
 import {
@@ -1788,6 +1789,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
       inflight: runtime.inFlight,
       rpm: runtime.rpm,
       can_import_credential: proxy.can_import_credential && !v.node_id && runtimeKind(v) === 'docker',
+      antigravity_quota: extras.projectRoot ? readAntigravityQuota(extras.projectRoot, v) : null,
     }
   }
   if (extras.projectRoot && isLeftoverQuotaScheduleOff(v)) {
