@@ -150,8 +150,8 @@ test('a platform-scoped key cannot count tokens on the other platform and peeks 
 
 test('Antigravity count_tokens rejects before account selection while preserving key scope denials', async () => {
   for (const [model, group, expectedStatus, expectedCode] of [
-    ['antigravity/claude-test', 'all', 400, 'antigravity_experimental_text_only'],
-    ['antigravity/gpt-test', 'antigravity', 400, 'antigravity_experimental_text_only'],
+    ['antigravity/claude-test', 'all', 400, 'feature_not_supported'],
+    ['antigravity/gpt-test', 'antigravity', 400, 'feature_not_supported'],
     ['antigravity/claude-test', 'anthropic', 403, 'key_group_mismatch'],
     ['prefix/antigravity/claude-test', 'all', 400, 'model_not_supported'],
     ['antigravity//claude-test', 'all', 400, 'model_not_supported'],

@@ -8,7 +8,8 @@ import { EventEmitter } from 'node:events'
 import { createPanelHandler } from '../../src/lib/admin/panel-routes.mjs'
 import { createRoutingRuntime } from '../../src/lib/admin/routing-runtime.mjs'
 import { prepareAntigravityChat, scopeAntigravitySession } from '../../src/lib/admin/antigravity-panel.mjs'
-import { buildVmDetail } from '../../src/lib/admin/panel-api.mjs'
+import { buildVmDetail, buildVmList } from '../../src/lib/admin/panel-api.mjs'
+import { antigravityPoolRuntime } from '../../src/lib/pool/antigravity-slot-pool.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 
 const routing = { antigravity: { enabled: true, models: ['gemini-example'] } }
@@ -389,13 +390,71 @@ test('confirmed auth metadata is visible while text remains disabled', async (t)
   assert.equal(h.response.body.data.authenticated, true)
   assert.equal(h.response.body.data.enabled, false)
   assert.equal(h.response.body.data.ready, false)
-  const record = { ...vm, proxy: { id: 'px-test', host: '127.0.0.1', port: 1080 } }
+  const record = { ...vm, schedulable: false, proxy: { id: 'px-test', host: '127.0.0.1', port: 1080 } }
   fs.writeFileSync(path.join(project, 'vms', `${vm.id}.json`), JSON.stringify(record))
   const result = await buildVmDetail({ cfg: { paths: { project } }, id: vm.id, routingConfig: {} })
   assert.equal(result.data.vm.can_import_credential, true)
   assert.equal(result.data.vm.antigravity.authenticated, true)
   assert.equal(result.data.vm.has_token, false)
   assert.equal(result.data.vm.schedulable, false)
+})
+
+test('Antigravity panel list and detail preserve actual scheduling and independent model/concurrency policy', async (t) => {
+  const project = fixture(t)
+  const cfg = { paths: { project } }
+  const routingConfig = { antigravity: { enabled: true, max_sessions: 2, models: ['gemini-example'] } }
+  const record = {
+    ...vm,
+    status: 'running',
+    schedulable: true,
+    schedule_disabled_reason: 'antigravity_experimental_text_only',
+    policy: {
+      maxConcurrency: 3,
+      concurrencyOverride: true,
+      maxRpm: 12,
+      rpmOverride: true,
+      allowed_models: ['antigravity/gemini-example'],
+      weight: 7,
+    },
+  }
+  const vmPath = path.join(project, 'vms', vm.id + '.json')
+  fs.writeFileSync(vmPath, JSON.stringify(record))
+  const runDir = path.join(project, 'vms', vm.id, 'run')
+  fs.mkdirSync(runDir, { recursive: true })
+  const authPath = path.join(runDir, 'antigravity-auth.json')
+  fs.writeFileSync(authPath, JSON.stringify({ authenticated: true, updated_at: Date.now() }))
+  antigravityPoolRuntime.reset()
+  t.after(() => antigravityPoolRuntime.reset())
+  const lease = antigravityPoolRuntime.acquire(vm.id, { concurrency: 2 })
+  t.after(() => lease.release())
+  const listed = await buildVmList({ cfg, routingConfig })
+  const detail = await buildVmDetail({ cfg, id: vm.id, routingConfig })
+  for (const view of [listed.data.items[0], detail.data.vm]) {
+    assert.equal(view.schedulable, true)
+    assert.equal(view.schedule_disabled_reason, null)
+    assert.equal(view.antigravity.authenticated, true)
+    assert.equal(view.max_concurrency, 2)
+    assert.equal(view.max_sessions, 2)
+    assert.equal(view.max_rpm, 12)
+    assert.equal(view.concurrency_override, true)
+    assert.equal(view.rpm_override, true)
+    assert.equal(view.inflight, 1)
+    assert.equal(view.rpm, 1)
+    assert.equal(view.scheduling_inherited.max_concurrency, 2)
+    assert.deepEqual(view.allowed_models, ['antigravity/gemini-example'])
+    assert.equal(view.weight, 7)
+    assert.equal(view.has_token, false)
+    assert.equal(view.quota_policy, null)
+  }
+  assert.deepEqual(JSON.parse(fs.readFileSync(vmPath, 'utf8')), record)
+  fs.writeFileSync(vmPath, JSON.stringify({ ...record, schedulable: false, schedule_disabled_reason: 'manual' }))
+  const disabled = (await buildVmList({ cfg, routingConfig })).data.items[0]
+  assert.equal(disabled.schedulable, false)
+  assert.equal(disabled.schedule_disabled_reason, 'manual')
+  fs.writeFileSync(authPath, JSON.stringify({ authenticated: false, updated_at: Date.now() }))
+  const loggedOut = (await buildVmList({ cfg, routingConfig })).data.items[0]
+  assert.equal(loggedOut.schedulable, false)
+  assert.equal(loggedOut.schedule_disabled_reason, 'antigravity_official_login_required')
 })
 
 test('status remains read-only and VM detail never calls Claude health or process probes', async (t) => {

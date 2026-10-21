@@ -49,6 +49,7 @@ import { hardBlockOf } from '../pool/rate-limit-service.mjs'
 import { unitCircuit } from '../pool/unit-circuit.mjs'
 import { accountIdOf, normalizePoolRouting } from '../pool/pool-scheduler.mjs'
 import { codexMaxSessions } from '../pool/codex-slot-pool.mjs'
+import { antigravityPoolRuntime } from '../pool/antigravity-slot-pool.mjs'
 import { resolveCredentialScheduleLevel } from '../pool/credential-weight.mjs'
 import { activeHoursZoneOf, evaluateActiveHours } from '../pool/active-hours.mjs'
 import {
@@ -1756,14 +1757,36 @@ function mergeVmProxy(v, poolSnap, { role = 'admin', nodes = [] } = {}) {
 function enrichVm(v, accountQuota, active, extras = {}) {
   if (isAntigravityVm(v)) {
     const proxy = mergeVmProxy(v, extras.poolSnap, { role: extras.role, nodes: extras.clusterNodes })
+    const config = normalizeAntigravityRouting(extras.routingConfig?.antigravity)
+    const authenticated = v.antigravity?.authenticated === true
+    const schedulable = authenticated && v.schedulable !== false
+    const runtime = antigravityPoolRuntime.snapshot(v.id)
     return {
       ...v,
       ...proxy,
       is_active: v.id === active,
       resolved_inference_engine: 'antigravity',
       resolved_persona_preset: null,
-      schedulable: false,
-      schedule_disabled_reason: 'antigravity_experimental_text_only',
+      schedulable,
+      schedule_disabled_reason: schedulable
+        ? null
+        : !authenticated
+          ? 'antigravity_official_login_required'
+          : v.schedule_disabled_reason || 'manual',
+      max_concurrency: Math.max(1, Math.min(config.max_sessions, Number(v.max_concurrency) || config.max_sessions)),
+      max_sessions: config.max_sessions,
+      max_sessions_override: false,
+      max_rpm: v.max_rpm ?? 0,
+      concurrency_override: v.max_concurrency_override === true,
+      rpm_override: v.max_rpm_override === true,
+      scheduling_inherited: {
+        max_concurrency: config.max_sessions,
+        max_sessions: config.max_sessions,
+        max_rpm: 0,
+        session_slots: null,
+      },
+      inflight: runtime.inFlight,
+      rpm: runtime.rpm,
       can_import_credential: proxy.can_import_credential && !v.node_id && runtimeKind(v) === 'docker',
     }
   }

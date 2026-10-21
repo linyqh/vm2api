@@ -124,8 +124,8 @@ export async function peekCurrentAccount({
     return {
       ok: false,
       status: 400,
-      code: 'antigravity_experimental_text_only',
-      message: 'Antigravity 实验文本会话不支持 count_tokens，请使用专用账号面板',
+      code: 'feature_not_supported',
+      message: 'Antigravity 暂不提供生成前的 count_tokens；实际用量随生成响应返回。',
     }
   }
   if (!poolScheduler?.peekAccount) {
