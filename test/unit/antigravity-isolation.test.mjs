@@ -76,9 +76,41 @@ test('Antigravity summary exposes its own metadata without inherited Claude cred
   assert.equal(summary.schedulable, false)
   assert.equal(summary.inference_engine, 'antigravity')
   assert.equal(summary.schedule_disabled_reason, 'antigravity_experimental_text_only')
-  assert.equal(summary.antigravity.credential_storage, 'slot-keyring')
+  assert.equal(summary.antigravity.credential_storage, 'slot-official-client')
   assert.equal(JSON.stringify(summary).includes('must-not-leak'), false)
   assert.equal(JSON.stringify(summary).includes('old-claude@example.test'), false)
+})
+
+test('Antigravity summary reads only confirmed public auth metadata without importing tokens', (t) => {
+  const projectRoot = tempProject(t)
+  const dir = path.join(projectRoot, 'vms', antigravity.id, 'run')
+  fs.mkdirSync(dir, { recursive: true })
+  const authPath = path.join(dir, 'antigravity-auth.json')
+  fs.writeFileSync(
+    authPath,
+    JSON.stringify({
+      authenticated: true,
+      updated_at: 123456,
+      email: 'official@example.test',
+      access_token: 'must-not-leak-access',
+      refresh_token: 'must-not-leak-refresh',
+    }),
+  )
+  const summary = summarizeVm(antigravity, projectRoot)
+  assert.equal(summary.antigravity.authenticated, true)
+  assert.equal(summary.antigravity.credential_state, 'authenticated')
+  assert.equal(summary.antigravity.updated_at, 123456)
+  assert.equal(summary.email, 'official@example.test')
+  assert.equal(summary.has_token, false)
+  assert.equal(summary.has_refresh, false)
+  assert.doesNotMatch(JSON.stringify(summary), /must-not-leak/)
+  assert.equal(vmHasSchedulableCredential(summary), false)
+  fs.writeFileSync(authPath, JSON.stringify({ authenticated: false, updated_at: 123457 }))
+  const loggedOut = summarizeVm(antigravity, projectRoot)
+  assert.equal(loggedOut.email, null)
+  assert.equal(loggedOut.antigravity.credential_state, 'unauthenticated')
+  fs.writeFileSync(authPath, '{invalid-json')
+  assert.equal(summarizeVm(antigravity, projectRoot).antigravity.authenticated, null)
 })
 
 test('Claude telemetry stays disabled with an official identity and stale worker config on disk', async (t) => {

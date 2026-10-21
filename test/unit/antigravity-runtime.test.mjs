@@ -4,6 +4,8 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { EventEmitter } from 'node:events'
+import childProcess from 'node:child_process'
+import { syncBuiltinESMExports } from 'node:module'
 import {
   antigravityRuntimeSupport,
   antigravityBridgeStatus,
@@ -81,6 +83,85 @@ test('Antigravity rejects KVM, remote slots and missing egress before any runtim
     assert.equal(fs.existsSync(path.join(root, 'vms')), false)
   }
   assert.equal((await startVmRuntime(vm, root)).code, 'antigravity_disabled')
+  for (const bad of [
+    { ...vm, node_id: 'remote' },
+    { ...vm, runtime: { type: 'kvm' } },
+    { ...vm, proxy: null },
+  ]) {
+    assert.equal((await startVmRuntime(bad, root, { forAuthentication: true })).ok, false)
+    assert.throws(() => writeWorkerFiles(bad, root, { forAuthentication: true }))
+    assert.equal(fs.existsSync(path.join(root, 'vms')), false)
+  }
+})
+
+test('authentication may prepare a disabled isolated slot without enabling text runtime', async (t) => {
+  const root = rootFor(t)
+  assert.throws(() => writeWorkerFiles(vm, root), { code: 'antigravity_disabled' })
+  assert.throws(() => writeWorkerFiles(vm, root, { forAuthentication: 'true' }), { code: 'antigravity_disabled' })
+  const files = writeWorkerFiles(vm, root, { forAuthentication: true })
+  assert.equal(files.worker, 'antigravity')
+  assert.equal(fs.existsSync(files.runDir), true)
+  assert.equal(fs.existsSync(files.config), false)
+  assert.equal(fs.existsSync(files.token), false)
+  assert.equal(fs.existsSync(path.join(root, 'vms', vm.id, 'cli-home')), false)
+  assert.equal((await ensureAntigravityBridge({ projectRoot: root, vm })).code, 'antigravity_disabled')
+  assert.equal(
+    (await runAntigravityText({ projectRoot: root, vm, model: 'model-a', prompt: 'hello' })).code,
+    'antigravity_disabled',
+  )
+})
+
+test('authentication rejects a running container on another egress without recreating it', async (t) => {
+  const root = rootFor(t)
+  const original = childProcess.execFileSync
+  const calls = []
+  childProcess.execFileSync = (command, args, options) => {
+    if (command === 'python3') return original(command, args, options)
+    calls.push([command, ...args])
+    assert.equal(command, 'docker')
+    if (args[0] === 'network' && args[1] === 'inspect') return '172.30.0.0/24|172.30.0.1'
+    if (args[0] === 'inspect') return 'true|123|host|2026-01-01|base-image|ag-host|docker|antigravity|false'
+    assert.fail(`unexpected Docker mutation: ${args[0]}`)
+  }
+  syncBuiltinESMExports()
+  try {
+    const local = { ...vm, proxy: { id: 'px-local', scheme: 'local', host: 'local' } }
+    const result = await startVmRuntime(local, root, { forAuthentication: true })
+    assert.equal(result.ok, false)
+    assert.equal(result.code, 'antigravity_egress_mismatch')
+    assert.deepEqual(
+      calls.map((entry) => entry[1]),
+      ['network', 'inspect'],
+    )
+    assert.equal(fs.existsSync(path.join(root, 'vms', vm.id, 'run', 'antigravity.json')), false)
+  } finally {
+    childProcess.execFileSync = original
+    syncBuiltinESMExports()
+  }
+})
+
+test('authentication runtime refuses a replaced home and does not publish bridge assets through symlinks', async (t) => {
+  const root = rootFor(t)
+  const home = path.join(root, 'vms', vm.id, 'cli-home')
+  const outside = path.join(root, 'outside-slot')
+  fs.mkdirSync(outside, { mode: 0o750 })
+  fs.writeFileSync(path.join(outside, 'private-config'), 'untouched', { mode: 0o640 })
+  fs.mkdirSync(path.dirname(home), { recursive: true })
+  fs.symlinkSync(outside, home)
+  const before = fs.statSync(outside)
+  await assert.rejects(startVmRuntime(vm, root, { forAuthentication: true }))
+  assert.equal(fs.statSync(outside).mode, before.mode)
+  assert.equal(fs.statSync(outside).uid, before.uid)
+  assert.equal(fs.statSync(outside).gid, before.gid)
+  fs.unlinkSync(home)
+  fs.mkdirSync(home)
+  fs.symlinkSync(outside, path.join(home, '.kin'))
+  const files = writeWorkerFiles(vm, root, { forAuthentication: true })
+  assert.equal(fs.existsSync(files.runDir), true)
+  assert.equal(fs.existsSync(files.config), false)
+  assert.equal(fs.existsSync(path.join(home, '.cache')), false)
+  assert.deepEqual(fs.readdirSync(outside), ['private-config'])
+  assert.equal(fs.readFileSync(path.join(outside, 'private-config'), 'utf8'), 'untouched')
 })
 
 test('worker preparation writes only separate bridge config and a tool-free custom agent', (t) => {

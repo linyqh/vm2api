@@ -92,6 +92,7 @@ import {
 import { normalizeCredentialMode } from './lib/oauth/credential-mode.mjs'
 import { ensureWorkerCredential } from './lib/transport/go-worker-client.mjs'
 import { stopAllAntigravityBridges } from './lib/transport/antigravity-bridge-supervisor.mjs'
+import { stopAllAntigravityAuthLogins } from './lib/oauth/antigravity-auth-login.mjs'
 import { isClaudeVm } from './lib/vm/vm-kind.mjs'
 import { stopAllRustKernels } from './lib/transport/rust-kernel-supervisor.mjs'
 import { createRespond, parseRequestUrl } from './lib/http/respond.mjs'
@@ -1281,6 +1282,7 @@ async function shutdown(signal) {
     stopVmWatch()
   } catch {}
   try {
+    await stopAllAntigravityAuthLogins()
     await stopAllAntigravityBridges(cfg.paths.project)
     stopAllRustKernels()
   } catch {}

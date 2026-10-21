@@ -123,8 +123,9 @@ describe('Antigravity credential surface', () => {
     const vm: Vm = {
       id: 'ag',
       platform: 'antigravity',
-      has_token: true,
-      has_refresh: true,
+      has_token: false,
+      has_refresh: false,
+      antigravity: { authenticated: true },
       credential_mode: 'setup-token',
     }
     expect(importSurfaceFor(vm)).toBe('antigravity')

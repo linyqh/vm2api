@@ -6,12 +6,12 @@ import {
 } from 'react'
 import type { UsageAccountRow } from '@/types/panel-usage'
 import type { Vm } from '@/types/panel-vm'
-import { Download, Link2, RefreshCw } from 'lucide-react'
+import { Download, Link2, Play, RefreshCw } from 'lucide-react'
 import { credEndpointLabel, credEndpointOf } from '@/lib/cred-type'
 import { fmtAgo, fmtNum, fmtUsd } from '@/lib/format'
 import { tierVisual } from '@/lib/tier-visual'
 import { cn } from '@/lib/utils'
-import { slotCredentialLabel } from '@/lib/vm-kind'
+import { isAntigravityVm, slotCredentialLabel } from '@/lib/vm-kind'
 import {
   claudeTier,
   credentialStatus,
@@ -82,6 +82,7 @@ export function TierBadge({ vm, className }: { vm: Vm; className?: string }) {
 
 export const BLADE_STATE_CLASS: Record<BladeState, string> = {
   live: 'bg-muted/50',
+  official: 'bg-muted/50',
   unprobed: 'bg-muted/50',
   dead: 'bg-[color:color-mix(in_oklch,var(--status-bad-bg)_35%,var(--card))]',
   vacant: 'bg-transparent shadow-[inset_0_0_0_1px_var(--border)]',
@@ -214,7 +215,7 @@ function Callout({
   children,
   action,
 }: {
-  tone: 'bad' | 'caution' | 'none'
+  tone: 'ok' | 'bad' | 'caution' | 'none'
   title: ReactNode
   children?: ReactNode
   action: ReactNode
@@ -223,6 +224,8 @@ function Callout({
     <div
       className={cn(
         'grid min-w-0 content-center gap-1.5 rounded-lg px-3.5 py-3 text-[12.5px]',
+        tone === 'ok' &&
+          'bg-[color:var(--status-ok-bg)] text-[color:var(--status-ok)]',
         tone === 'bad' &&
           'bg-[color:var(--status-bad-bg)] text-[color:var(--status-bad)]',
         tone === 'caution' &&
@@ -284,7 +287,25 @@ export function BladeCallout({
   state: BladeState
 }) {
   const actions = useVmActions()
-  const canCred = useVmPerms().credential
+  const perms = useVmPerms()
+  const canCred = perms.credential
+  if (state === 'official') {
+    return (
+      <Callout
+        tone='ok'
+        title='已登录官方客户端'
+        action={
+          perms.test ? (
+            <CalloutAction icon={<Play />} onClick={() => actions.openTest(vm)}>
+              测试文本会话
+            </CalloutAction>
+          ) : null
+        }
+      >
+        <span>Antigravity 实验文本会话可在测试页使用。</span>
+      </Callout>
+    )
+  }
   if (state === 'dead') {
     const failed = vmFailedAt(vm)
     const ago = failed ? fmtAgo(new Date(failed).toISOString()) : ''
@@ -328,7 +349,11 @@ export function BladeCallout({
           ) : null
         }
       >
-        <span>绑定后进入探测，再按结果入池。</span>
+        <span>
+          {isAntigravityVm(vm)
+            ? '通过 OAuth 登录槽位内的官方 Antigravity 客户端。'
+            : '绑定后进入探测，再按结果入池。'}
+        </span>
       </Callout>
     )
   }

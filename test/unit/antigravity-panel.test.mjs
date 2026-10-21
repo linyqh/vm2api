@@ -227,6 +227,177 @@ test('foreign tenants and read-only operators cannot start text sessions', async
   }
 })
 
+test('Antigravity OAuth routes bind the caller and return public session fields only', async (t) => {
+  const project = fixture(t)
+  const session = {
+    session_id: 'auth-session-1',
+    status: 'awaiting_code',
+    auth_url: 'https://accounts.google.com/o/oauth2/v2/auth?state=test',
+    expires_at: Date.now() + 60000,
+    authenticated: false,
+  }
+  const cases = [
+    ['POST', 'start', {}, 'startAntigravityAuthLogin'],
+    ['GET', 'session?session_id=auth-session-1', {}, 'readAntigravityAuthLogin'],
+    ['POST', 'complete', { session_id: session.session_id, code: 'manual-code' }, 'completeAntigravityAuthLogin'],
+    ['POST', 'cancel', { session_id: session.session_id }, 'cancelAntigravityAuthLogin'],
+  ]
+  for (const [method, suffix, body, override] of cases) {
+    let calls = 0
+    const h = harness(project, tenant, body, {
+      routingConfig: { antigravity: { enabled: false } },
+      [override]: async (input) => {
+        calls++
+        assert.equal(input.actor, 'id:u-1')
+        assert.equal(input.vm.id, vm.id)
+        assert.equal(input.projectRoot, project)
+        if (override === 'startAntigravityAuthLogin') assert.equal(input.routing.antigravity.enabled, false)
+        else assert.equal(input.sessionId, session.session_id)
+        if (override === 'completeAntigravityAuthLogin') assert.equal(input.code, 'manual-code')
+        return {
+          ok: true,
+          session: {
+            ...session,
+            access_token: 'provider-secret',
+            refresh_token: 'provider-refresh',
+            transcript: 'private-output',
+          },
+        }
+      },
+    })
+    await h.call(method, `vms/vm-ag/antigravity/oauth/${suffix}`)
+    assert.equal(h.response.status, 200, JSON.stringify(h.response.body))
+    assert.equal(calls, 1)
+    assert.deepEqual(h.response.body.data, session)
+    assert.doesNotMatch(JSON.stringify(h.response.body), /provider-secret|provider-refresh|private-output/)
+  }
+  assert.equal(fs.readFileSync(path.join(project, 'vms', `${vm.id}.json`), 'utf8'), JSON.stringify(vm))
+})
+
+test('foreign tenants and read-only operators cannot access any OAuth session endpoint', async (t) => {
+  const project = fixture(t)
+  for (const who of [
+    { ...tenant, panelUserId: 'u-2' },
+    { panelUser: 'operator', panelRole: 'super' },
+  ]) {
+    for (const [method, operation] of [
+      ['POST', 'start'],
+      ['GET', 'session'],
+      ['POST', 'complete'],
+      ['POST', 'cancel'],
+    ]) {
+      const reject = () => assert.fail('unauthorized caller reached authentication manager')
+      const h = harness(
+        project,
+        who,
+        { session_id: 'session-1', code: 'manual-code' },
+        {
+          startAntigravityAuthLogin: reject,
+          readAntigravityAuthLogin: reject,
+          completeAntigravityAuthLogin: reject,
+          cancelAntigravityAuthLogin: reject,
+        },
+      )
+      await h.call(method, `vms/vm-ag/antigravity/oauth/${operation}`)
+      assert.equal(h.response.status, who.panelRole === 'super' ? 403 : 404)
+    }
+  }
+})
+
+test('OAuth rejects wrong platform and invalid callback fields before manager execution', async (t) => {
+  const project = fixture(t)
+  const reject = () => assert.fail('invalid input reached authentication manager')
+  for (const [operation, body] of [
+    ['start', { token: 'injected-token' }],
+    ['complete', { session_id: '../other', code: 'manual-code' }],
+    ['complete', { session_id: 'session-1', code: '' }],
+    ['complete', { session_id: 'session-1', code: 123 }],
+    ['complete', { session_id: 'session-1', code: 'manual-code', proxy: 'other-exit' }],
+    ['cancel', {}],
+  ]) {
+    const h = harness(project, tenant, body, {
+      startAntigravityAuthLogin: reject,
+      completeAntigravityAuthLogin: reject,
+      cancelAntigravityAuthLogin: reject,
+    })
+    await h.call('POST', `vms/vm-ag/antigravity/oauth/${operation}`)
+    assert.equal(h.response.status, 400)
+  }
+  fs.writeFileSync(
+    path.join(project, 'vms', 'vm-gpt.json'),
+    JSON.stringify({ id: 'vm-gpt', platform: 'openai', owner_user_id: 'u-1' }),
+  )
+  const other = harness(project, tenant, {}, { startAntigravityAuthLogin: reject })
+  await other.call('POST', 'vms/vm-gpt/antigravity/oauth/start')
+  assert.equal(other.response.body.error.code, 'platform_mismatch')
+})
+
+test('OAuth manager failures preserve status and owner reassignment stops pending login', async (t) => {
+  const project = fixture(t)
+  const h = harness(
+    project,
+    tenant,
+    {},
+    {
+      readAntigravityAuthLogin: async () => ({
+        ok: false,
+        status: 404,
+        code: 'antigravity_auth_session_not_found',
+        error: '授权会话不存在或已结束',
+      }),
+    },
+  )
+  await h.call('GET', 'vms/vm-ag/antigravity/oauth/session?session_id=missing')
+  assert.equal(h.response.status, 404)
+  assert.equal(h.response.body.error.code, 'antigravity_auth_session_not_found')
+  let stopped
+  const owner = harness(
+    project,
+    admin,
+    { user_id: 'u-2' },
+    {
+      panelUsers: { getById: () => ({ id: 'u-2' }) },
+      stopAntigravityAuthLogin: async (id) => {
+        stopped = id
+      },
+    },
+  )
+  await owner.call('PATCH', 'vms/vm-ag/owner')
+  assert.equal(owner.response.status, 200, JSON.stringify(owner.response.body))
+  assert.equal(stopped, vm.id)
+  assert.equal(JSON.parse(fs.readFileSync(path.join(project, 'vms', `${vm.id}.json`), 'utf8')).owner_user_id, 'u-2')
+})
+
+test('confirmed auth metadata is visible while text remains disabled', async (t) => {
+  const project = fixture(t)
+  const runDir = path.join(project, 'vms', vm.id, 'run')
+  fs.mkdirSync(runDir, { recursive: true })
+  fs.writeFileSync(
+    path.join(runDir, 'antigravity-auth.json'),
+    JSON.stringify({ authenticated: true, updated_at: Date.now() }),
+  )
+  const h = harness(
+    project,
+    tenant,
+    {},
+    {
+      routingConfig: {},
+      antigravityBridgeStatus: async () => ({ ok: false, code: 'antigravity_disabled', authenticated: null }),
+    },
+  )
+  await h.call('GET', 'vms/vm-ag/antigravity/status')
+  assert.equal(h.response.body.data.authenticated, true)
+  assert.equal(h.response.body.data.enabled, false)
+  assert.equal(h.response.body.data.ready, false)
+  const record = { ...vm, proxy: { id: 'px-test', host: '127.0.0.1', port: 1080 } }
+  fs.writeFileSync(path.join(project, 'vms', `${vm.id}.json`), JSON.stringify(record))
+  const result = await buildVmDetail({ cfg: { paths: { project } }, id: vm.id, routingConfig: {} })
+  assert.equal(result.data.vm.can_import_credential, true)
+  assert.equal(result.data.vm.antigravity.authenticated, true)
+  assert.equal(result.data.vm.has_token, false)
+  assert.equal(result.data.vm.schedulable, false)
+})
+
 test('status remains read-only and VM detail never calls Claude health or process probes', async (t) => {
   const project = fixture(t)
   const h = harness(

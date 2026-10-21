@@ -178,7 +178,7 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
           antigravity,
           email: antigravity.email || null,
           credential_mode: 'official_cli',
-          oauth_source: 'antigravity-keyring',
+          oauth_source: 'antigravity-official-cli',
           has_token: false,
           has_refresh: false,
           account_tier: null,

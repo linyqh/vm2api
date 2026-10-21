@@ -22,7 +22,7 @@ import {
 } from '@/components/ui/tooltip'
 import { StatusMark } from '@/components/status-mark'
 import { AllowedModelsCard } from '@/features/vm/allowed-models-card'
-import { AntigravityPanel } from '@/features/vm/antigravity-panel'
+import { AntigravityCredentialPanel } from '@/features/vm/antigravity-credential-panel'
 import { AuthSchemeEditor } from '@/features/vm/auth-scheme-editor'
 import { CodexCredentialPanel } from '@/features/vm/codex-credential-panel'
 import { ConvertOauthToSetupButton } from '@/features/vm/convert-oauth-button'
@@ -98,7 +98,17 @@ export function VmAccountTab(props: VmAccountTabProps) {
   if (isAntigravityVm(vm))
     return (
       <TabsContent value='account' className='space-y-3 pt-3'>
-        <AntigravityPanel key={vm.id} vm={vm} />
+        <Card>
+          <CardHeader className='pb-2'>
+            <CardTitle className='text-sm'>Antigravity 账号授权</CardTitle>
+          </CardHeader>
+          <CardContent className='pt-0'>
+            <AntigravityCredentialPanel
+              vm={vm}
+              onCommitted={onCredentialCommitted}
+            />
+          </CardContent>
+        </Card>
       </TabsContent>
     )
 

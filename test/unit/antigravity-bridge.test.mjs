@@ -267,7 +267,7 @@ test('CLI inherits no proxy or provider API credentials from the control plane',
       OPENAI_API_KEY: 'secret',
       KIN_INTERNAL_TOKEN: 'secret',
     }),
-    { HOME: '/slot', PATH: '/bin', LANG: 'en_US.UTF-8', LC_ALL: 'C' },
+    { HOME: '/slot', PATH: '/slot/.local/bin:/bin', LANG: 'en_US.UTF-8', LC_ALL: 'C' },
   )
 })
 

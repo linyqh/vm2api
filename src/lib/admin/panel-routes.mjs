@@ -152,6 +152,14 @@ import { validateAntigravityRoutingPatch, listAntigravityPublicModels } from '..
 import { prepareAntigravityChat, antigravityStatusView, scopeAntigravitySession } from './antigravity-panel.mjs'
 import { closeAntigravityTextSession } from '../transport/antigravity-bridge-client.mjs'
 import { antigravityBridgeStatus, runAntigravityText } from '../transport/antigravity-bridge-supervisor.mjs'
+import {
+  startAntigravityAuthLogin,
+  readAntigravityAuthLogin,
+  completeAntigravityAuthLogin,
+  cancelAntigravityAuthLogin,
+  stopAntigravityAuthLogin,
+} from '../oauth/antigravity-auth-login.mjs'
+import { summarizeAntigravitySlot } from '../vm/antigravity-slot.mjs'
 import { parseAllowedModelsPatch } from '../pool/slot-model-gate.mjs'
 import { parseScheduleLevelInput, manualScheduleLevelOf } from '../pool/credential-weight.mjs'
 import { parseActiveHoursInput } from '../pool/active-hours.mjs'
@@ -1411,6 +1419,107 @@ export function createPanelHandler(ctx) {
           })
         }
       }
+      const agAuthRoute = p.match(/^\/api\/panel\/vms\/([^/]+)\/antigravity\/oauth\/(start|session|complete|cancel)$/)
+      if (
+        agAuthRoute &&
+        ((req.method === 'GET' && agAuthRoute[2] === 'session') ||
+          (req.method === 'POST' && agAuthRoute[2] !== 'session'))
+      ) {
+        const vm = isValidVmId(agAuthRoute[1]) ? getVm(cfg.paths.project, agAuthRoute[1]) : null
+        if (!vm) return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: '槽位不存在' } })
+        if (!isAntigravityVm(vm))
+          return json(res, 400, {
+            ok: false,
+            error: { code: 'platform_mismatch', message: '此操作需要 Antigravity 槽位' },
+          })
+        const operation = agAuthRoute[2]
+        const actor = req.panelUserId ? `id:${req.panelUserId}` : `login:${panelIdentity(req).user || 'master'}`
+        const body = operation === 'session' ? {} : await readBody(req, 20 * 1024)
+        const allowed = operation === 'complete' ? ['session_id', 'code'] : operation === 'cancel' ? ['session_id'] : []
+        if (
+          !body ||
+          typeof body !== 'object' ||
+          Array.isArray(body) ||
+          Object.keys(body).some((key) => !allowed.includes(key))
+        )
+          return json(res, 400, { ok: false, error: { code: 'invalid_request', message: '授权请求字段无效' } })
+        const sessionId = operation === 'session' ? url.searchParams.get('session_id') || undefined : body.session_id
+        if (
+          (sessionId != null && (typeof sessionId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(sessionId))) ||
+          (['complete', 'cancel'].includes(operation) && !sessionId)
+        )
+          return json(res, 400, { ok: false, error: { code: 'invalid_session_id', message: '授权会话 ID 无效' } })
+        if (
+          operation === 'complete' &&
+          (typeof body.code !== 'string' || !body.code.trim() || Buffer.byteLength(body.code) > 16 * 1024)
+        )
+          return json(res, 400, { ok: false, error: { code: 'code_required', message: '请粘贴完整授权码' } })
+        try {
+          const handlers = {
+            start: ctx.startAntigravityAuthLogin || startAntigravityAuthLogin,
+            session: ctx.readAntigravityAuthLogin || readAntigravityAuthLogin,
+            complete: ctx.completeAntigravityAuthLogin || completeAntigravityAuthLogin,
+            cancel: ctx.cancelAntigravityAuthLogin || cancelAntigravityAuthLogin,
+          }
+          const result = await handlers[operation]({
+            projectRoot: cfg.paths.project,
+            vm,
+            actor,
+            sessionId,
+            ...(operation === 'start' ? { routing: getRouting() } : {}),
+            ...(operation === 'complete' ? { code: body.code } : {}),
+          })
+          if (!result?.ok) {
+            const code = result?.code || 'antigravity_auth_failed'
+            const status =
+              Number.isInteger(result?.status) && result.status >= 400 && result.status < 600
+                ? result.status
+                : /not_found|mismatch/.test(code)
+                  ? 404
+                  : /expired|invalid|required|unsupported/.test(code)
+                    ? 400
+                    : /busy|active/.test(code)
+                      ? 409
+                      : 502
+            return json(res, status, {
+              ok: false,
+              error: {
+                code,
+                message: String(result?.error?.message || result?.error || 'Antigravity 授权操作失败').slice(0, 240),
+              },
+            })
+          }
+          const session = result.session
+          if (
+            !session ||
+            !['starting', 'awaiting_code', 'verifying', 'authenticated', 'failed', 'expired', 'cancelled'].includes(
+              session.status,
+            )
+          )
+            return json(res, 502, {
+              ok: false,
+              error: { code: 'antigravity_auth_response_invalid', message: '授权会话状态无效' },
+            })
+          return json(
+            res,
+            200,
+            panel.ok({
+              session_id: typeof session.session_id === 'string' ? session.session_id : null,
+              status: session.status,
+              auth_url: typeof session.auth_url === 'string' ? session.auth_url : null,
+              expires_at: session.expires_at ?? null,
+              authenticated: session.authenticated === true,
+              ...(typeof session.error === 'string' ? { error: session.error } : {}),
+              ...(typeof session.message === 'string' ? { message: session.message } : {}),
+            }),
+          )
+        } catch (error) {
+          return json(res, 502, {
+            ok: false,
+            error: { code: error?.code || 'antigravity_auth_failed', message: 'Antigravity 授权操作失败' },
+          })
+        }
+      }
       const agRoute = p.match(/^\/api\/panel\/vms\/([^/]+)\/antigravity\/(status|chat|close)$/)
       if (
         agRoute &&
@@ -1427,7 +1536,21 @@ export function createPanelHandler(ctx) {
         const projectRoot = cfg.paths.project
         if (agRoute[2] === 'status') {
           const runtime = await (ctx.antigravityBridgeStatus || antigravityBridgeStatus)({ projectRoot, vm, routing })
-          return json(res, 200, panel.ok(antigravityStatusView({ routing, runtime })))
+          const auth = summarizeAntigravitySlot(projectRoot, vm)
+          return json(
+            res,
+            200,
+            panel.ok(
+              antigravityStatusView({
+                routing,
+                runtime: {
+                  ...runtime,
+                  authenticated:
+                    typeof runtime.authenticated === 'boolean' ? runtime.authenticated : auth.authenticated,
+                },
+              }),
+            ),
+          )
         }
         const actor = req.panelUserId ? `id:${req.panelUserId}` : `login:${panelIdentity(req).user || 'master'}`
         const body = await readBody(req, 128 * 1024)
@@ -2779,6 +2902,8 @@ export function createPanelHandler(ctx) {
           })
         }
         const origin = assignOriginForOwner(nextOwner, { previousOrigin: currentOrigin, actorRole: 'admin' })
+        if (isAntigravityVm(vm) && normalizeOwnerId(vm.owner_user_id) !== nextOwner)
+          await (ctx.stopAntigravityAuthLogin || stopAntigravityAuthLogin)(id)
         const saved = persistVmOwner(cfg.paths.project, id, { ownerUserId: nextOwner, origin })
         return json(res, 200, panel.ok({ vm: summarizeVm(saved, cfg.paths.project, ctx.routingConfig) }))
       }

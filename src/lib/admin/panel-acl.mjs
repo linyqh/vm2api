@@ -171,6 +171,7 @@ function userVmPathAllowed(method, path) {
     if (rest === 'oauth/credential' || rest === 'package') return false
     return (
       rest === 'antigravity/status' ||
+      rest === 'antigravity/oauth/session' ||
       rest === 'test-schedule' ||
       rest.startsWith('oauth/') ||
       rest === 'probe' ||
@@ -188,6 +189,7 @@ function userVmPathAllowed(method, path) {
     return (
       rest === 'antigravity/chat' ||
       rest === 'antigravity/close' ||
+      ['antigravity/oauth/start', 'antigravity/oauth/complete', 'antigravity/oauth/cancel'].includes(rest) ||
       rest === 'schedulable' ||
       rest === 'cooldown/clear' ||
       rest === 'circuit/reset' ||

@@ -12,6 +12,7 @@ import {
 } from '../transport/rust-kernel-supervisor.mjs'
 import { ensureCodexKernel, stopCodexKernel, writeCodexKernelConfig } from '../transport/codex-kernel-supervisor.mjs'
 import { antigravityRuntimeSupport, ensureAntigravityBridge } from '../transport/antigravity-bridge-supervisor.mjs'
+import { stopAntigravityAuthLogin } from '../oauth/antigravity-auth-login.mjs'
 import { runtimeKind, isKvmRuntime } from './runtime-kind.mjs'
 import { getVm, listVms, isCodexVm, persistVmRuntime } from './vm-registry.mjs'
 import { isAntigravityVm, isClaudeVm } from './vm-kind.mjs'
@@ -76,12 +77,14 @@ export async function startSlotReady(vm, projectRoot, opts = {}) {
 }
 
 export async function stopSlot(vm) {
+  if (isAntigravityVm(vm)) await stopAntigravityAuthLogin(vm.id)
   if (isCodexVm(vm)) stopCodexKernel(vm.id)
   return slotHost(vm).stop(vm)
 }
 
 /** Destroy the slot container. Used only by explicit reset / delete. */
 export async function destroySlot(vm) {
+  if (isAntigravityVm(vm)) await stopAntigravityAuthLogin(vm.id)
   return slotHost(vm).destroy(vm)
 }
 

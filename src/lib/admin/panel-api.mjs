@@ -1755,15 +1755,16 @@ function mergeVmProxy(v, poolSnap, { role = 'admin', nodes = [] } = {}) {
 
 function enrichVm(v, accountQuota, active, extras = {}) {
   if (isAntigravityVm(v)) {
+    const proxy = mergeVmProxy(v, extras.poolSnap, { role: extras.role, nodes: extras.clusterNodes })
     return {
       ...v,
-      ...mergeVmProxy(v, extras.poolSnap, { role: extras.role, nodes: extras.clusterNodes }),
+      ...proxy,
       is_active: v.id === active,
       resolved_inference_engine: 'antigravity',
       resolved_persona_preset: null,
       schedulable: false,
       schedule_disabled_reason: 'antigravity_experimental_text_only',
-      can_import_credential: false,
+      can_import_credential: proxy.can_import_credential && !v.node_id && runtimeKind(v) === 'docker',
     }
   }
   if (extras.projectRoot && isLeftoverQuotaScheduleOff(v)) {

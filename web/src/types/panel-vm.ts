@@ -201,6 +201,15 @@ export type Vm = {
   status?: string
   has_token?: boolean
   has_refresh?: boolean
+  /** Display metadata only; Antigravity credentials stay in the official client. */
+  antigravity?: {
+    authenticated?: boolean | null
+    email?: string | null
+    credential_storage?: string
+    credential_state?: 'authenticated' | 'unauthenticated' | 'unknown'
+    updated_at?: string | number | null
+    experimental?: boolean
+  } | null
   cred_status?: string | { text?: string; key?: string; tone?: string }
   /**
    * 凭证类型的权威字段（`oauth` / `setup-token` / `official-setup-token` / `apikey`）。

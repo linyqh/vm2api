@@ -7,7 +7,12 @@ import { expiresAtToMs, fmtResetClock } from '@/lib/fable-status'
 import { fmtNum } from '@/lib/format'
 import { tierVisual } from '@/lib/tier-visual'
 import { cn } from '@/lib/utils'
-import { isClaudeVm, isCodexVm, slotNameLabel } from '@/lib/vm-kind'
+import {
+  hasSlotCredential,
+  isClaudeVm,
+  isCodexVm,
+  slotNameLabel,
+} from '@/lib/vm-kind'
 import {
   credentialStatus,
   fleetGroup,
@@ -142,7 +147,7 @@ function PriorityChip({ vm }: { vm: Vm }) {
  * 平台（Claude / GPT）与 pro / max 等级都在「账号」列，不在这里重复。
  */
 function TypeCell({ vm, now }: { vm: Vm; now: number }) {
-  const hasToken = Boolean(vm.has_token)
+  const hasToken = hasSlotCredential(vm)
   const resetAt = vm.reset_7d || vm.reset_7d_oi
   const clock = hasToken ? fmtResetClock(resetAt) : null
   const resetMs = clock ? expiresAtToMs(resetAt) : 0

@@ -9,6 +9,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
+import { antigravityModelsFromIds } from '@/features/settings/antigravity-models'
 import { routingQueryOptions } from '@/features/settings/queries'
 import { useVmPerms } from '@/features/vm/vm-perms'
 
@@ -294,7 +295,7 @@ function AntigravityPanelContent({
   )
 }
 
-function AntigravitySettings() {
+export function AntigravitySettings() {
   const qc = useQueryClient()
   const routing = useQuery(routingQueryOptions())
   const [enabled, setEnabled] = useState(false)
@@ -325,14 +326,11 @@ function AntigravitySettings() {
             ...((routing.data?.antigravity || {}) as Record<string, unknown>),
             enabled,
             cli_bin: cli.trim() || 'agy',
-            models: [
-              ...new Set(
-                models
-                  .split('\n')
-                  .map((id) => id.trim())
-                  .filter(Boolean)
-              ),
-            ],
+            models: antigravityModelsFromIds(
+              (routing.data?.antigravity as Record<string, unknown> | undefined)
+                ?.models,
+              models
+            ),
           },
         }),
       }),

@@ -16,7 +16,13 @@ import {
 import { credTypeLabel, credTypeOf } from '@/lib/cred-type'
 import { fmtExpiresAt, fmtNum, fmtUsd } from '@/lib/format'
 import { cn } from '@/lib/utils'
-import { compactEmail, isCodexVm, slotNameLabel } from '@/lib/vm-kind'
+import {
+  compactEmail,
+  hasSlotCredential,
+  isAntigravityVm,
+  isCodexVm,
+  slotNameLabel,
+} from '@/lib/vm-kind'
 import {
   accountStatus,
   claudeTier,
@@ -204,10 +210,20 @@ function CardBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
                 {fmtExpiresAt(vm.expires_at)}
               </span>
             </Field>
-            <Field label='令牌' compact>
+            <Field label={isAntigravityVm(vm) ? '官方客户端' : '令牌'} compact>
               <span className='text-xs'>
-                Access {vm.has_token ? '已写入' : '-'} · Refresh{' '}
-                {vm.has_refresh ? '已绑定' : '-'}
+                {isAntigravityVm(vm) ? (
+                  hasSlotCredential(vm) ? (
+                    '已登录官方客户端'
+                  ) : (
+                    '未绑定账号'
+                  )
+                ) : (
+                  <>
+                    Access {vm.has_token ? '已写入' : '-'} · Refresh{' '}
+                    {vm.has_refresh ? '已绑定' : '-'}
+                  </>
+                )}
               </span>
             </Field>
           </div>

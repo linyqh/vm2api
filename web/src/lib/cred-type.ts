@@ -1,5 +1,10 @@
 import type { AuthScheme, OauthFlavor, Vm } from '@/types/panel-vm'
-import { isAntigravityVm, isClaudeVm, isCodexVm } from '@/lib/vm-kind'
+import {
+  hasSlotCredential,
+  isAntigravityVm,
+  isClaudeVm,
+  isCodexVm,
+} from '@/lib/vm-kind'
 
 export type CredType =
   'oauth' | 'setup-token' | 'official-setup-token' | 'apikey' | 'none'
@@ -43,12 +48,8 @@ export function credTypeFromMode(raw: unknown): CredType {
 }
 
 export function credTypeOf(vm: Vm | undefined): CredType {
-  if (
-    !vm?.has_token ||
-    (!isClaudeVm(vm) && !isCodexVm(vm) && !isAntigravityVm(vm))
-  )
-    return 'none'
-  if (isAntigravityVm(vm)) return 'oauth'
+  if (isAntigravityVm(vm)) return hasSlotCredential(vm) ? 'oauth' : 'none'
+  if (!vm?.has_token || (!isClaudeVm(vm) && !isCodexVm(vm))) return 'none'
   return credTypeFromMode(vm.credential_mode || vm.claude_mode || '')
 }
 

@@ -16,6 +16,7 @@ import { isAntigravityVm, isClaudeVm, isCodexVm } from './vm-kind.mjs'
 import { antigravityRuntimeSupport, writeAntigravityBridgeConfig } from '../transport/antigravity-bridge-supervisor.mjs'
 import { antigravityBridgePaths } from '../transport/antigravity-bridge-client.mjs'
 import { normalizeAntigravityRouting } from '../protocol/antigravity-route.mjs'
+import { publishAntigravitySlotAssets } from '../oauth/antigravity-auth-login.mjs'
 import { buildWorkerTelemetry } from './worker-telemetry.mjs'
 import { kernelBinPath, writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
 import { assertCliHopAllowed, resolveOfficialCcInference } from './slot-engine.mjs'
@@ -535,13 +536,19 @@ function resolveSlotRouting(projectRoot, routing) {
   return readProjectRouting(projectRoot) || {}
 }
 
-export function writeWorkerFiles(vm, projectRoot, { transparent, routing } = {}) {
+export function writeWorkerFiles(vm, projectRoot, { transparent, routing, forAuthentication = false } = {}) {
   if (isAntigravityVm(vm)) {
     const support = antigravityRuntimeSupport(vm)
     if (!support.ok) throw Object.assign(new Error(support.error), { code: support.code })
     const resolvedRouting = resolveSlotRouting(projectRoot, routing)
-    if (!normalizeAntigravityRouting(resolvedRouting.antigravity || {}).enabled)
+    if (forAuthentication !== true && !normalizeAntigravityRouting(resolvedRouting.antigravity || {}).enabled)
       throw Object.assign(new Error('Antigravity is disabled'), { code: 'antigravity_disabled' })
+    if (forAuthentication === true) {
+      const paths = slotWorkerPaths(projectRoot, vm)
+      fs.mkdirSync(paths.runDir, { recursive: true, mode: 0o700 })
+      chownSlotRuntimeFile(paths.runDir, vm)
+      return paths
+    }
     writeAntigravityBridgeConfig(projectRoot, vm, { routing: resolvedRouting })
     return slotWorkerPaths(projectRoot, vm)
   }
@@ -933,11 +940,18 @@ export function dockerSlotResourceArgs(vm, routing) {
   return ['--memory', memory, '--memory-swap', memory, ...(cpus > 0 ? ['--cpus', String(cpus)] : [])]
 }
 
-export async function startVmRuntime(vm, projectRoot, { recreate = false, routing, accel: accelOpt } = {}) {
+export async function startVmRuntime(
+  vm,
+  projectRoot,
+  { recreate = false, routing, accel: accelOpt, forAuthentication = false } = {},
+) {
   if (isAntigravityVm(vm)) {
     const support = antigravityRuntimeSupport(vm)
     if (!support.ok) return support
-    if (!normalizeAntigravityRouting(resolveSlotRouting(projectRoot, routing).antigravity || {}).enabled)
+    if (
+      forAuthentication !== true &&
+      !normalizeAntigravityRouting(resolveSlotRouting(projectRoot, routing).antigravity || {}).enabled
+    )
       return { ok: false, code: 'antigravity_disabled', error: 'Antigravity is disabled' }
   }
   if (!isClaudeVm(vm) && !isCodexVm(vm) && !isAntigravityVm(vm))
@@ -949,10 +963,10 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
       const resolved = resolveSlotRouting(projectRoot, routing)
       return probeLocalKvm({ routing: resolved }).then((probe) => {
         if (!probe.ok) return { ok: false, code: 'kvm_unavailable', error: probe.error || '本机不支持 KVM' }
-        return startVmRuntime(vm, projectRoot, { recreate, routing: resolved, accel: probe.accel })
+        return startVmRuntime(vm, projectRoot, { recreate, routing: resolved, accel: probe.accel, forAuthentication })
       })
     }
-    return startVmRuntime(vm, projectRoot, { recreate, routing, accel: recorded })
+    return startVmRuntime(vm, projectRoot, { recreate, routing, accel: recorded, forAuthentication })
   }
   const kvm = isKvmRuntime(vm)
   const name = containerName(vm.id)
@@ -967,7 +981,9 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
   const mem = slotMemory(vm, resolvedRouting)
   const image = kvm ? kvmImageForKernel(kernel) : imageForKernel(kernel)
   const home = path.join(projectRoot, 'vms', vm.id, 'cli-home')
-  fs.mkdirSync(home, { recursive: true })
+  const isolatedAuthHome = isAntigravityVm(vm) && forAuthentication === true
+  if (isolatedAuthHome) publishAntigravitySlotAssets(projectRoot, vm)
+  else fs.mkdirSync(home, { recursive: true })
   try {
     if (isClaudeVm(vm)) ensureSlotClaudeOwnership(home, runtimeUidNum(vm), Number(GID))
   } catch (error) {
@@ -981,6 +997,17 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
   if (!eg.network && !eg.name) return { ok: false, error: 'egress network missing; refusing host fallback' }
 
   let existing = inspectContainer(name)
+  if (
+    isAntigravityVm(vm) &&
+    forAuthentication === true &&
+    existing?.running &&
+    slotContainerNetworkMismatch(existing, vm)
+  )
+    return {
+      ok: false,
+      code: 'antigravity_egress_mismatch',
+      error: 'Antigravity 槽位出口网络不匹配，请先停止槽位后重试授权',
+    }
   const paths = slotWorkerPaths(projectRoot, vm)
   const replace = recreate || !slotKernelAlive(existing, paths, vm) || codexContainerStale(existing, vm)
   // Node restart / 开机 must not bounce a live slot with a healthy worker.
@@ -1012,12 +1039,12 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
 
   let worker
   try {
-    worker = writeWorkerFiles(vm, projectRoot, { transparent: true, routing: resolvedRouting })
+    worker = writeWorkerFiles(vm, projectRoot, { transparent: true, routing: resolvedRouting, forAuthentication })
   } catch (error) {
     return { ok: false, error: String(error.message || error) }
   }
   try {
-    fs.chownSync(home, runtimeUidNum(vm), Number(GID))
+    if (!isolatedAuthHome) fs.chownSync(home, runtimeUidNum(vm), Number(GID))
   } catch {}
 
   if (

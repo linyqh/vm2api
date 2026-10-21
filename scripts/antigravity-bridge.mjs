@@ -27,7 +27,9 @@ function failure(status, code, message, extra = {}) {
 
 export function antigravityCliEnv(env = process.env) {
   const allowed = /^(HOME|PATH|LANG|LC_[A-Z_]+|TZ|USER|LOGNAME|XDG_[A-Z_]+|DBUS_SESSION_BUS_ADDRESS|SHELL)$/
-  return Object.fromEntries(Object.entries(env).filter(([key]) => allowed.test(key)))
+  const result = Object.fromEntries(Object.entries(env).filter(([key]) => allowed.test(key)))
+  if (result.HOME) result.PATH = `${result.HOME}/.local/bin:${result.PATH || '/usr/bin:/bin'}`
+  return result
 }
 
 function countersOf(value) {

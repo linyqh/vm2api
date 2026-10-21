@@ -84,13 +84,21 @@ export function kindFromModel(
   return 'claude'
 }
 
+/** UI binding state only. This does not imply gateway token availability or pool eligibility. */
+export function hasSlotCredential(vm?: Partial<Vm>): boolean {
+  if (isAntigravityVm(vm as Vm | undefined))
+    return vm?.antigravity?.authenticated === true
+  return vm?.has_token === true
+}
+
 /** Account line on rack cards: credential presence is independent of the email. */
-export function slotCredentialLabel(
-  vm?: Pick<Vm, 'email' | 'has_token' | 'has_refresh'>,
-  compact = false
-): string {
+export function slotCredentialLabel(vm?: Partial<Vm>, compact = false): string {
+  if (isAntigravityVm(vm as Vm | undefined) && !hasSlotCredential(vm))
+    return '空槽'
   const email = String(vm?.email || '').trim()
   if (email) return compact ? email.split('@')[0] : email
+  if (isAntigravityVm(vm as Vm | undefined) && hasSlotCredential(vm))
+    return '已登录官方客户端'
   return vm?.has_token || vm?.has_refresh ? '已导入账号 · 邮箱未知' : '空槽'
 }
 
@@ -110,13 +118,11 @@ export function slotAccountLabel(
 }
 
 /** `vm-01` without an email is unbound. A custom slot id is the name and stays visible. */
-export function slotNameLabel(vm?: {
-  id?: string | null
-  name?: string | null
-  email?: string | null
-}): string {
+export function slotNameLabel(vm?: Partial<Vm>): string {
   const name = String(vm?.name || vm?.id || '').trim()
   const email = String(vm?.email || '').trim()
+  if (isAntigravityVm(vm as Vm | undefined) && hasSlotCredential(vm))
+    return name || '已登录官方客户端'
   if (email || (name && !/^vm-\d+$/i.test(String(vm?.id || '').trim())))
     return name || '未绑定账号'
   return '未绑定账号'
