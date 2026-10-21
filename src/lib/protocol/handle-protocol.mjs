@@ -1,4 +1,3 @@
-import { normalizeAntigravityRouting } from './antigravity-route.mjs'
 /**
  * /v1 protocol handler. URLs, auth, and response envelopes stay with the
  * server wiring; this factory owns convert → pool → Go/Rust hop → client.
@@ -40,6 +39,7 @@ import { sanitizeInboundBody, defaultSeedPolicy, callerAutoCompactWindow } from 
 import { fingerprintRequest } from './client-fingerprint.mjs'
 import { validateOfficialModel } from './models.mjs'
 import { handleCodexProtocol, handleCodexSearch } from './handle-codex.mjs'
+import { handleAntigravityProtocol } from './handle-antigravity.mjs'
 import { disjointOpenaiUsage } from './openai-usage.mjs'
 import { costColumnsFromUsage } from '../admin/pricing.mjs'
 import { detectInboundPlatform } from './platform-detect.mjs'
@@ -197,8 +197,8 @@ export function createHandleProtocol(deps) {
     return disjointOpenaiUsage(next)
   }
 
-  function attachPricing(logBag, { managedKey = null, rateMultiplier = 1, bill = false } = {}) {
-    const model = logBag.upstream_model || logBag.model
+  function attachPricing(logBag, { managedKey = null, rateMultiplier = 1, bill = false, pricingModel = null } = {}) {
+    const model = pricingModel || logBag.upstream_model || logBag.model
     const priced = costColumnsFromUsage(logBag.usage || {}, model)
     Object.assign(logBag, priced)
     if (!bill || !managedKey) return
@@ -705,24 +705,43 @@ export function createHandleProtocol(deps) {
       return json(res, 403, errorResult.body)
     }
     if (platform.platform === 'antigravity') {
-      const enabled = normalizeAntigravityRouting(getRouting()?.antigravity).enabled
-      stats.errors++
-      const code = enabled ? 'antigravity_experimental_text_only' : 'antigravity_disabled'
-      const message = enabled
-        ? 'Antigravity currently supports experimental panel text sessions; native API history, system, images and tools are not supported.'
-        : 'Antigravity is disabled.'
-      logBag.error_code = code
-      logBag.error_message = message
-      return json(
+      if (await applyProtocolIntercept({ req, inbound, body: ctx.body, fp, logBag, requestId: logCtx.request_id, res }))
+        return
+      return handleAntigravityProtocol({
+        req,
         res,
-        enabled ? 400 : 503,
-        makeError({
-          type: ErrorType.INVALID_REQUEST,
-          code,
-          message,
-          status: enabled ? 400 : 503,
-        }).body,
-      )
+        protocol,
+        ctx,
+        inbound,
+        logBag,
+        stats,
+        json,
+        writeSSEHeaders,
+        routing: getRouting() || {},
+        projectRoot: cfg.paths.project,
+        stickyRouter,
+        apiKeyStore,
+        requestStartedAt: logCtx.t0,
+        accountGate: (vm) =>
+          applyProtocolIntercept({
+            req,
+            inbound,
+            body: ctx.body,
+            fp,
+            logBag,
+            requestId: logCtx.request_id,
+            res,
+            account: scopeAccountFromVm(vm),
+          }),
+        recordUsage: () =>
+          attachPricing(logBag, {
+            managedKey: req.apiKeyRecord,
+            rateMultiplier: deps.groupsRepo.rateMultiplier(req.apiKeyRecord?.group_id ?? 1),
+            bill: !!req.apiKeyRecord,
+            pricingModel: ctx.body.model,
+          }),
+        ops: deps.antigravityOps || {},
+      })
     }
     // Codex returns before conversion. Distill does not apply to OpenAI platform models; the rest
     // of the gate scans them only when jev.openai_platform_enabled is on.

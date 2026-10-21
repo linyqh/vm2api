@@ -538,7 +538,7 @@ export function CreateVmForm({
               value: 'antigravity',
               title: <PlatformChip kind='antigravity' />,
               detail:
-                '实验文本会话。仅本机 Docker，创建为空槽后配置官方客户端。',
+                '官方客户端接入。仅本机 Docker，创建后完成 OAuth 并同步账号模型。',
             },
           ]}
         />
@@ -547,7 +547,7 @@ export function CreateVmForm({
       {d.platform === 'antigravity' ? (
         <p className='text-sm text-muted-foreground'>
           Antigravity 当前仅支持本机
-          Docker，创建后保持停止。请在账号页查看客户端和实验功能状态。
+          Docker，创建后保持停止。请在账号页完成授权并同步模型，再启用 API 调度。
           {remote ? ' 请将放置改为本机。' : ''}
         </p>
       ) : null}

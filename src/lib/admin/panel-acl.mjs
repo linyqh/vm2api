@@ -189,6 +189,7 @@ function userVmPathAllowed(method, path) {
     return (
       rest === 'antigravity/chat' ||
       rest === 'antigravity/close' ||
+      rest === 'antigravity/models/sync' ||
       ['antigravity/oauth/start', 'antigravity/oauth/complete', 'antigravity/oauth/cancel'].includes(rest) ||
       rest === 'schedulable' ||
       rest === 'cooldown/clear' ||

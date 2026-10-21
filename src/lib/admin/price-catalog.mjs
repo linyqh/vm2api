@@ -556,6 +556,9 @@ function hasExactLayer(platform, id, catalog) {
 }
 
 export function resolvePrice(rawModel) {
+  // Antigravity subscriptions are a distinct billing platform. A model vendor
+  // name must not inherit the vendor's direct API price or wildcard overrides.
+  if (/^antigravity\//i.test(String(rawModel || '').trim())) return null
   const platform = platformOfModel(rawModel)
   const candidates = catalogIdCandidates(rawModel, platform)
   const catalog = loadCatalog()

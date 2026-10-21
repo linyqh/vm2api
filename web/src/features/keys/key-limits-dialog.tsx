@@ -269,8 +269,8 @@ export function KeyLimitsDialog({
           </Field>
           {draft.group_type === 'antigravity' ? (
             <p className='text-xs text-muted-foreground sm:col-span-2'>
-              Antigravity 范围独立保存；实验文本会话请使用槽位测试页，通用 /v1
-              API 暂不支持。
+              Antigravity 范围独立保存，API 模型使用 antigravity/ 前缀。
+              仅调度已授权且支持所选模型的 Antigravity 槽位。
             </p>
           ) : null}
           {draft.group_type === 'pool' ? (

@@ -580,10 +580,11 @@ function AntigravityCatalog() {
         <h3 className='font-semibold'>Antigravity 模型目录</h3>
         <p className='text-sm text-muted-foreground'>
           目录按接入平台隔离。模型供应商不改变槽位平台；请在 Antigravity
-          槽位账号页配置原始模型 ID。
+          平台设置中从已授权槽位同步官方模型目录。
         </p>
         <p className='text-xs text-muted-foreground'>
-          此目录用于实验文本会话。通用 /v1 API 暂不支持此平台。
+          支持 Messages、Chat Completions 与 Responses API。调用时保留
+          antigravity/ 前缀。
         </p>
         {items.length ? (
           <ul className='divide-y'>
@@ -600,7 +601,7 @@ function AntigravityCatalog() {
           </ul>
         ) : (
           <p className='text-sm text-muted-foreground'>
-            尚无已启用模型。请先启用实验平台并配置模型 ID。
+            尚无已启用模型。请先在平台设置中同步账号模型并启用 API 接入。
           </p>
         )}
       </section>

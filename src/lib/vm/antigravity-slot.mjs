@@ -31,6 +31,6 @@ export function summarizeAntigravitySlot(projectRoot, vm = {}) {
     credential_storage: 'slot-official-client',
     credential_state:
       authenticated === true ? 'authenticated' : authenticated === false ? 'unauthenticated' : 'unknown',
-    experimental: true,
+    experimental: false,
   }
 }

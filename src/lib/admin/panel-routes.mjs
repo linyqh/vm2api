@@ -148,8 +148,17 @@ import {
 import { fillVmTimezoneFromExit, syncVmTimezoneFromProxy } from '../vm/proxy-timezone.mjs'
 import { validTimezone } from '../core/timezone.mjs'
 import { stampVmKind, isCodexVm, isClaudeVm, isAntigravityVm, normalizeVmKind } from '../vm/vm-kind.mjs'
-import { validateAntigravityRoutingPatch, listAntigravityPublicModels } from '../protocol/antigravity-route.mjs'
+import {
+  validateAntigravityRoutingPatch,
+  listAntigravityPublicModels,
+  normalizeAntigravityRouting,
+} from '../protocol/antigravity-route.mjs'
 import { prepareAntigravityChat, antigravityStatusView, scopeAntigravitySession } from './antigravity-panel.mjs'
+import {
+  readAntigravityModelCatalog,
+  syncAntigravityModels,
+  mergeAntigravityCatalogModels,
+} from '../oauth/antigravity-models.mjs'
 import { closeAntigravityTextSession } from '../transport/antigravity-bridge-client.mjs'
 import { antigravityBridgeStatus, runAntigravityText } from '../transport/antigravity-bridge-supervisor.mjs'
 import {
@@ -1406,7 +1415,7 @@ export function createPanelHandler(ctx) {
         const candidate = getVm(cfg.paths.project, agPath[1])
         if (
           isAntigravityVm(candidate) &&
-          /^(oauth(?:\/|$)|credential(?:\/|$)|activate$|claude-reset(?:\/|$)|openai-quota(?:\/|$)|count-tokens$|probe$|test-chat$|diagnose$|official-cc-bootstrap(?:\/|$)|wrap-cli(?:\/|$)|seed-settings$|recreate$|package$|recover$|reset-fingerprint$|schedulable$)/.test(
+          /^(oauth(?:\/|$)|credential(?:\/|$)|activate$|claude-reset(?:\/|$)|openai-quota(?:\/|$)|count-tokens$|probe$|test-chat$|diagnose$|official-cc-bootstrap(?:\/|$)|wrap-cli(?:\/|$)|seed-settings$|recreate$|package$|recover$|reset-fingerprint$)/.test(
             agPath[2],
           )
         ) {
@@ -1414,7 +1423,7 @@ export function createPanelHandler(ctx) {
             ok: false,
             error: {
               code: 'antigravity_operation_unsupported',
-              message: 'Antigravity 实验槽请使用专用账号面板与文本会话',
+              message: 'Antigravity 槽位请使用专用账号与模型管理功能',
             },
           })
         }
@@ -1520,6 +1529,45 @@ export function createPanelHandler(ctx) {
           })
         }
       }
+      const agModelsRoute = p.match(/^\/api\/panel\/vms\/([^/]+)\/antigravity\/models\/sync$/)
+      if (req.method === 'POST' && agModelsRoute) {
+        const vm = isValidVmId(agModelsRoute[1]) ? getVm(cfg.paths.project, agModelsRoute[1]) : null
+        if (!vm) return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: '槽位不存在' } })
+        if (!isAntigravityVm(vm))
+          return json(res, 400, {
+            ok: false,
+            error: { code: 'platform_mismatch', message: '此操作需要 Antigravity 槽位' },
+          })
+        const body = await readBody(req, 4096)
+        if (
+          !body ||
+          typeof body !== 'object' ||
+          Array.isArray(body) ||
+          Object.keys(body).some((key) => key !== 'publish_global') ||
+          ('publish_global' in body && typeof body.publish_global !== 'boolean')
+        )
+          return json(res, 400, { ok: false, error: { code: 'invalid_request', message: '模型同步请求字段无效' } })
+        if (body.publish_global === true && panelIdentity(req).role !== 'admin')
+          return json(res, 403, { ok: false, error: { code: 'forbidden', message: '只有管理员可以发布全局模型目录' } })
+        const result = await (ctx.syncAntigravityModels || syncAntigravityModels)({
+          projectRoot: cfg.paths.project,
+          vm,
+          routing: getRouting(),
+          ops: { getVm: () => getVm(cfg.paths.project, vm.id) },
+        })
+        if (!result.ok)
+          return json(res, result.status || 502, { ok: false, error: { code: result.code, message: result.message } })
+        if (body.publish_global === true) {
+          const routing = getRouting()
+          persistRoutingPatch({
+            antigravity: {
+              ...normalizeAntigravityRouting(routing.antigravity),
+              models: mergeAntigravityCatalogModels(routing.antigravity?.models, result.models),
+            },
+          })
+        }
+        return json(res, 200, panel.ok({ ...result, published_global: body.publish_global === true }))
+      }
       const agRoute = p.match(/^\/api\/panel\/vms\/([^/]+)\/antigravity\/(status|chat|close)$/)
       if (
         agRoute &&
@@ -1540,8 +1588,8 @@ export function createPanelHandler(ctx) {
           return json(
             res,
             200,
-            panel.ok(
-              antigravityStatusView({
+            panel.ok({
+              ...antigravityStatusView({
                 routing,
                 runtime: {
                   ...runtime,
@@ -1549,7 +1597,8 @@ export function createPanelHandler(ctx) {
                     typeof runtime.authenticated === 'boolean' ? runtime.authenticated : auth.authenticated,
                 },
               }),
-            ),
+              model_catalog: readAntigravityModelCatalog(projectRoot, vm),
+            }),
           )
         }
         const actor = req.panelUserId ? `id:${req.panelUserId}` : `login:${panelIdentity(req).user || 'master'}`
@@ -3491,6 +3540,16 @@ export function createPanelHandler(ctx) {
           /oauth_revoked|oauth_invalid_grant|invalid_grant|refresh_token_missing|token has been revoked/i.test(
             `${currentVm?.claude?.refresh_error || ''} ${currentVm?.schedule_disabled_reason || ''}`,
           )
+        if (
+          body.schedulable &&
+          isAntigravityVm(currentVm) &&
+          summarizeAntigravitySlot(cfg.paths.project, currentVm).authenticated !== true
+        ) {
+          return json(res, 409, {
+            ok: false,
+            error: { code: 'credential_unavailable', message: '请先完成 Antigravity 账号授权，再开启调度' },
+          })
+        }
         if (body.schedulable && credentialFailure) {
           return json(res, 409, {
             ok: false,
@@ -4180,12 +4239,12 @@ export function createPanelHandler(ctx) {
           return json(res, 400, { ok: false, error: { code: 'invalid_platform', message: '不支持的账号平台' } })
         }
         const antigravity = requestedKind.platform === 'antigravity'
-        if (antigravity && (body.activate === true || body.allowed_models != null))
+        if (antigravity && body.activate === true)
           return json(res, 400, {
             ok: false,
             error: {
               code: 'antigravity_operation_unsupported',
-              message: 'Antigravity 实验槽不使用活跃账号或原生池模型策略，请在专用面板配置',
+              message: 'Antigravity 槽位通过独立 API 调度，无需设置为 Claude 活跃账号',
             },
           })
         const existing = listVms(cfg.paths.project)
@@ -4242,7 +4301,7 @@ export function createPanelHandler(ctx) {
         if (antigravity && (nodeId || runtime !== 'docker')) {
           return json(res, 400, {
             ok: false,
-            error: { code: 'antigravity_runtime_unsupported', message: 'Antigravity 实验槽仅支持本机 Docker' },
+            error: { code: 'antigravity_runtime_unsupported', message: 'Antigravity 槽位仅支持本机 Docker' },
           })
         }
         let machine
@@ -4434,11 +4493,19 @@ export function createPanelHandler(ctx) {
           ) {
             return json(res, 400, {
               ok: false,
-              error: { code: 'invalid_create_schedule', message: 'Antigravity 实验槽仅支持单会话调试' },
+              error: {
+                code: 'invalid_create_schedule',
+                message: 'Antigravity 槽位默认使用单会话并发，创建时请使用默认调度配置',
+              },
             })
           }
           vm.policy = { maxConcurrency: 1, maxRpm: 0, maxSessions: 1 }
-          vm.schedule_disabled_reason = 'antigravity_experimental_text_only'
+          if (Object.prototype.hasOwnProperty.call(body, 'allowed_models')) {
+            const parsed = parseAllowedModelsPatch(body.allowed_models, { vm })
+            if (!parsed.ok) return json(res, 400, { ok: false, error: { message: parsed.error } })
+            vm.policy.allowed_models = parsed.value
+          }
+          vm.schedule_disabled_reason = 'no_credential'
         } else if (isCodexVm(vm)) {
           if (
             (explicitConcurrency && invalidCreate(rawConcurrency, 1, 256)) ||

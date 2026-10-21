@@ -78,11 +78,14 @@ describe('Antigravity binding metadata from the server', () => {
     expect(vm.has_token).toBe(false)
   })
 
-  it('keeps an authenticated experimental client outside the gateway token pool', () => {
-    expect(poolStatus(vm)).toMatchObject({ key: 'off', text: '实验文本专用' })
+  it('shows API schedule intent without inventing token or quota windows', () => {
+    expect(poolStatus(vm)).toMatchObject({ key: 'off', text: 'API 调度关' })
     expect(fleetGroup(vm)).toBe('off')
-    expect(accountUsable(vm)).toBe(false)
+    expect(accountUsable(vm)).toBe(true)
     expect(poolQuota([vm])).toMatchObject({ eligible: 0, withToken: 0 })
+    expect(
+      poolStatus({ ...vm, schedulable: true, status: 'running' })
+    ).toMatchObject({ key: 'ok' })
   })
 
   it('leaves unknown and signed-out clients unbound, even with stale token flags', () => {

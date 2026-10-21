@@ -6,6 +6,7 @@ import http from 'node:http'
 import crypto from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { createAntigravityUpstream, ANTIGRAVITY_API_CAPABILITIES } from './antigravity-upstream.mjs'
 
 const TERMINAL = new Set(['SUCCESS', 'ERROR', 'CANCELED', 'INTERRUPTED', 'INVALID'])
 const COUNTERS = ['input_tokens', 'output_tokens', 'thinking_tokens', 'cache_read_tokens', 'total_tokens']
@@ -359,7 +360,10 @@ function tokenMatches(actual, expected) {
   return b.length > 0 && a.length === b.length && crypto.timingSafeEqual(a, b)
 }
 
-export async function startAntigravityBridge(config, { pool = createAntigravitySessionPool(config) } = {}) {
+export async function startAntigravityBridge(
+  config,
+  { pool = createAntigravitySessionPool(config), upstream = createAntigravityUpstream(config) } = {},
+) {
   if (!config?.socket_path || !config.internal_token) throw new Error('socket_path and internal_token are required')
   fs.mkdirSync(path.dirname(config.socket_path), { recursive: true, mode: 0o700 })
   let shutdown = async () => {}
@@ -380,7 +384,7 @@ export async function startAntigravityBridge(config, { pool = createAntigravityS
         platform: 'antigravity',
         authenticated: null,
         config_hash: config.config_hash || null,
-        capabilities: ANTIGRAVITY_TEXT_CAPABILITIES,
+        capabilities: ANTIGRAVITY_API_CAPABILITIES,
         sessions: pool.size,
       })
     if (req.method === 'POST' && req.url === '/shutdown') {
@@ -390,7 +394,7 @@ export async function startAntigravityBridge(config, { pool = createAntigravityS
       })
       return
     }
-    if (req.method !== 'POST' || !['/text', '/close-session'].includes(req.url))
+    if (req.method !== 'POST' || !['/text', '/inference', '/close-session'].includes(req.url))
       return json(404, failure(404, 'not_found', 'Not found'))
     let body = ''
     let tooLarge = false
@@ -399,12 +403,12 @@ export async function startAntigravityBridge(config, { pool = createAntigravityS
       for await (const chunk of req.iterator({ destroyOnReturn: false })) {
         if (tooLarge) continue
         body += chunk
-        if (Buffer.byteLength(body) > 128 * 1024) {
+        if (Buffer.byteLength(body) > (req.url === '/inference' ? 32 * 1024 * 1024 : 128 * 1024)) {
           tooLarge = true
           body = ''
         }
       }
-      if (tooLarge) return json(413, failure(413, 'request_too_large', 'Request exceeds 128 KiB'))
+      if (tooLarge) return json(413, failure(413, 'request_too_large', 'Request exceeds the bridge size limit'))
       body = JSON.parse(body)
     } catch {
       return json(400, failure(400, 'invalid_json', 'Invalid JSON'))
@@ -422,14 +426,23 @@ export async function startAntigravityBridge(config, { pool = createAntigravityS
     }
     res.once('close', disconnect)
     res.writeHead(200, { 'content-type': 'application/x-ndjson' })
-    const result = await pool.infer({
-      ...body,
-      signal: controller.signal,
-      onText: (text) => {
-        if (res.writableLength > 1024 * 1024) throw new Error('slow consumer')
-        res.write(JSON.stringify({ event: 'text_delta', text }) + '\n')
-      },
-    })
+    const result =
+      req.url === '/inference'
+        ? await upstream.infer(body, {
+            signal: controller.signal,
+            onEvent: (value) => {
+              if (res.writableLength > 1024 * 1024) throw new Error('slow consumer')
+              res.write(JSON.stringify({ event: 'inference_event', value }) + '\n')
+            },
+          })
+        : await pool.infer({
+            ...body,
+            signal: controller.signal,
+            onText: (text) => {
+              if (res.writableLength > 1024 * 1024) throw new Error('slow consumer')
+              res.write(JSON.stringify({ event: 'text_delta', text }) + '\n')
+            },
+          })
     res.off('close', disconnect)
     if (!res.destroyed) res.end(JSON.stringify({ event: 'result', result }) + '\n')
   })
@@ -446,6 +459,7 @@ export async function startAntigravityBridge(config, { pool = createAntigravityS
   shutdown = () => {
     closing ||= (async () => {
       pool.close()
+      upstream.close()
       server.closeAllConnections()
       await new Promise((resolve) => server.close(resolve))
       try {

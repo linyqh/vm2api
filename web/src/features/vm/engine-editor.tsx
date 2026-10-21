@@ -72,9 +72,9 @@ export function VmEngineEditor({
   if (isAntigravityVm(vm))
     return (
       <CardSection title='推理运行时'>
-        <p className='text-sm'>Antigravity 独立 bridge · 实验文本接入</p>
+        <p className='text-sm'>Antigravity 独立运行时 · 官方客户端接入</p>
         <p className='mt-2 text-xs text-muted-foreground'>
-          状态和配置见账号页。
+          账号页完成 OAuth，测试页同步账号模型，平台设置中控制 API 接入。
         </p>
       </CardSection>
     )

@@ -435,7 +435,12 @@ test('status remains read-only and VM detail never calls Claude health or proces
 
 test('AG creation defaults to stopped local Docker and never seeds Claude config', async (t) => {
   const project = fixture(t)
-  const h = harness(project, admin, { platform: 'antigravity', status: 'running', auto_allocate_proxy: false })
+  const h = harness(project, admin, {
+    platform: 'antigravity',
+    status: 'running',
+    auto_allocate_proxy: false,
+    allowed_models: ['antigravity/gemini-example'],
+  })
   await h.call('POST', 'vms/create')
   assert.equal(h.response.status, 200, JSON.stringify(h.response.body))
   const saved = h.response.body.data.vm
@@ -443,15 +448,16 @@ test('AG creation defaults to stopped local Docker and never seeds Claude config
   assert.equal(saved.runtime_type, 'docker')
   assert.equal(saved.status, 'stopped')
   assert.equal(saved.schedulable, false)
+  const stored = JSON.parse(fs.readFileSync(path.join(project, 'vms', `${saved.id}.json`), 'utf8'))
+  assert.deepEqual(stored.policy.allowed_models, ['antigravity/gemini-example'])
   assert.equal(fs.existsSync(path.join(project, 'vms', saved.id, 'cli-home', '.claude')), false)
 })
 
-test('AG rejects generic credential and scheduling mutations', async (t) => {
+test('AG rejects unrelated generic credential mutations', async (t) => {
   const project = fixture(t)
   for (const [method, suffix, body] of [
     ['POST', 'vms/import', { vm_id: vm.id, token: 'secret' }],
     ['POST', 'vms/vm-ag/oauth/refresh', {}],
-    ['POST', 'vms/vm-ag/schedulable', { schedulable: true }],
     ['POST', 'vms/vm-ag/activate', {}],
     ['POST', 'vms/vm-ag/credential/clear', {}],
     ['PATCH', 'vms/vm-ag', { inference_engine: 'rust' }],
@@ -463,7 +469,7 @@ test('AG rejects generic credential and scheduling mutations', async (t) => {
   }
 })
 
-test('generic AG requests bypass Claude cached health and never enter either scheduler', async () => {
+test('generic AG requests use independent admission and never use the Claude scheduler', async () => {
   for (const enabled of [false, true]) {
     const res = Object.assign(new EventEmitter(), { headersSent: false })
     const body = { model: 'antigravity/gemini-example', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }
@@ -477,7 +483,8 @@ test('generic AG requests bypass Claude cached health and never enter either sch
       requestLog: { start: () => ({ request_id: 'ag-unsupported' }), finish() {} },
       stats: { errors: 0 },
       groupsRepo: { rateMultiplier: () => 1 },
-      getRoutingConfig: () => ({ antigravity: { enabled } }),
+      getRoutingConfig: () => ({ antigravity: { enabled, models: ['gemini-example'] } }),
+      antigravityOps: { listVms: () => [] },
       getHealthMonitor: () => ({
         decide() {
           throw new Error('must not use cached Claude health')
@@ -487,8 +494,13 @@ test('generic AG requests bypass Claude cached health and never enter either sch
         throw new Error('must not schedule Claude')
       },
     })
-    await handler.handleProtocol({ headers: {}, apiKeyKind: 'master' }, res, 'anthropic.messages', '/v1/messages')
-    assert.equal(res.status, enabled ? 400 : 503, JSON.stringify(res.body))
-    assert.equal(res.body.error.code, enabled ? 'antigravity_experimental_text_only' : 'antigravity_disabled')
+    await handler.handleProtocol(
+      Object.assign(new EventEmitter(), { headers: {}, apiKeyKind: 'master' }),
+      res,
+      'anthropic.messages',
+      '/v1/messages',
+    )
+    assert.equal(res.status, 503, JSON.stringify(res.body))
+    assert.equal(res.body.error.code, enabled ? 'no_antigravity_vm' : 'antigravity_disabled')
   }
 })

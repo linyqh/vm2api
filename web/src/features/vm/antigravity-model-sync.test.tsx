@@ -1,0 +1,59 @@
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { renderToStaticMarkup } from 'react-dom/server'
+import { describe, expect, it } from 'vitest'
+import { AntigravityModelSync } from './antigravity-model-sync'
+import { antigravityModelSyncRequest } from './antigravity-model-sync-api'
+import { vmSchedulableProps } from './schedulable-switch'
+
+describe('Antigravity model synchronization', () => {
+  it('defaults to slot-only sync and makes global publication explicit', () => {
+    expect(antigravityModelSyncRequest('vm ag')).toEqual({
+      url: '/api/panel/vms/vm%20ag/antigravity/models/sync',
+      body: { publish_global: false },
+    })
+    expect(antigravityModelSyncRequest('vm-ag', true).body.publish_global).toBe(
+      true
+    )
+  })
+
+  it('shows only authorized Antigravity slots in the global settings picker', () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    client.setQueryData(['panel', 'vms'], {
+      items: [
+        {
+          id: 'vm-ready',
+          platform: 'antigravity',
+          antigravity: { authenticated: true },
+        },
+        {
+          id: 'vm-empty',
+          platform: 'antigravity',
+          antigravity: { authenticated: false },
+        },
+        { id: 'vm-gpt', platform: 'openai', has_token: true },
+      ],
+    })
+    const html = renderToStaticMarkup(
+      <QueryClientProvider client={client}>
+        <AntigravityModelSync publishGlobal />
+      </QueryClientProvider>
+    )
+    expect(html).toContain('vm-ready')
+    expect(html).not.toContain('vm-empty')
+    expect(html).not.toContain('vm-gpt')
+    expect(html).toContain('同步账号模型并加入全局目录')
+    client.clear()
+  })
+
+  it('does not permanently disable Antigravity API scheduling', () => {
+    expect(
+      vmSchedulableProps({
+        id: 'vm-ag',
+        platform: 'antigravity',
+        schedulable: true,
+      })
+    ).not.toHaveProperty('unsupported', true)
+  })
+})

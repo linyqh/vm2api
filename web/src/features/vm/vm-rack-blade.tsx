@@ -302,7 +302,9 @@ export function BladeCallout({
           ) : null
         }
       >
-        <span>Antigravity 实验文本会话可在测试页使用。</span>
+        <span>
+          同步账号模型并启用调度后可使用 Antigravity API；测试页可检查文本回复。
+        </span>
       </Callout>
     )
   }

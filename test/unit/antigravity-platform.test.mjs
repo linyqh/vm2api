@@ -86,7 +86,7 @@ test('platform sticky namespaces never reuse another platform conversation', () 
   assert.equal(scopeStickyKey(keys[2], 'antigravity'), keys[2])
 })
 
-test('routing is opt-in and does not advertise native API capabilities', () => {
+test('routing remains opt-in and advertises its independent API capabilities', () => {
   const defaults = normalizeAntigravityRouting()
   assert.deepEqual(defaults, {
     enabled: false,
@@ -97,9 +97,14 @@ test('routing is opt-in and does not advertise native API capabilities', () => {
     timeout_ms: 180000,
   })
   assert.deepEqual(listAntigravityPublicModels({ models: ['gemini-test'] }), [])
-  assert.equal(ANTIGRAVITY_CAPABILITIES.client_tools, false)
-  assert.equal(ANTIGRAVITY_CAPABILITIES.history_import, false)
-  assert.deepEqual(ANTIGRAVITY_CAPABILITIES.protocols, [])
+  assert.equal(ANTIGRAVITY_CAPABILITIES.client_tools, true)
+  assert.equal(ANTIGRAVITY_CAPABILITIES.history_import, true)
+  assert.deepEqual(ANTIGRAVITY_CAPABILITIES.protocols, [
+    'anthropic.messages',
+    'openai.chat',
+    'openai.responses',
+    'openai.completions',
+  ])
   for (const config of [
     null,
     [],

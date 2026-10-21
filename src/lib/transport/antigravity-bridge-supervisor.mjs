@@ -1,5 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
+import os from 'node:os'
 import crypto from 'node:crypto'
 import { execFile, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
@@ -8,7 +9,8 @@ import { isAntigravityVm } from '../vm/vm-kind.mjs'
 import { isKvmRuntime } from '../vm/runtime-kind.mjs'
 import { vmNodeId } from '../cluster/placement.mjs'
 import { slotNetworkForVm } from '../vm/egress.mjs'
-import { replaceSlotOwnedFile, chownSlotRuntimeFile } from '../oauth/oauth-credentials.mjs'
+import { replaceSlotOwnedFile, chownSlotRuntimeFile, slotRuntimeOwner } from '../oauth/oauth-credentials.mjs'
+import { publishAntigravitySlotAssets } from '../oauth/antigravity-auth-login.mjs'
 import { normalizeAntigravityRouting } from '../protocol/antigravity-route.mjs'
 import { antigravityBridgePaths, callAntigravityBridge } from './antigravity-bridge-client.mjs'
 
@@ -16,6 +18,7 @@ const execFileAsync = promisify(execFile)
 const starts = new Map()
 const tracked = new Map()
 const scriptSource = fileURLToPath(new URL('../../../scripts/antigravity-bridge.mjs', import.meta.url))
+const upstreamSource = fileURLToPath(new URL('../../../scripts/antigravity-upstream.mjs', import.meta.url))
 const BRIDGE_SCRIPT = '/home/kincli/.kin/antigravity-bridge.mjs'
 const BRIDGE_NODE = '/home/kincli/.kin/antigravity-node'
 const AGENT =
@@ -44,15 +47,33 @@ export function writeAntigravityBridgeConfig(projectRoot, vm, { routing = {} } =
   const paths = antigravityBridgePaths(projectRoot, vm)
   const home = path.join(projectRoot, 'vms', vm.id, 'cli-home')
   const kin = path.join(home, '.kin')
-  const workspace = path.join(kin, 'antigravity-workspace')
-  const agentDir = path.join(workspace, '.agents', 'agents')
-  for (const dir of [paths.runDir, home, kin, workspace, path.dirname(agentDir), agentDir]) {
-    fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
-    chownSlotRuntimeFile(dir, vm)
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-assets-'))
+  try {
+    const agentSource = path.join(temporary, 'vm2api-text.md')
+    fs.writeFileSync(agentSource, AGENT, { mode: 0o600 })
+    publishAntigravitySlotAssets(projectRoot, vm, {
+      directories: ['.kin/antigravity-workspace/.agents/agents'],
+      files: [
+        { source: scriptSource, path: '.kin/antigravity-bridge.mjs' },
+        { source: upstreamSource, path: '.kin/antigravity-upstream.mjs' },
+        { source: agentSource, path: '.kin/antigravity-workspace/.agents/agents/vm2api-text.md' },
+      ],
+    })
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true })
   }
+  fs.mkdirSync(paths.runDir, { recursive: true, mode: 0o700 })
+  if (!fs.lstatSync(paths.runDir).isDirectory() || fs.lstatSync(paths.runDir).isSymbolicLink())
+    throw new Error('Unsafe bridge run directory')
+  chownSlotRuntimeFile(paths.runDir, vm)
   let token = ''
   try {
-    token = fs.readFileSync(paths.tokenPath, 'utf8').trim()
+    const fd = fs.openSync(paths.tokenPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW)
+    try {
+      if (fs.fstatSync(fd).isFile() && fs.fstatSync(fd).size < 256) token = fs.readFileSync(fd, 'utf8').trim()
+    } finally {
+      fs.closeSync(fd)
+    }
   } catch {}
   if (!token) token = crypto.randomBytes(32).toString('hex')
   replaceSlotOwnedFile(paths.tokenPath, token + '\n', vm)
@@ -69,10 +90,10 @@ export function writeAntigravityBridgeConfig(projectRoot, vm, { routing = {} } =
   config.config_hash = crypto
     .createHash('sha256')
     .update(JSON.stringify({ ...config, internal_token: undefined }))
+    .update(fs.readFileSync(scriptSource))
+    .update(fs.readFileSync(upstreamSource))
     .digest('hex')
   replaceSlotOwnedFile(paths.configPath, JSON.stringify(config) + '\n', vm)
-  replaceSlotOwnedFile(path.join(kin, 'antigravity-bridge.mjs'), fs.readFileSync(scriptSource, 'utf8'), vm)
-  replaceSlotOwnedFile(path.join(agentDir, 'vm2api-text.md'), AGENT, vm)
   return { ...paths, home, kin, config, options }
 }
 
@@ -137,23 +158,7 @@ export async function ensureAntigravityBridge({ projectRoot, vm, routing = {}, o
     }
     if (!header.equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46])))
       return fail('antigravity_node_unavailable', 'The Antigravity slot requires a Linux ELF Node executable')
-    const nodeDest = path.join(paths.kin, 'antigravity-node')
-    const stat = fs.statSync(nodeSource)
-    if (
-      !fs.existsSync(nodeDest) ||
-      fs.statSync(nodeDest).size !== stat.size ||
-      !crypto
-        .createHash('sha256')
-        .update(fs.readFileSync(nodeSource))
-        .digest()
-        .equals(crypto.createHash('sha256').update(fs.readFileSync(nodeDest)).digest())
-    ) {
-      const temp = `${nodeDest}.${process.pid}.tmp`
-      fs.copyFileSync(nodeSource, temp)
-      fs.chmodSync(temp, 0o755)
-      chownSlotRuntimeFile(temp, vm)
-      fs.renameSync(temp, nodeDest)
-    }
+    publishAntigravitySlotAssets(projectRoot, vm, { files: [{ source: nodeSource, path: '.kin/antigravity-node' }] })
     // ECONNREFUSED means the previous container left a stale socket. An auth
     // response is a live process and must never be unlinked or replaced.
     if (old.code === 'unauthorized')
@@ -168,7 +173,22 @@ export async function ensureAntigravityBridge({ projectRoot, vm, routing = {}, o
     }
     const child = (ops.spawn || spawn)(
       'docker',
-      ['exec', info.container, BRIDGE_NODE, BRIDGE_SCRIPT, '--config', '/run/kin/antigravity.json'],
+      [
+        'exec',
+        '--user',
+        `${slotRuntimeOwner(vm).uid}:${slotRuntimeOwner(vm).gid}`,
+        '--env',
+        'HOME=/home/kincli',
+        '--env',
+        'PATH=/home/kincli/.local/bin:/usr/local/bin:/usr/bin:/bin',
+        '--workdir',
+        '/home/kincli',
+        info.container,
+        BRIDGE_NODE,
+        BRIDGE_SCRIPT,
+        '--config',
+        '/run/kin/antigravity.json',
+      ],
       { stdio: ['ignore', 'ignore', 'ignore'], shell: false },
     )
     let exited = false
@@ -219,6 +239,30 @@ export async function runAntigravityText({
     body: { model, prompt, session_id: sessionId },
     signal,
     onText,
+    timeoutMs: options.timeout_ms + 5000,
+  })
+}
+
+/** Structured API requests are forwarded to the slot-local official service adapter. */
+export async function runAntigravityInference({
+  projectRoot,
+  vm,
+  routing = {},
+  request,
+  signal,
+  onEvent,
+  ops = {},
+} = {}) {
+  const options = normalizeAntigravityRouting(routing.antigravity || {})
+  const started = await (ops.ensureBridge || ensureAntigravityBridge)({ projectRoot, vm, routing, ops })
+  if (!started.ok) return started
+  return await (ops.callBridge || callAntigravityBridge)({
+    projectRoot,
+    vm,
+    requestPath: '/inference',
+    body: request,
+    signal,
+    onEvent,
     timeoutMs: options.timeout_ms + 5000,
   })
 }

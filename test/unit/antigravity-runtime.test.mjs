@@ -11,9 +11,11 @@ import {
   antigravityBridgeStatus,
   ensureAntigravityBridge,
   runAntigravityText,
+  runAntigravityInference,
   stopAntigravityBridge,
   writeAntigravityBridgeConfig,
 } from '../../src/lib/transport/antigravity-bridge-supervisor.mjs'
+import { slotRuntimeOwner } from '../../src/lib/oauth/oauth-credentials.mjs'
 import { antigravityBridgePaths } from '../../src/lib/transport/antigravity-bridge-client.mjs'
 import { startAntigravityBridge } from '../../scripts/antigravity-bridge.mjs'
 import {
@@ -286,6 +288,14 @@ test('supervisor verifies container network and executes only a Docker-local bri
   assert.equal(launch.command, 'docker')
   assert.deepEqual(launch.args, [
     'exec',
+    '--user',
+    `${slotRuntimeOwner(vm).uid}:${slotRuntimeOwner(vm).gid}`,
+    '--env',
+    'HOME=/home/kincli',
+    '--env',
+    'PATH=/home/kincli/.local/bin:/usr/local/bin:/usr/bin:/bin',
+    '--workdir',
+    '/home/kincli',
     'kin-ag',
     '/home/kincli/.kin/antigravity-node',
     '/home/kincli/.kin/antigravity-bridge.mjs',
@@ -356,4 +366,44 @@ test('AG shell is plain and rejects Claude credential/login workflows before wri
   await assert.rejects(adoptShellLogin(root, vm), { code: 'platform_login_not_supported' })
   assert.equal((await adoptLiveShellLogin(root, vm)).imported, false)
   assert.equal(fs.existsSync(path.join(root, 'vms', vm.id, 'cli-home', '.claude')), false)
+})
+
+test('structured supervisor forwarding preserves events, request and cancellation', async () => {
+  const controller = new AbortController()
+  const onEvent = () => {}
+  const request = { model: 'model-a', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }
+  let forwarded
+  const response = await runAntigravityInference({
+    projectRoot: '/unused',
+    vm,
+    routing,
+    request,
+    signal: controller.signal,
+    onEvent,
+    ops: {
+      ensureBridge: async () => ({ ok: true }),
+      callBridge: async (options) => {
+        forwarded = options
+        return { ok: true, content: [] }
+      },
+    },
+  })
+  assert.equal(response.ok, true)
+  assert.equal(forwarded.requestPath, '/inference')
+  assert.equal(forwarded.body, request)
+  assert.equal(forwarded.onEvent, onEvent)
+  assert.equal(forwarded.signal, controller.signal)
+})
+
+test('bridge preparation refuses guest parent symlinks before publishing trusted assets', (t) => {
+  const root = rootFor(t)
+  const outside = path.join(root, 'outside')
+  fs.mkdirSync(outside)
+  fs.writeFileSync(path.join(outside, 'antigravity-bridge.mjs'), 'untouched')
+  const home = path.join(root, 'vms', vm.id, 'cli-home')
+  fs.mkdirSync(home, { recursive: true })
+  fs.symlinkSync(outside, path.join(home, '.kin'))
+  assert.throws(() => writeAntigravityBridgeConfig(root, vm, { routing }))
+  assert.deepEqual(fs.readdirSync(outside), ['antigravity-bridge.mjs'])
+  assert.equal(fs.readFileSync(path.join(outside, 'antigravity-bridge.mjs'), 'utf8'), 'untouched')
 })

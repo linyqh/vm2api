@@ -290,10 +290,10 @@ export function VmSchedulingBlock({
   if (isAntigravityVm(vm)) {
     return (
       <div className='space-y-1 rounded-md border px-2.5 py-2 text-xs'>
-        <div className='font-medium'>实验文本会话</div>
+        <div className='font-medium'>Antigravity API 调度</div>
         <p className='text-muted-foreground'>
-          Antigravity 使用独立会话，不参与通用 API
-          池调度。请在账号或测试页查看运行状态。
+          完成账号授权并同步可用模型后，使用槽位开关控制 API 调度。 当前并发{' '}
+          {inf}/{concMax || 1}，排队 {queued}。
         </p>
       </div>
     )

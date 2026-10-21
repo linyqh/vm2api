@@ -109,6 +109,7 @@ export function VmAccountTab(props: VmAccountTabProps) {
             />
           </CardContent>
         </Card>
+        <AllowedModelsCard vm={vm} />
       </TabsContent>
     )
 

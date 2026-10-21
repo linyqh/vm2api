@@ -22,6 +22,7 @@ export function callAntigravityBridge({
   body,
   signal,
   onText,
+  onEvent,
   timeoutMs = 5000,
 } = {}) {
   const paths = antigravityBridgePaths(projectRoot, vm)
@@ -45,7 +46,16 @@ export function callAntigravityBridge({
       if (settled) return
       settled = true
       signal?.removeEventListener('abort', onAbort)
-      resolve(value)
+      resolve(
+        result && value?.ok === false
+          ? {
+              ...value,
+              usage: value.usage ?? result.usage ?? null,
+              output_committed: value.output_committed === true || textCommitted || result.output_committed === true,
+              upstream_status: result.upstream_status ?? value.upstream_status ?? null,
+            }
+          : value,
+      )
     }
     const req = http.request(
       {
@@ -70,13 +80,16 @@ export function callAntigravityBridge({
           if (event.event === 'text_delta' && typeof event.text === 'string') {
             textCommitted ||= !!event.text
             onText?.(event.text)
+          } else if (event.event === 'inference_event' && event.value && typeof event.value.type === 'string') {
+            textCommitted = true
+            onEvent?.(event.value)
           } else if (event.event === 'result' && event.result && typeof event.result.ok === 'boolean')
             result = event.result
           else throw new Error('invalid_bridge_event')
         }
         res.on('data', (chunk) => {
           bytes += Buffer.byteLength(chunk)
-          if (bytes > 8 * 1024 * 1024) return req.destroy(new Error('response_too_large'))
+          if (bytes > 32 * 1024 * 1024) return req.destroy(new Error('response_too_large'))
           buffer += chunk
           if (!ndjson) return
           try {

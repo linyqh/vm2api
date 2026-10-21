@@ -4,7 +4,6 @@ import type { Vm } from '@/types/panel-vm'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
 import { expiresAtToMs } from '@/lib/fable-status'
-import { isAntigravityVm } from '@/lib/vm-kind'
 import { isRestrictedSchedule, restrictionUntilOf } from '@/lib/vm-status'
 import { Switch } from '@/components/ui/switch'
 import {
@@ -30,7 +29,6 @@ export function vmSchedulableProps(vm: Vm) {
       : vm.schedule_state,
     restrictionUntil: restrictionUntilOf(vm),
     restrictionReason: vm.restriction_reason,
-    unsupported: isAntigravityVm(vm),
   }
 }
 
@@ -78,7 +76,7 @@ export function SchedulableSwitch({
 
   const untilText = formatRestrictionUntil(restrictionUntil)
   const tooltip = unsupported
-    ? 'Antigravity 实验会话不参与通用 API 调度'
+    ? '当前槽位不支持 API 调度'
     : restricted && checked
       ? untilText
         ? `调度开，当前受限至 ${untilText}`

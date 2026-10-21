@@ -137,7 +137,13 @@ export async function evaluateProtocolIntercept({
   // is set, the slot decides GPT: a scope with no GPT pair and no named
   // account is out of range. Claude stays in the gate until a Claude pair
   // or a named account is selected; a GPT-only scope does not turn it off.
-  if (isOpenaiPlatformModel(inbound, body)) {
+  if (/^antigravity\//i.test(String(inbound?.model || body?.model || ''))) {
+    if (jevScopeConfigured(jev)) {
+      if (!jevScopeWaits(jev, 'antigravity')) return pass('scope')
+      if (!account) return pass('scope-wait')
+      if (!jevAccountInScope(jev, account)) return pass('scope')
+    }
+  } else if (isOpenaiPlatformModel(inbound, body)) {
     if (!jevScopeConfigured(jev)) {
       if (jev?.openai_platform_enabled !== true) return pass('platform')
     } else if (!jevScopeWaits(jev, 'gpt')) {

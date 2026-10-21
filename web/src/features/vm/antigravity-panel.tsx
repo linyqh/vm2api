@@ -12,12 +12,17 @@ import { Textarea } from '@/components/ui/textarea'
 import { antigravityModelsFromIds } from '@/features/settings/antigravity-models'
 import { routingQueryOptions } from '@/features/settings/queries'
 import { useVmPerms } from '@/features/vm/vm-perms'
+import {
+  AntigravityModelSync,
+  type AntigravityModelCatalog,
+} from './antigravity-model-sync'
 
 export type AntigravityStatus = {
   enabled?: boolean
   ready?: boolean
   authenticated?: boolean | null
   models?: { id: string; display_name?: string }[]
+  model_catalog?: AntigravityModelCatalog | null
   runtime?: { supported?: boolean }
   error?: string | { code?: string; message?: string } | null
   message?: string
@@ -134,16 +139,18 @@ function AntigravityPanelContent({
     <div className='space-y-3'>
       <Card>
         <CardHeader className='pb-2'>
-          <CardTitle className='text-sm'>Antigravity · 实验文本会话</CardTitle>
+          <CardTitle className='text-sm'>
+            Antigravity · 账号与 API 状态
+          </CardTitle>
         </CardHeader>
         <CardContent className='space-y-3 pt-0'>
           <p className='text-sm text-muted-foreground'>
-            使用槽内官方 Antigravity
-            客户端登录。当前支持显式会话的纯文本测试；完整历史、system、图片和外部工具调用尚未开放。
+            使用槽内官方 Antigravity 客户端完成账号登录。
+            授权后同步账号模型，启用平台并开启槽位调度即可使用 API。
           </p>
           <p className='text-xs text-muted-foreground'>
-            通用 /v1 Messages、Chat Completions 与 Responses API
-            暂不支持此平台。
+            支持 Messages、Chat Completions 与 Responses API，模型名称使用
+            antigravity/ 前缀。
           </p>
           <dl className='grid grid-cols-2 gap-2 text-sm'>
             <dt className='text-muted-foreground'>平台</dt>
@@ -173,14 +180,21 @@ function AntigravityPanelContent({
                   : '尚未确认'}
             </dd>
           </dl>
+          <p className='text-xs text-muted-foreground'>
+            账号模型：{status.data?.model_catalog?.models.length ?? 0} 个
+            {status.data?.model_catalog?.updated_at
+              ? ` · 同步于 ${new Date(status.data.model_catalog.updated_at).toLocaleString()}`
+              : ' · 尚未同步'}
+          </p>
+          {perms.credential ? <AntigravityModelSync vmId={vm.id} /> : null}
           {message ? (
             <p role='status' className='text-sm text-muted-foreground'>
               {message}
             </p>
           ) : null}
           <p className='text-xs text-muted-foreground'>
-            仅支持本机
-            Docker。请先配置官方客户端与独立凭证存储，再在运维终端运行官方登录流程；凭证由客户端管理。
+            仅支持本机 Docker。账号凭证由槽内官方客户端保存，使用账号页的 OAuth
+            完成绑定。
           </p>
           <Button
             size='sm'
@@ -349,8 +363,8 @@ export function AntigravitySettings() {
       </CardHeader>
       <CardContent className='space-y-3 pt-0'>
         <p className='text-xs text-muted-foreground'>
-          此配置作用于全部 Antigravity 槽位，默认关闭。模型 ID
-          以该账号实际可用目录为准。
+          此配置作用于全部 Antigravity
+          槽位，默认关闭。先从已授权槽位同步模型，再启用 API 接入。
         </p>
         {routing.error ? (
           <p role='alert' className='text-sm text-destructive'>
@@ -358,13 +372,14 @@ export function AntigravitySettings() {
           </p>
         ) : null}
         <div className='flex items-center justify-between'>
-          <Label htmlFor='agy-enabled'>启用实验文本接入</Label>
+          <Label htmlFor='agy-enabled'>启用 Antigravity API 接入</Label>
           <Switch
             id='agy-enabled'
             checked={enabled}
             onCheckedChange={setEnabled}
           />
         </div>
+        <AntigravityModelSync publishGlobal />
         <div className='space-y-1'>
           <Label htmlFor='agy-cli'>槽内客户端路径</Label>
           <Input

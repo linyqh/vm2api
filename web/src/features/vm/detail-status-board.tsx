@@ -177,12 +177,13 @@ export function VmStatusBoard(props: Props) {
   if (isAntigravityVm(vm)) {
     return (
       <section className='space-y-3 rounded-lg border bg-card p-4'>
-        <h2 className='text-lg font-semibold'>Antigravity · 实验平台</h2>
+        <h2 className='text-lg font-semibold'>Antigravity · 官方客户端接入</h2>
         <p className='text-sm text-muted-foreground'>
           在账号页检查官方客户端登录和独立运行时状态；在测试页使用显式会话进行纯文本测试。
         </p>
         <p className='text-xs text-muted-foreground'>
-          当前仅支持本机 Docker；通用 API、Claude 配额与遥测策略暂不适用。
+          支持 Messages、Chat Completions 与 Responses
+          API；账号模型需在槽位测试页同步。
         </p>
         <VmSchedulingBlock vm={vm} />
         <VmMemoryBlock vm={vm} />

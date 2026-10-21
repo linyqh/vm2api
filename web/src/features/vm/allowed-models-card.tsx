@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { Vm } from '@/types/panel-vm'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
-import { catalogForVm, isCodexVm } from '@/lib/vm-kind'
+import { catalogForVm, isAntigravityVm, isCodexVm } from '@/lib/vm-kind'
 import { claudeTier } from '@/lib/vm-status'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -13,6 +13,7 @@ import { modelPolicyQueryOptions } from '@/features/models/queries'
 import { dashboardQueryOptions } from '@/features/overview/queries'
 import { vmQueryOptions } from '@/features/vm/queries'
 import { matchesAllowedModel, toggleAllowedModel } from './allowed-models'
+import { AntigravityAllowedModelsCard } from './antigravity-allowed-models-card'
 
 type CatalogItem = { id: string; label: string; family?: string }
 
@@ -69,6 +70,14 @@ function isChecked(vm: Vm, id: string) {
 }
 
 export function AllowedModelsCard({ vm }: { vm: Vm }) {
+  return isAntigravityVm(vm) ? (
+    <AntigravityAllowedModelsCard vm={vm} />
+  ) : (
+    <NativeAllowedModelsCard vm={vm} />
+  )
+}
+
+function NativeAllowedModelsCard({ vm }: { vm: Vm }) {
   const qc = useQueryClient()
   const me = useQuery(meQueryOptions())
   const canEdit = me.data?.role === 'admin'

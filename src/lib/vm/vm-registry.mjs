@@ -185,11 +185,20 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
           session_slots: null,
           quota_override: null,
           can_claude_reset: false,
-          max_concurrency: 1,
-          max_sessions: 1,
+          max_concurrency: Math.max(
+            1,
+            Math.min(
+              Number(routing?.antigravity?.max_sessions) || 1,
+              Number(vm.policy?.maxConcurrency) || Number(routing?.antigravity?.max_sessions) || 1,
+            ),
+          ),
+          max_sessions: Number(routing?.antigravity?.max_sessions) || 1,
           inference_engine: 'antigravity',
-          schedulable: false,
-          schedule_disabled_reason: 'antigravity_experimental_text_only',
+          schedulable: vm.schedulable !== false && antigravity.authenticated === true,
+          schedule_disabled_reason:
+            antigravity.authenticated === true
+              ? vm.schedule_disabled_reason || null
+              : 'antigravity_official_login_required',
         }
       : {}),
   }
@@ -450,7 +459,7 @@ export function persistSlotEnginePolicyMany(projectRoot, ids, patch = {}) {
   for (const id of targets) {
     const vm = persistSlotEnginePolicy(projectRoot, id, patch)
     if (!vm) missing.push(id)
-    else items.push(summarizeVm(vm))
+    else items.push(summarizeVm(vm, projectRoot))
   }
   return { updated: items.length, missing, items }
 }
@@ -485,7 +494,11 @@ export function vmHasClaudeCredential(vm) {
  * re-enable) silently drops the whole GPT pool as `no_credential`.
  */
 export function vmHasSchedulableCredential(vm, projectRoot = null) {
-  if (!vm || isAntigravityVm(vm)) return false
+  if (!vm) return false
+  if (isAntigravityVm(vm))
+    return projectRoot
+      ? summarizeAntigravitySlot(projectRoot, vm).authenticated === true
+      : vm.antigravity?.authenticated === true
   if (!isCodexVm(vm)) {
     if (!vmHasClaudeCredential(vm)) return false
     // An expired access token with a recorded refresh failure is not a live
@@ -523,7 +536,7 @@ export function setVmSchedulable(
   if (!fs.existsSync(file)) return null
   const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
   const src = source === 'manual' || source === 'force' ? source : 'auto'
-  if (src === 'auto' && isManualScheduleLocked(vm)) return summarizeVm(vm)
+  if (src === 'auto' && isManualScheduleLocked(vm)) return summarizeVm(vm, projectRoot)
   if (src === 'manual') vm.schedule_manual = true
   vm.schedulable = !!schedulable
   vm.schedule_updated_at = new Date().toISOString()
@@ -536,7 +549,7 @@ export function setVmSchedulable(
     if (!preserveStatus && String(vm.status || '').toLowerCase() === 'running') vm.status = 'paused'
   }
   atomicWriteJson(file, vm)
-  return summarizeVm(vm)
+  return summarizeVm(vm, projectRoot)
 }
 export const KERNEL_UPDATE_HOLD = 'kernel_update'
 
@@ -610,7 +623,7 @@ export function bindVmProxy(projectRoot, id, proxyInfo) {
   vm.proxy_cli_enabled = hasBoundExit(vm.proxy)
   vm.updated_at = new Date().toISOString()
   atomicWriteJson(file, vm)
-  return summarizeVm(vm)
+  return summarizeVm(vm, projectRoot)
 }
 
 /**
@@ -712,7 +725,7 @@ export function persistVmTimezone(projectRoot, id, timezone, { source = 'manual'
   if (vm.fingerprint && typeof vm.fingerprint === 'object') vm.fingerprint.timezone = zone
   vm.updated_at = new Date().toISOString()
   atomicWriteJson(file, vm)
-  return summarizeVm(vm)
+  return summarizeVm(vm, projectRoot)
 }
 
 export function persistVmOwner(projectRoot, id, { ownerUserId = null, origin = null } = {}) {

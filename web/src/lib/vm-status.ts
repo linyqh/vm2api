@@ -535,10 +535,17 @@ function seatsFullTone(vm: Vm | undefined): StatusTone | null {
  * 临近闸线仍在接单，所以排在熔断之后：熔断中的槽确实不接单，要让人看见。
  */
 export function poolStatus(vm: Vm | undefined): StatusTone {
-  if (isAntigravityVm(vm))
-    return hasSlotCredential(vm)
-      ? { key: 'off', text: '实验文本专用', cls: 'off' }
-      : { key: 'none', text: '未绑定账号', cls: 'none' }
+  if (isAntigravityVm(vm)) {
+    if (!hasSlotCredential(vm))
+      return { key: 'none', text: '未绑定账号', cls: 'none' }
+    if (vm?.schedulable === false || vm?.schedule_state === 'off')
+      return { key: 'off', text: 'API 调度关', cls: 'off' }
+    if (vm?.schedule_state === 'restricted')
+      return { key: 'cool', text: 'API 调度受限', cls: 'caution' }
+    if (['stopped', 'dead', 'disabled'].includes(String(vm?.status)))
+      return { key: 'cool', text: '槽位未运行', cls: 'caution' }
+    return { key: 'ok', text: 'API 调度开', cls: 'ok' }
+  }
   // 吊销 / 废票先判：它可能同时带着 off / quota 的 availability.key，照 key
   // 判会显示成「调度关」，把真正的死因盖掉。
   if (parkedGrantDeath(vm) || vmRevoked(vm)) return invalidCredTone(vm)
@@ -627,6 +634,7 @@ export function poolStatus(vm: Vm | undefined): StatusTone {
  * 完整判定链（revoke 先于一切）。号池额度卡与本口径共用同一谓词。
  */
 export function accountUsable(vm: Vm | undefined): boolean {
+  if (isAntigravityVm(vm)) return hasSlotCredential(vm)
   return Boolean(vm?.has_token) && credentialStatus(vm).cls !== 'bad'
 }
 

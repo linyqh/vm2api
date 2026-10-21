@@ -1,13 +1,13 @@
-/** Experimental official CLI text sessions. Native API compatibility is not enabled. */
+/** Independent Antigravity account platform backed by the slot's authenticated runtime. */
 export const ANTIGRAVITY_MODEL_PREFIX = 'antigravity/'
 export const ANTIGRAVITY_CAPABILITIES = Object.freeze({
   experimental_text_session: true,
   streaming: true,
-  system: false,
-  images: false,
-  client_tools: false,
-  history_import: false,
-  protocols: Object.freeze([]),
+  system: true,
+  images: true,
+  client_tools: true,
+  history_import: true,
+  protocols: Object.freeze(['anthropic.messages', 'openai.chat', 'openai.responses', 'openai.completions']),
 })
 
 function objectOf(value) {
@@ -117,7 +117,7 @@ export function listAntigravityPublicModels(routing = {}) {
       vendor: model.vendor,
       upstream_model: model.id,
       enabled: true,
-      experimental: true,
+      experimental: false,
       capabilities: ANTIGRAVITY_CAPABILITIES,
       source: 'antigravity-routing',
     }))

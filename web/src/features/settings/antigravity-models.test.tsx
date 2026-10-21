@@ -22,10 +22,11 @@ describe('global Antigravity settings', () => {
         <AntigravitySettings />
       </QueryClientProvider>
     )
-    expect(html).toContain('启用实验文本接入')
+    expect(html).toContain('启用 Antigravity API 接入')
     expect(html).toContain('槽内客户端路径')
     expect(html).toContain('模型 ID，每行一个')
     expect(html).toContain('保存平台配置')
+    expect(html).toContain('同步账号模型并加入全局目录')
     expect(html).not.toContain('提交授权码')
     client.clear()
   })
