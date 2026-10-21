@@ -35,7 +35,7 @@ import { unitCircuit } from './unit-circuit.mjs'
 import { isSlotProxyDesynced, readWorkerProxyEndpoint, readWorkerEgressMode } from '../vm/vm-runtime.mjs'
 import { splitBlocksModel } from './weekly-split.mjs'
 import { slotAllowsModel } from './slot-model-gate.mjs'
-import { isCodexVm } from '../vm/vm-kind.mjs'
+import { normalizeVmKind } from '../vm/vm-kind.mjs'
 import { detectInboundPlatform } from '../protocol/platform-detect.mjs'
 import { resolveCredentialScheduleLevel } from './credential-weight.mjs'
 import { PLATFORM_SCOPE, normalizeOwnerId, vmMatchesOwnerScope } from '../admin/resource-owner.mjs'
@@ -298,10 +298,7 @@ function grantable(candidate) {
 function platformMismatch(model, vm) {
   const detected = detectInboundPlatform(model)
   if (!detected.ok) return false
-  const codex = isCodexVm(vm)
-  if (detected.platform === 'openai') return !codex
-  if (detected.platform === 'anthropic') return codex
-  return false
+  return detected.platform !== normalizeVmKind(vm).platform
 }
 
 function runtimeHealthStatus(value) {
@@ -877,6 +874,8 @@ export class PoolScheduler extends EventEmitter {
     // Soonest working-window open across resting slots; an all-rest pool
     // reports it as retry_after so the client can time the next attempt.
     candidates.rest_until = null
+    // Antigravity sessions belong to their dedicated bridge, including pinned calls.
+    if (/(?:^|\/)antigravity(?:\/|$)/i.test(String(model || '').trim())) return candidates
     const pin = pinVmId ? String(pinVmId).trim() : ''
     for (const summary of summaries) {
       if (signal?.aborted) throw makeAbortError()

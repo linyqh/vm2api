@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import type { Vm, VmProxySnap } from '@/types/panel-vm'
 import { type CredType, credTypeLabel } from '@/lib/cred-type'
-import { isCodexVm } from '@/lib/vm-kind'
+import { isAntigravityVm, isClaudeVm, isCodexVm } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
@@ -122,21 +122,27 @@ export function VmOpsTab(props: VmOpsTabProps) {
         onFollowProxy={onTimezoneFollowProxy}
       />
       <div className='flex flex-wrap gap-2'>
-        <Button
-          size='sm'
-          variant='outline'
-          loading={busy('/activate')}
-          onClick={() => onAction('/activate')}
-        >
-          设为活跃
-        </Button>
+        {!isAntigravityVm(vm) ? (
+          <Button
+            size='sm'
+            variant='outline'
+            loading={busy('/activate')}
+            onClick={() => onAction('/activate')}
+          >
+            设为活跃
+          </Button>
+        ) : null}
         <Button
           size='sm'
           variant='outline'
           loading={busy('/reload')}
           onClick={() => onAction('/reload')}
         >
-          {gpt ? '重载 Codex kernel' : '重载 worker'}
+          {isAntigravityVm(vm)
+            ? '重载 Antigravity bridge'
+            : gpt
+              ? '重载 Codex kernel'
+              : '重载 worker'}
         </Button>
         <Button
           size='sm'
@@ -146,7 +152,7 @@ export function VmOpsTab(props: VmOpsTabProps) {
         >
           采集特征
         </Button>
-        {gpt ? null : (
+        {!isClaudeVm(vm) ? null : (
           <>
             <Tooltip>
               <TooltipTrigger asChild>
@@ -205,7 +211,7 @@ export function VmOpsTab(props: VmOpsTabProps) {
           ) : null}
         </Tooltip>
       </div>
-      {gpt ? null : (
+      {!isClaudeVm(vm) ? null : (
         <>
           <Separator />
           <div className='flex flex-wrap items-center gap-2'>

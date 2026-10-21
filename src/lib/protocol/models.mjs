@@ -16,6 +16,7 @@ import {
 import { hasClaudeCode1mSuffix, stripClaudeCode1mSuffix } from './context-1m.mjs'
 import { isGptSeriesId } from './gpt-ids.mjs'
 import { listGptPolicyModels } from './gpt-model-policy.mjs'
+import { listAntigravityPublicModels } from './antigravity-route.mjs'
 
 const FAMILY_ALIASES = new Map([
   ['sonnet', 'sonnet'],
@@ -61,18 +62,20 @@ function listGptPublicModels() {
 
 /**
  * Local catalog for GET /v1/models and boot. Does not touch workers.
- * groupType is the key's group_type: openai lists GPT only, anthropic lists Claude only, all lists both.
+ * groupType is the key's account platform. Antigravity uses the current local routing snapshot.
  */
-export function gatewayModelCatalog({ groupType = 'all' } = {}) {
+export function gatewayModelCatalog({ groupType = 'all', antigravityRouting = {} } = {}) {
   seedModelCatalog()
   try {
     loadModelPolicy()
   } catch {}
-  const gpt = groupType === 'anthropic' ? [] : listGptPublicModels()
-  const claude = groupType === 'openai' ? [] : listOfficialModels()
+  const gpt = groupType === 'all' || groupType === 'openai' ? listGptPublicModels() : []
+  const claude = groupType === 'all' || groupType === 'anthropic' ? listOfficialModels() : []
+  const antigravity =
+    groupType === 'all' || groupType === 'antigravity' ? listAntigravityPublicModels(antigravityRouting) : []
   return {
     object: 'list',
-    data: [...gpt, ...claude],
+    data: [...gpt, ...claude, ...antigravity],
     source: cache.source || 'model-policy',
   }
 }
@@ -165,6 +168,7 @@ function resolvePolicyAliasToCatalog(raw, ids) {
 export function resolveCatalogModel(raw, ids = cache.ids) {
   const m = String(raw || '').trim()
   if (!m) return { ok: false, reason: 'empty' }
+  if (/(?:^|\/)antigravity(?:\/|$)/i.test(m)) return { ok: false, reason: 'platform_mismatch' }
   const popped = m.split('/').filter(Boolean).pop() || m
   const want1m = hasClaudeCode1mSuffix(popped)
   const bare = stripClaudeCode1mSuffix(popped)
@@ -276,6 +280,17 @@ export function validateOfficialModel(model) {
         message: 'model is required. Use a model from the gateway model catalog.',
         type: 'invalid_request_error',
         code: 'model_required',
+      },
+    }
+  }
+  if (/(?:^|\/)antigravity(?:\/|$)/i.test(m)) {
+    return {
+      ok: false,
+      error: {
+        message: `model '${m}' belongs to the Antigravity platform.`,
+        type: 'invalid_request_error',
+        code: 'platform_mismatch',
+        param: 'model',
       },
     }
   }

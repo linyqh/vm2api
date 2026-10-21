@@ -1,12 +1,12 @@
 /**
  * Managed-key schedule scope.
- * group_type all schedules every VM. anthropic/openai only schedule the checked VMs of that platform.
+ * group_type all schedules every VM. Platform groups only schedule their checked VMs.
  * vm_pool_id schedules the pool's current members instead of a copied allowlist.
  * group_id (coding/other) is a rate multiplier and is not this field.
  */
 import { isDbOpen, getDb } from '../db/database.mjs'
 import { VmPoolsRepo } from '../db/repos/vm-pools-repo.mjs'
-import { isCodexVm } from '../vm/vm-kind.mjs'
+import { normalizeVmKind } from '../vm/vm-kind.mjs'
 
 const POOL_DENIAL = {
   missing: '账号池不存在',
@@ -15,7 +15,7 @@ const POOL_DENIAL = {
 }
 
 export function vmGroupType(vm) {
-  return isCodexVm(vm) ? 'openai' : 'anthropic'
+  return normalizeVmKind(vm).platform
 }
 
 export function parseAllowedVms(value) {
@@ -43,7 +43,7 @@ export function parseAllowedVms(value) {
   ]
 }
 
-/** null when the value is present but not all/anthropic/openai. Empty uses fallback. */
+/** Unknown explicit platforms are rejected. Empty uses fallback. */
 export function normalizeGroupType(value, { fallback = 'all' } = {}) {
   if (value == null || value === '') return fallback
   if (value === 'pool') return null
@@ -51,6 +51,7 @@ export function normalizeGroupType(value, { fallback = 'all' } = {}) {
   if (v === 'all') return 'all'
   if (v === 'anthropic' || v === 'claude') return 'anthropic'
   if (v === 'openai' || v === 'gpt' || v === 'codex') return 'openai'
+  if (v === 'antigravity') return 'antigravity'
   return null
 }
 
@@ -70,7 +71,7 @@ function poolIdOf(value) {
 
 export function keyScopeFromRecord(rec) {
   if (!rec) return { group_type: 'all', allowed_vms: [], vm_pool_id: null }
-  const group_type = normalizeGroupType(rec.group_type) || 'all'
+  const group_type = normalizeGroupType(rec.group_type) || 'unknown'
   const vm_pool_id = poolIdOf(rec.vm_pool_id)
   return {
     group_type,
@@ -140,7 +141,9 @@ export function normalizeKeyScope(input = {}, { partial = false, current = null 
   if (hasType) {
     const parsed = normalizeGroupType(input.group_type, { fallback: null })
     if (!parsed) {
-      throw Object.assign(new Error('group_type 只能是 all、anthropic 或 openai'), { code: 'invalid_group_type' })
+      throw Object.assign(new Error('group_type 只能是 all、anthropic、openai 或 antigravity'), {
+        code: 'invalid_group_type',
+      })
     }
     group_type = parsed
   }
@@ -153,7 +156,7 @@ export function normalizeKeyScope(input = {}, { partial = false, current = null 
   }
   if (group_type === 'all') allowed_vms = []
   if (group_type !== 'all' && allowed_vms.length === 0) {
-    throw Object.assign(new Error('选择 anthropic 或 openai 时至少勾选一台 VM'), { code: 'key_vms_required' })
+    throw Object.assign(new Error('选择平台分组时至少勾选一台 VM'), { code: 'key_vms_required' })
   }
   return { group_type, allowed_vms, vm_pool_id: null }
 }

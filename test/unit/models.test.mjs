@@ -146,7 +146,7 @@ test('gatewayModelCatalog stays local and never hops', () => {
   )
   const src = fs.readFileSync(new URL('../../src/server.mjs', import.meta.url), 'utf8')
   assert.equal(src.includes('callWorkerGet'), false)
-  assert.match(src, /return gatewayModelCatalog\([a-z]*\)/)
+  assert.match(src, /return gatewayModelCatalog\(/)
 })
 
 test('models module never talks to Anthropic or a CLI binary', () => {

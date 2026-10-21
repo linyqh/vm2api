@@ -7,6 +7,7 @@ import { slotContainerName } from '../transport/rust-kernel-supervisor.mjs'
 import { slotHost } from './slot-host.mjs'
 import { runtimeKind } from './runtime-kind.mjs'
 import { slotExecArgv } from './slot-exec.mjs'
+import { isClaudeVm } from './vm-kind.mjs'
 
 const exec = promisify(execFile)
 export const SLOT_WORKER_BIN = '/usr/local/bin/kin-worker'
@@ -39,6 +40,7 @@ function isSafeSlotId(id) {
 
 export async function readSlotProcessStatus({ projectRoot, vm, run = exec, timeoutMs = 2500 } = {}) {
   const unknown = { telemetry: { enabled: null, running: null }, process_topology: null }
+  if (!isClaudeVm(vm)) return { telemetry: { enabled: false, running: false }, process_topology: null }
   if (!projectRoot || !isSafeSlotId(vm?.id)) return unknown
   let enabled = null
   try {
@@ -79,6 +81,7 @@ export async function readSlotProcessStatus({ projectRoot, vm, run = exec, timeo
  * Background check: `docker exec` takes 3-5s on a loaded host, far over the detail page's budget.
  */
 export async function ensureTelemetrySidecar({ projectRoot, vm, run = exec, timeoutMs = 15_000 } = {}) {
+  if (!isClaudeVm(vm)) return { ok: true, action: 'unchanged' }
   const status = await readSlotProcessStatus({ projectRoot, vm, run, timeoutMs })
   if (status.telemetry.enabled !== true || status.telemetry.running !== false) {
     return { ok: true, action: 'unchanged' }
@@ -109,6 +112,7 @@ export async function ensureTelemetrySidecar({ projectRoot, vm, run = exec, time
 
 /** Replace only the Go telemetry child; the slot container and Rust process stay up. */
 export async function restartTelemetrySidecar({ projectRoot, vm, enabled, run = exec, timeoutMs = 15_000 } = {}) {
+  if (!isClaudeVm(vm)) return { ok: true, action: 'unchanged' }
   if (!projectRoot || !isSafeSlotId(vm?.id)) return { ok: false, action: 'invalid_vm' }
   const kind = runtimeKind(vm)
   if (kind !== 'docker' && kind !== 'kvm') return { ok: false, action: 'unsupported_runtime' }

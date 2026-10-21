@@ -1,7 +1,7 @@
 import type { Vm } from '@/types/panel-vm'
 import type { StatusTone } from '@/types/status'
 import { pct } from '@/lib/format'
-import { isCodexVm } from '@/lib/vm-kind'
+import { isClaudeVm, isCodexVm } from '@/lib/vm-kind'
 
 function credTextOf(vm: Vm): { text: string; key: string; tone: string } {
   const cred = vm.cred_status
@@ -655,6 +655,8 @@ export function openaiPlanLabel(planType: unknown): string {
 }
 
 export function claudeTier(vm: Vm | undefined): StatusTone {
+  if (!isClaudeVm(vm) && !isCodexVm(vm))
+    return { key: 'none', label: '—', cls: 'none', text: '—' }
   if (isCodexVm(vm)) {
     if (!vm?.has_token)
       return { key: 'none', label: '—', cls: 'none', text: '—' }

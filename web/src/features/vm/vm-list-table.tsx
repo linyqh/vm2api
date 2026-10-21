@@ -7,7 +7,7 @@ import { expiresAtToMs, fmtResetClock } from '@/lib/fable-status'
 import { fmtNum } from '@/lib/format'
 import { tierVisual } from '@/lib/tier-visual'
 import { cn } from '@/lib/utils'
-import { isCodexVm, slotNameLabel } from '@/lib/vm-kind'
+import { isClaudeVm, isCodexVm, slotNameLabel } from '@/lib/vm-kind'
 import {
   credentialStatus,
   fleetGroup,
@@ -189,7 +189,7 @@ function CountPill({ tone, n }: { tone: 'ok' | 'bad'; n: number }) {
 
 /** 实时席位占用（预调度席位簿）；Codex 行没有席位。 */
 function SeatTag({ vm }: { vm: Vm }) {
-  if (vm.seats_max == null) return null
+  if (!isClaudeVm(vm) || vm.seats_max == null) return null
   const used = Number(vm.seats_used) || 0
   const queued = Number(vm.queue_depth) || 0
   if (!used && !queued) return null

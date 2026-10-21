@@ -1,3 +1,4 @@
+import { isClaudeVm } from '../vm/vm-kind.mjs'
 /**
  * Periodic OAuth refresh for every slot that still has a refresh token,
  * including operator 调度关. Inference no longer reaches those workers, so
@@ -53,7 +54,7 @@ export function vmHasProxyPath(vm) {
 }
 
 export function isCredentialRefreshTarget(vm) {
-  if (!vm?.id) return false
+  if (!vm?.id || !isClaudeVm(vm)) return false
   if (!hasRefreshPresence(vm.claude) && !vm.has_refresh) return false
   const status = String(vm.status || '').toLowerCase()
   if (HARD_DOWN.has(status)) return false

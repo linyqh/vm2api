@@ -12,7 +12,7 @@ import type {
   WeeklySplitSummary,
 } from '@/lib/fable-status'
 import { fmtNum, fmtUsd } from '@/lib/format'
-import { isCodexVm } from '@/lib/vm-kind'
+import { isClaudeVm, isCodexVm } from '@/lib/vm-kind'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { TabsContent } from '@/components/ui/tabs'
 import { VmCostByModel } from '@/features/vm/detail-cost-by-model'
@@ -105,7 +105,7 @@ export function VmOverviewTab(props: VmOverviewTabProps) {
       <VmStatusBoard vm={vm} kernel={kernel} {...board} />
       {isCodexVm(vm) ? <OpenaiWindowStats billing={billing} /> : null}
       <VmCostByModel rows={costByModel} />
-      {isCodexVm(vm) ? null : (
+      {!isClaudeVm(vm) ? null : (
         <div className='grid gap-3 lg:grid-cols-2'>
           <VmEngineEditor id={vm.id} vm={vm} kernel={kernel} />
           <VmPersonaEditor id={vm.id} vm={vm} />

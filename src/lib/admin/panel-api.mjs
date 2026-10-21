@@ -8,6 +8,7 @@
 
 import { THINKING_DISPLAY_MODES } from '../protocol/thinking.mjs'
 import { readSlotProcessStatus } from '../vm/slot-process-status.mjs'
+import { isAntigravityVm } from '../vm/vm-kind.mjs'
 import os from 'node:os'
 import path from 'node:path'
 import {
@@ -802,6 +803,25 @@ export async function buildVmDetail({
     clusterNodes,
     role,
   })
+  if (isAntigravityVm(vm)) {
+    return ok({
+      vm: summary,
+      proxy: summary.proxy || null,
+      proxy_pool: summarizeProxyPool(proxyPool),
+      billing: null,
+      account: null,
+      official_cc: null,
+      kernel: {
+        credential_owner: 'antigravity',
+        configured_engine: 'antigravity',
+        resolved_engine: 'antigravity',
+        active_engine: null,
+        go_health: null,
+        rust_health: null,
+        codex_health: null,
+      },
+    })
+  }
   const acc = findAccount(accountQuota, summary)
   const billing = (() => {
     try {
@@ -1052,6 +1072,16 @@ export async function buildProbeOne({
   routingConfig = {},
 } = {}) {
   const vm = getVm(cfg.paths.project, id)
+  if (isAntigravityVm(vm)) {
+    return fail(
+      makeError({
+        type: ErrorType.INVALID_REQUEST,
+        code: 'antigravity_operation_unsupported',
+        message: '请使用 Antigravity 专用状态面板与文本会话',
+        status: 400,
+      }),
+    )
+  }
   if (!vm) {
     return fail(
       makeError({
@@ -1722,6 +1752,18 @@ function mergeVmProxy(v, poolSnap, { role = 'admin', nodes = [] } = {}) {
 }
 
 function enrichVm(v, accountQuota, active, extras = {}) {
+  if (isAntigravityVm(v)) {
+    return {
+      ...v,
+      ...mergeVmProxy(v, extras.poolSnap, { role: extras.role, nodes: extras.clusterNodes }),
+      is_active: v.id === active,
+      resolved_inference_engine: 'antigravity',
+      resolved_persona_preset: null,
+      schedulable: false,
+      schedule_disabled_reason: 'antigravity_experimental_text_only',
+      can_import_credential: false,
+    }
+  }
   if (extras.projectRoot && isLeftoverQuotaScheduleOff(v)) {
     setVmSchedulable(extras.projectRoot, v.id, true, null, { preserveStatus: true, source: 'force' })
     v = { ...v, schedulable: true, schedule_disabled_reason: null }

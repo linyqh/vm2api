@@ -1,6 +1,6 @@
 import type { Vm } from '@/types/panel-vm'
 
-export type VmKind = 'claude' | 'codex'
+export type VmKind = 'claude' | 'codex' | 'antigravity' | 'unknown'
 
 function labelOf(vm: Vm | undefined, key: 'platform' | 'family' | 'kind') {
   return String(vm?.[key] || '')
@@ -13,16 +13,12 @@ export function vmKindOf(vm: Vm | undefined): VmKind {
   const platform = labelOf(vm, 'platform')
   const family = labelOf(vm, 'family')
   const kind = labelOf(vm, 'kind')
-  if (
-    platform === 'openai' ||
-    family === 'codex' ||
-    kind === 'codex' ||
-    kind === 'gpt'
-  ) {
-    return 'codex'
-  }
-  if (platform === 'anthropic' || family === 'claude' || kind === 'claude') {
-    return 'claude'
+  for (const label of [platform, family, kind]) {
+    if (!label) continue
+    if (label === 'antigravity') return 'antigravity'
+    if (label === 'anthropic' || label === 'claude') return 'claude'
+    if (['openai', 'codex', 'gpt', 'chatgpt'].includes(label)) return 'codex'
+    if (label === platform) return 'unknown'
   }
   if (vm.codex_kernel === true) return 'codex'
   if (String(vm.inference_engine || '').trim() === 'codex') return 'codex'
@@ -34,12 +30,25 @@ export function isCodexVm(vm: Vm | undefined): boolean {
   return vmKindOf(vm) === 'codex'
 }
 
-export function platformLabel(vm: Vm | undefined): 'Claude' | 'GPT' {
-  return isCodexVm(vm) ? 'GPT' : 'Claude'
+export function isAntigravityVm(vm: Vm | undefined): boolean {
+  return vmKindOf(vm) === 'antigravity'
 }
 
-export function platformLabelOf(kind: VmKind): 'Claude' | 'GPT' {
-  return kind === 'codex' ? 'GPT' : 'Claude'
+export function isClaudeVm(vm: Vm | undefined): boolean {
+  return vmKindOf(vm) === 'claude'
+}
+
+export function platformLabel(vm: Vm | undefined): string {
+  return platformLabelOf(vmKindOf(vm))
+}
+
+export function platformLabelOf(kind: VmKind): string {
+  return {
+    claude: 'Claude',
+    codex: 'GPT',
+    antigravity: 'Antigravity',
+    unknown: '未知平台',
+  }[kind]
 }
 
 export function indexVms(vms: Vm[] | undefined | null): Map<string, Vm> {
@@ -58,6 +67,11 @@ export function kindFromModel(
   const proto = String(protocol || '')
     .trim()
     .toLowerCase()
+  if (
+    /^antigravity\//i.test(String(model || '').trim()) ||
+    proto === 'antigravity'
+  )
+    return 'antigravity'
   if (
     proto === 'openai' ||
     proto === 'codex' ||
@@ -141,12 +155,25 @@ export function isGptCatalogId(id: string, family?: string) {
   return /^gpt/i.test(String(id || '')) && !/^gpt-image/i.test(String(id || ''))
 }
 
-export function catalogForVm<T extends { id: string; family?: string }>(
-  items: T[],
-  vm: Vm | undefined
-): T[] {
-  const gpt = isCodexVm(vm)
-  return items.filter((item) =>
-    isGptCatalogId(item.id, item.family) ? gpt : !gpt
-  )
+export function catalogForVm<
+  T extends { id: string; family?: string; platform?: string },
+>(items: T[], vm: Vm | undefined): T[] {
+  const kind = vmKindOf(vm)
+  return items.filter((item) => {
+    const platform = String(item.platform || '').toLowerCase()
+    const itemKind: VmKind = platform
+      ? platform === 'antigravity'
+        ? 'antigravity'
+        : platform === 'openai'
+          ? 'codex'
+          : platform === 'anthropic'
+            ? 'claude'
+            : 'unknown'
+      : /^antigravity\//i.test(item.id) || item.family === 'antigravity'
+        ? 'antigravity'
+        : isGptCatalogId(item.id, item.family)
+          ? 'codex'
+          : 'claude'
+    return itemKind === kind
+  })
 }

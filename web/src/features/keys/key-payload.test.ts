@@ -14,6 +14,12 @@ const draft: KeyLimitsDraft = {
 }
 
 describe('API key limit payload', () => {
+  it('preserves the independent Antigravity platform scope', () => {
+    expect(
+      keyLimitsPayload({ ...draft, group_type: 'antigravity' }, 'create')
+    ).toMatchObject({ group_type: 'antigravity', allowed_vms: ['vm-01'] })
+  })
+
   it('keeps request and USD quotas separate', () => {
     expect(keyLimitsPayload(draft, 'create')).toEqual({
       name: 'ops',

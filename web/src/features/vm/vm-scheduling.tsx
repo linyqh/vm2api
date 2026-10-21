@@ -5,7 +5,7 @@ import { SlidersHorizontal } from 'lucide-react'
 import { toast } from 'sonner'
 import { patchVm, type VmPatch } from '@/lib/api'
 import { cn } from '@/lib/utils'
-import { isCodexVm } from '@/lib/vm-kind'
+import { isAntigravityVm, isCodexVm } from '@/lib/vm-kind'
 import { seatTitle } from '@/lib/vm-status'
 import { Button } from '@/components/ui/button'
 import {
@@ -287,6 +287,18 @@ export function VmSchedulingBlock({
   const level = Number(vm.schedule_level)
   const canEdit = useVmPerms().admin
 
+  if (isAntigravityVm(vm)) {
+    return (
+      <div className='space-y-1 rounded-md border px-2.5 py-2 text-xs'>
+        <div className='font-medium'>实验文本会话</div>
+        <p className='text-muted-foreground'>
+          Antigravity 使用独立会话，不参与通用 API
+          池调度。请在账号或测试页查看运行状态。
+        </p>
+      </div>
+    )
+  }
+
   return (
     <div className='space-y-2 rounded-md border border-primary/30 bg-primary/5 px-2.5 py-2'>
       <div className='flex items-center justify-between gap-2'>
@@ -482,6 +494,11 @@ function KnobRow({
 }
 
 export function VmSchedulingEditor({ vm }: { vm: Vm }) {
+  if (isAntigravityVm(vm)) return null
+  return <NativeVmSchedulingEditor vm={vm} />
+}
+
+function NativeVmSchedulingEditor({ vm }: { vm: Vm }) {
   const qc = useQueryClient()
   const [open, setOpen] = useState(false)
   const [draft, setDraft] = useState(() => draftOf(vm))

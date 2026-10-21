@@ -148,6 +148,34 @@ test('a platform-scoped key cannot count tokens on the other platform and peeks 
   assert.deepEqual(seen[0], { group_type: 'anthropic', allowed_vms: ['vm-02'], vm_pool_id: null })
 })
 
+test('Antigravity count_tokens rejects before account selection while preserving key scope denials', async () => {
+  for (const [model, group, expectedStatus, expectedCode] of [
+    ['antigravity/claude-test', 'all', 400, 'antigravity_experimental_text_only'],
+    ['antigravity/gpt-test', 'antigravity', 400, 'antigravity_experimental_text_only'],
+    ['antigravity/claude-test', 'anthropic', 403, 'key_group_mismatch'],
+    ['prefix/antigravity/claude-test', 'all', 400, 'model_not_supported'],
+    ['antigravity//claude-test', 'all', 400, 'model_not_supported'],
+    ['gemini-test', 'all', 400, 'model_not_supported'],
+  ]) {
+    const cap = jsonCapture()
+    const forbidden = async () => assert.fail(`${model} must not select an account or hop`)
+    await handleUserCountTokens(
+      { apiKeyKind: 'managed', apiKeyRecord: { group_type: group, allowed_vms: ['vm-ag-01'] } },
+      {},
+      {
+        json: cap.json,
+        requireAuth: () => true,
+        readBody: async () => ({ model, messages: [{ role: 'user', content: 'hello' }] }),
+        cfg: { limits: { max_body_bytes: 4096 } },
+        getPoolScheduler: () => ({ peekAccount: forbidden }),
+        countTokensViaWorker: forbidden,
+      },
+    )
+    assert.equal(cap.calls[0].status, expectedStatus, model)
+    assert.equal(cap.calls[0].body.error.code, expectedCode, model)
+  }
+})
+
 test('distill count_tokens returns distill_blocked and never peeks or hops', async () => {
   const cap = jsonCapture()
   let peeked = false

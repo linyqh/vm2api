@@ -22,7 +22,7 @@ import {
 } from '../identity/telemetry-env.mjs'
 import { readOfficialCcIdentity } from '../identity/official-fingerprint.mjs'
 import { slotHost } from './slot-host.mjs'
-import { isCodexVm } from './vm-kind.mjs'
+import { isClaudeVm } from './vm-kind.mjs'
 import { readRoutingConfigFile } from '../core/config.mjs'
 
 const DROP_HEADER = /^(authorization|cookie|x-api-key|proxy-authorization)$/i
@@ -118,7 +118,7 @@ function telemetryHeaders(identity) {
 
 export function buildWorkerTelemetry(vm, projectRoot, routing = null) {
   const seed = defaultSeedPolicy(vm?.seed_policy || {})
-  if (!isTelemetryEnabled(seed) || isCodexVm(vm)) {
+  if (!isTelemetryEnabled(seed) || !isClaudeVm(vm)) {
     return { enabled: false }
   }
   const homeDir = projectRoot && vm?.id ? path.join(projectRoot, 'vms', vm.id, 'cli-home') : ''

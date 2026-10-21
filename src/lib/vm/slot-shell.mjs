@@ -13,7 +13,8 @@ import { WebSocketServer } from 'ws'
 import { execDetached, inspectExec, openExecTty, resizeExec } from '../cluster/docker-remote.mjs'
 import { slotContainerName } from '../transport/rust-kernel-supervisor.mjs'
 import { slotHost } from './slot-host.mjs'
-import { isCodexVm } from './vm-kind.mjs'
+import { isAntigravityVm, isClaudeVm, isCodexVm } from './vm-kind.mjs'
+import { antigravityRuntimeSupport } from '../transport/antigravity-bridge-supervisor.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
 import { slotExecCmd } from './slot-exec.mjs'
 import { getVm } from './vm-registry.mjs'
@@ -56,6 +57,7 @@ export async function syncShellLoginCredentials(
     ensureRemoteLink = ensureRemoteOfficialCredentialLink,
   } = {},
 ) {
+  if (!isClaudeVm(vm)) return { synced: false }
   if (host.kind !== 'node') return { synced: false }
   const slotDir = path.join(projectRoot, 'vms', vm.id)
   if (phase === 'prepare') {
@@ -68,6 +70,10 @@ export async function syncShellLoginCredentials(
 }
 
 export async function preparePanelShellLogin(projectRoot, vm) {
+  if (!isClaudeVm(vm))
+    throw Object.assign(new Error('This platform uses its own official client login'), {
+      code: 'platform_login_not_supported',
+    })
   const home = path.join(projectRoot, 'vms', vm.id, 'cli-home')
   const linked = ensureOfficialCredentialLink(home, {
     ...officialCcUidGid(vm.id),
@@ -83,6 +89,10 @@ export async function preparePanelShellLogin(projectRoot, vm) {
 }
 
 export async function adoptShellLogin(projectRoot, vm, { importOauth = null, loginHost = null } = {}) {
+  if (!isClaudeVm(vm))
+    throw Object.assign(new Error('This platform uses its own official client login'), {
+      code: 'platform_login_not_supported',
+    })
   const home = path.join(projectRoot, 'vms', vm.id, 'cli-home')
   await syncShellLoginCredentials(projectRoot, vm, { phase: 'adopt', host: loginHost || slotHost(vm) })
   ensureOfficialCredentialLink(home, officialCcUidGid(vm.id))
@@ -122,6 +132,7 @@ export async function adoptShellLogin(projectRoot, vm, { importOauth = null, log
 
 /** Import one new interactive grant. The same refresh is not imported twice. */
 export async function adoptLiveShellLogin(projectRoot, vm, { importOauth = null, loginHost = null, seen = '' } = {}) {
+  if (!isClaudeVm(vm)) return { imported: false, refresh: seen }
   const home = path.join(projectRoot, 'vms', vm.id, 'cli-home')
   await syncShellLoginCredentials(projectRoot, vm, { phase: 'adopt', host: loginHost || slotHost(vm) })
   ensureOfficialCredentialLink(home, officialCcUidGid(vm.id))
@@ -356,6 +367,24 @@ export function panelShellLaunch(cliBin) {
     rc,
   }
 }
+
+/** Plain slot terminal; Antigravity authentication stays inside its official CLI. */
+export function panelAntigravityShellLaunch() {
+  return {
+    cmd: [
+      '/bin/sh',
+      '-c',
+      `rc=$(mktemp) && printf '%s\\n' "$${RC_ENV}" > "$rc" && export KIN_PANEL_RCFILE=$rc && if command -v bash >/dev/null 2>&1; then exec bash --rcfile "$rc" -i; fi; ENV=$rc exec sh -i`,
+    ],
+    rc: [
+      'if [ -n "${BASH_VERSION:-}" ]; then [ -f /etc/bash.bashrc ] && . /etc/bash.bashrc; [ -f ~/.bashrc ] && . ~/.bashrc; fi',
+      'export HOME="${HOME:-/home/kincli}"',
+      'export PATH="$HOME/.local/bin:$HOME/.antigravity/bin:$PATH"',
+      SYSTEM_FACTS_RC,
+      'rm -f "$KIN_PANEL_RCFILE"',
+    ].join('\n'),
+  }
+}
 // Closing the hijacked stream does not end a TTY exec: bash would linger in the
 // slot. Every process of the session inherits the marker, so HUP them by it.
 const REAP_SCRIPT = `for d in /proc/[0-9]*; do tr '\\0' '\\n' < "$d/environ" 2>/dev/null | grep -qx "${SESSION_ENV}=$1" || continue; cmd=$(tr '\\0' ' ' < "$d/cmdline" 2>/dev/null || true); case "$cmd" in *cli-node*) kill -KILL "\${d#/proc/}" 2>/dev/null || true ;; *) kill -HUP "\${d#/proc/}" 2>/dev/null || true ;; esac; done; exit 0`
@@ -386,6 +415,11 @@ export function createSlotShell({
     const vm = getVm(projectRoot, vmId)
     if (!vm) return refuse(404, 'vm_not_found', 'vm not found')
     if (isCodexVm(vm)) return refuse(409, 'no_container', 'GPT 槽没有容器，无法打开终端')
+    if (isAntigravityVm(vm)) {
+      const support = antigravityRuntimeSupport(vm)
+      if (!support.ok) return refuse(support.status || 409, support.code, support.message)
+      if (login) return refuse(409, 'platform_login_not_supported', '请在普通终端中使用 Antigravity 官方客户端登录')
+    } else if (!isClaudeVm(vm)) return refuse(409, 'platform_not_supported', 'Unsupported slot platform')
     if (login) {
       try {
         await (authLoginReady || assertAuthLoginReady)(projectRoot, vm)
@@ -430,6 +464,10 @@ export function createSlotShell({
     const vm = getVm(projectRoot, vmId)
     if (!vm || isCodexVm(vm)) {
       rejectUpgrade(socket, 404, 'Not Found')
+      return true
+    }
+    if ((!isClaudeVm(vm) && !isAntigravityVm(vm)) || (entry.login && !isClaudeVm(vm))) {
+      rejectUpgrade(socket, 409, 'Conflict')
       return true
     }
     const requestedLogin = url.searchParams.get('login') === '1'
@@ -522,7 +560,7 @@ export function createSlotShell({
     try {
       connect = slotHost(vm).dockerApi()
       if (size.login) await preparePanelShellLogin(projectRoot, vm)
-      const launch = panelShellLaunch(slotHost(vm).bins.cli)
+      const launch = isAntigravityVm(vm) ? panelAntigravityShellLaunch() : panelShellLaunch(slotHost(vm).bins.cli)
       const env = ['TERM=xterm-256color', `${SESSION_ENV}=${token}`, `${RC_ENV}=${launch.rc}`]
       if (size.login) env.push('KIN_PANEL_LOGIN=1')
       const { Cmd } = slotExecCmd(vm, launch.cmd, {

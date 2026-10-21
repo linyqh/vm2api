@@ -91,6 +91,8 @@ import {
 } from './lib/oauth/oauth-credentials.mjs'
 import { normalizeCredentialMode } from './lib/oauth/credential-mode.mjs'
 import { ensureWorkerCredential } from './lib/transport/go-worker-client.mjs'
+import { stopAllAntigravityBridges } from './lib/transport/antigravity-bridge-supervisor.mjs'
+import { isClaudeVm } from './lib/vm/vm-kind.mjs'
 import { stopAllRustKernels } from './lib/transport/rust-kernel-supervisor.mjs'
 import { createRespond, parseRequestUrl } from './lib/http/respond.mjs'
 import { corsHeadersForRequest } from './lib/http/cors.mjs'
@@ -418,7 +420,7 @@ const USAGE_ACTIVE_WINDOW_MS = 5 * 3600_000
 
 /** Serving traffic within one 5h window, or still holding pinned conversations (#163). */
 function usageProbeActive(vm, account) {
-  if (isCodexVm(vm)) return false
+  if (!isClaudeVm(vm)) return false
   const id = account?.account_id || vm?.claude?.account_uuid || vm?.account_uuid || vm?.id
   const lastUsed = Number(poolScheduler?.lastUsed?.get?.(id) || runtimeRepo?.get?.(id)?.last_used_at || 0)
   if (lastUsed && Date.now() - lastUsed < USAGE_ACTIVE_WINDOW_MS) return true
@@ -810,7 +812,7 @@ function requireAuth(req, res) {
 }
 
 function fetchWorkerModels(opts) {
-  return gatewayModelCatalog(opts)
+  return gatewayModelCatalog({ ...opts, antigravityRouting: routingConfig.antigravity })
 }
 
 const importCommit = createImportCommit({
@@ -934,7 +936,7 @@ if (proxyPool.snapshot().config.ipv6_enabled !== true) {
 const clusterRoutes = createClusterRoutes({ manager: clusterManager, json, readBody, ok: panel.ok })
 const slotShell = createSlotShell({ projectRoot: cfg.paths.project, importOauth: commitImportedOauth })
 for (const vm of listVms(cfg.paths.project)) {
-  if (isCodexVm(vm)) continue
+  if (!isClaudeVm(vm)) continue
   try {
     ensureSlotSubscriptionType(path.join(cfg.paths.project, 'vms', vm.id, 'cli-home'), vm.account_tier)
   } catch (error) {
@@ -1240,7 +1242,7 @@ process.on('unhandledRejection', (e) => console.error('[unhandled]', e))
 
 // Graceful shutdown: stop schedulers/watchers, close the DB (WAL checkpoint).
 let _shuttingDown = false
-function shutdown(signal) {
+async function shutdown(signal) {
   if (_shuttingDown) return
   _shuttingDown = true
   console.log(`[shutdown] ${signal} — closing`)
@@ -1279,6 +1281,7 @@ function shutdown(signal) {
     stopVmWatch()
   } catch {}
   try {
+    await stopAllAntigravityBridges(cfg.paths.project)
     stopAllRustKernels()
   } catch {}
   try {

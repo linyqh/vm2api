@@ -1,5 +1,6 @@
 import type { Vm } from '@/types/panel-vm'
 import { type CredType, credTypeLabel } from '@/lib/cred-type'
+import { isAntigravityVm } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
@@ -13,6 +14,7 @@ import {
 } from '@/components/ui/select'
 import { TabsContent } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
+import { AntigravityPanel } from '@/features/vm/antigravity-panel'
 import {
   DATAPLANE_HINT,
   HOP_TRANSPORT_LABEL,
@@ -63,6 +65,10 @@ export function VmTestTab(props: VmTestTabProps) {
 
 /** 不依赖 Tabs 上下文的测试面板，详情页 Tab 与弹窗共用。 */
 export function VmTestPanel(props: VmTestTabProps & { className?: string }) {
+  if (isAntigravityVm(props.vm))
+    return (
+      <AntigravityPanel key={props.vm.id} vm={props.vm} showSettings={false} />
+    )
   const {
     vm,
     models,

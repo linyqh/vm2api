@@ -2,7 +2,12 @@ import type { UsageAccountRow } from '@/types/panel-usage'
 import type { Vm } from '@/types/panel-vm'
 import { credTypeLabel, credTypeOf } from '@/lib/cred-type'
 import { usedPctOf } from '@/lib/format'
-import { isCodexVm, platformLabel } from '@/lib/vm-kind'
+import {
+  isAntigravityVm,
+  isClaudeVm,
+  isCodexVm,
+  platformLabel,
+} from '@/lib/vm-kind'
 import { claudeTier, fleetGroup, vmCredDead, vmFailedAt } from '@/lib/vm-status'
 import { vmCacheHitPct, vmTotalCost, vmWindowCosts } from '@/lib/vm-usage'
 import { Button } from '@/components/ui/button'
@@ -103,11 +108,12 @@ export function sortVms(
  * 等级与凭证类型仍参与全文搜索（可以直接搜 "Max" / "OAuth"）。
  * `kind` 切 Claude / GPT 凭证面，默认全部。
  */
-export type VmKindFilter = 'all' | 'claude' | 'gpt'
+export type VmKindFilter = 'all' | 'claude' | 'gpt' | 'antigravity'
 
 export function matchesKind(vm: Vm, kind: VmKindFilter): boolean {
   if (kind === 'all') return true
-  return isCodexVm(vm) ? kind === 'gpt' : kind === 'claude'
+  if (kind === 'antigravity') return isAntigravityVm(vm)
+  return kind === 'gpt' ? isCodexVm(vm) : isClaudeVm(vm)
 }
 
 export function KindFilterChips({
@@ -121,13 +127,16 @@ export function KindFilterChips({
 }) {
   let claude = 0
   let openai = 0
+  let antigravity = 0
   for (const vm of vms) {
-    if (isCodexVm(vm)) openai += 1
-    else claude += 1
+    if (isAntigravityVm(vm)) antigravity += 1
+    else if (isCodexVm(vm)) openai += 1
+    else if (isClaudeVm(vm)) claude += 1
   }
   const chips = [
     ['claude', 'claude', claude, '筛选 Claude'],
     ['gpt', 'codex', openai, '筛选 OpenAI'],
+    ['antigravity', 'antigravity', antigravity, '筛选 Antigravity'],
   ] as const
   return (
     <>

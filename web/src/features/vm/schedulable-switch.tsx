@@ -4,6 +4,7 @@ import type { Vm } from '@/types/panel-vm'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
 import { expiresAtToMs } from '@/lib/fable-status'
+import { isAntigravityVm } from '@/lib/vm-kind'
 import { isRestrictedSchedule, restrictionUntilOf } from '@/lib/vm-status'
 import { Switch } from '@/components/ui/switch'
 import {
@@ -29,6 +30,7 @@ export function vmSchedulableProps(vm: Vm) {
       : vm.schedule_state,
     restrictionUntil: restrictionUntilOf(vm),
     restrictionReason: vm.restriction_reason,
+    unsupported: isAntigravityVm(vm),
   }
 }
 
@@ -38,6 +40,7 @@ export function SchedulableSwitch({
   scheduleState,
   restrictionUntil,
   className,
+  unsupported = false,
 }: {
   vmId: string
   schedulable: boolean
@@ -45,11 +48,12 @@ export function SchedulableSwitch({
   restrictionUntil?: number | null
   restrictionReason?: string | null
   className?: string
+  unsupported?: boolean
 }) {
   const qc = useQueryClient()
   const restricted = scheduleState === 'restricted'
   const [optimistic, setOptimistic] = useState<boolean | null>(null)
-  const checked = optimistic ?? schedulable
+  const checked = !unsupported && (optimistic ?? schedulable)
   const mutation = useMutation({
     mutationFn: (next: boolean) =>
       api(`/api/panel/vms/${encodeURIComponent(vmId)}/schedulable`, {
@@ -73,8 +77,9 @@ export function SchedulableSwitch({
   })
 
   const untilText = formatRestrictionUntil(restrictionUntil)
-  const tooltip =
-    restricted && checked
+  const tooltip = unsupported
+    ? 'Antigravity 实验会话不参与通用 API 调度'
+    : restricted && checked
       ? untilText
         ? `调度开，当前受限至 ${untilText}`
         : '调度开，当前受限'
@@ -92,7 +97,7 @@ export function SchedulableSwitch({
         >
           <Switch
             checked={checked}
-            disabled={mutation.isPending}
+            disabled={unsupported || mutation.isPending}
             onCheckedChange={(next) => mutation.mutate(next)}
             aria-label={tooltip}
           />

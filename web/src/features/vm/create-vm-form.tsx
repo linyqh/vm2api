@@ -76,7 +76,7 @@ import {
 /** 「之后」的 5 档，对齐 index.html `createVmFromPage()` 的派生逻辑。 */
 export type CreateVmAfter = 'idle' | 'start' | 'proxy' | 'active' | 'full'
 
-type Platform = 'anthropic' | 'openai'
+type Platform = 'anthropic' | 'openai' | 'antigravity'
 
 type CreateVmResponse = {
   id?: string
@@ -180,7 +180,10 @@ export function useCreateVmDraft({
   const me = useQuery(meQueryOptions())
   const createOptions = useQuery(vmCreateOptionsQueryOptions())
   const vmCfg = normalizeVmConfig(createOptions.data?.vm)
-  const preferredRuntime = runtimeOverride ?? vmCfg.default_runtime
+  const preferredRuntime =
+    platform === 'antigravity'
+      ? 'docker'
+      : (runtimeOverride ?? vmCfg.default_runtime)
   const memory = memoryOverride ?? vmCfg.memory
   const vcpus = vcpusOverride ?? vmCfg.vcpus
   const diskGb = diskOverride ?? vmCfg.disk_gb
@@ -199,15 +202,16 @@ export function useCreateVmDraft({
         kvm: createOptions.data?.kvm,
       })
   const kvmBlocked =
-    !placement.nodeId &&
-    (kvmAvail.status === 'disabled' || kvmAvail.status === 'unknown')
+    platform === 'antigravity' ||
+    (!placement.nodeId &&
+      (kvmAvail.status === 'disabled' || kvmAvail.status === 'unknown'))
   // 宿主不支持时静默回落容器，不提交一个必然 409 的形态。
   const runtimeType: RuntimeType =
     preferredRuntime === 'kvm' && kvmBlocked ? 'docker' : preferredRuntime
   const kvmPending =
     runtimeType === 'kvm' && !placement.nodeId && kvmAvail.status === 'loading'
   const exit = useCreateExit(placement.nodeId)
-  const wantsExit = after !== 'idle'
+  const wantsExit = platform !== 'antigravity' && after !== 'idle'
 
   const create = useMutation({
     mutationFn: async () => {
@@ -224,9 +228,14 @@ export function useCreateVmDraft({
           // 「自动」是纯 UI 哨兵值，不发给后端。
           region: region === VM_REGION_AUTO ? undefined : region,
           // 并发、权重不在创建时定：后端按设置里的全局默认（Claude / OpenAI 各自）填。
-          ...deriveAfter(after),
+          ...deriveAfter(platform === 'antigravity' ? 'idle' : after),
           platform,
-          family: platform === 'openai' ? 'codex' : 'claude',
+          family:
+            platform === 'openai'
+              ? 'codex'
+              : platform === 'antigravity'
+                ? 'antigravity'
+                : 'claude',
           ...(nodeId ? { node_id: nodeId } : {}),
           ...(wantsExit && exit.proxyId ? { proxy_id: exit.proxyId } : {}),
           ...createMachinePayload({ runtimeType, memory, vcpus, diskGb }),
@@ -303,7 +312,10 @@ export function useCreateVmDraft({
     exit,
     wantsExit,
     create,
-    blocked: placement.blocked || kvmPending,
+    blocked:
+      placement.blocked ||
+      kvmPending ||
+      (platform === 'antigravity' && !!placement.nodeId),
     placementChecks: preflightChecksFromError(create.error),
   }
 }
@@ -358,7 +370,15 @@ export function draftSpecRows(d: CreateVmDraft): SpecRow[] {
     {
       label: '平台',
       value: (
-        <PlatformChip kind={d.platform === 'openai' ? 'codex' : 'claude'} />
+        <PlatformChip
+          kind={
+            d.platform === 'openai'
+              ? 'codex'
+              : d.platform === 'antigravity'
+                ? 'antigravity'
+                : 'claude'
+          }
+        />
       ),
     },
     {
@@ -514,9 +534,23 @@ export function CreateVmForm({
               title: <PlatformChip kind='codex' />,
               detail: 'Codex OAuth 或 auth.json。只能放在本机。',
             },
+            {
+              value: 'antigravity',
+              title: <PlatformChip kind='antigravity' />,
+              detail:
+                '实验文本会话。仅本机 Docker，创建为空槽后配置官方客户端。',
+            },
           ]}
         />
       </Section>
+
+      {d.platform === 'antigravity' ? (
+        <p className='text-sm text-muted-foreground'>
+          Antigravity 当前仅支持本机
+          Docker，创建后保持停止。请在账号页查看客户端和实验功能状态。
+          {remote ? ' 请将放置改为本机。' : ''}
+        </p>
+      ) : null}
 
       <Section title='形态' hint='容器轻、快；虚拟机给每个槽一台独立的机器。'>
         <ChoiceTiles
@@ -699,7 +733,9 @@ export function CreateVmForm({
         </p>
       </Section>
 
-      {variant === 'dialog' && !d.pinnedAfter ? (
+      {variant === 'dialog' &&
+      !d.pinnedAfter &&
+      d.platform !== 'antigravity' ? (
         <Section title='创建后'>
           <Field label='接着做'>
             <Select value={d.after} onValueChange={d.setAfter}>
@@ -744,7 +780,9 @@ export function CreateVmForm({
           </p>
         ) : variant === 'flow' ? (
           <p className='me-auto text-xs text-muted-foreground'>
-            创建后在下面绑出口、导入账号。
+            {d.platform === 'antigravity'
+              ? '创建后配置槽内官方 Antigravity 客户端。'
+              : '创建后在下面绑出口、导入账号。'}
           </p>
         ) : null}
         {onCancel ? (

@@ -4,7 +4,7 @@ import { Link } from '@tanstack/react-router'
 import type { Vm, VmKernelSnapshot } from '@/types/panel-vm'
 import { toast } from 'sonner'
 import { patchVm } from '@/lib/api'
-import { isCodexVm } from '@/lib/vm-kind'
+import { isAntigravityVm, isCodexVm } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
 import { dashboardQueryOptions } from '@/features/overview/queries'
 import {
@@ -68,6 +68,16 @@ export function VmEngineEditor({
     onError: (error: Error) =>
       toast.error(`恢复跟随全局失败：${error.message}`),
   })
+
+  if (isAntigravityVm(vm))
+    return (
+      <CardSection title='推理运行时'>
+        <p className='text-sm'>Antigravity 独立 bridge · 实验文本接入</p>
+        <p className='mt-2 text-xs text-muted-foreground'>
+          状态和配置见账号页。
+        </p>
+      </CardSection>
+    )
 
   return (
     <CardSection title='推理内核'>

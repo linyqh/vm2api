@@ -1,7 +1,7 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import type { ApiKeyItem, VmPool } from '@/types/panel-keys'
 import type { Vm } from '@/types/panel-vm'
-import { isCodexVm } from '@/lib/vm-kind'
+import { isAntigravityVm, isClaudeVm, isCodexVm } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -263,9 +263,16 @@ export function KeyLimitsDialog({
                 {pools ? <SelectItem value='pool'>账号池</SelectItem> : null}
                 <SelectItem value='anthropic'>anthropic</SelectItem>
                 <SelectItem value='openai'>openai</SelectItem>
+                <SelectItem value='antigravity'>antigravity</SelectItem>
               </SelectContent>
             </Select>
           </Field>
+          {draft.group_type === 'antigravity' ? (
+            <p className='text-xs text-muted-foreground sm:col-span-2'>
+              Antigravity 范围独立保存；实验文本会话请使用槽位测试页，通用 /v1
+              API 暂不支持。
+            </p>
+          ) : null}
           {draft.group_type === 'pool' ? (
             <Field label='账号池'>
               <Select
@@ -373,12 +380,14 @@ function blankDraft(): KeyLimitsDraft {
 }
 
 function groupOf(value: string | undefined): KeyGroupType {
-  if (value === 'anthropic' || value === 'openai') return value
+  if (value === 'anthropic' || value === 'openai' || value === 'antigravity')
+    return value
   return 'all'
 }
 
 function vmsInGroup(vms: Vm[], group: KeyGroupType): Vm[] {
   if (group === 'openai') return vms.filter((vm) => isCodexVm(vm))
-  if (group === 'anthropic') return vms.filter((vm) => !isCodexVm(vm))
+  if (group === 'anthropic') return vms.filter((vm) => isClaudeVm(vm))
+  if (group === 'antigravity') return vms.filter((vm) => isAntigravityVm(vm))
   return []
 }

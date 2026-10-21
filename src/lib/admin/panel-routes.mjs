@@ -147,7 +147,11 @@ import {
 } from '../vm/vm-registry.mjs'
 import { fillVmTimezoneFromExit, syncVmTimezoneFromProxy } from '../vm/proxy-timezone.mjs'
 import { validTimezone } from '../core/timezone.mjs'
-import { stampVmKind, isCodexVm } from '../vm/vm-kind.mjs'
+import { stampVmKind, isCodexVm, isClaudeVm, isAntigravityVm, normalizeVmKind } from '../vm/vm-kind.mjs'
+import { validateAntigravityRoutingPatch, listAntigravityPublicModels } from '../protocol/antigravity-route.mjs'
+import { prepareAntigravityChat, antigravityStatusView, scopeAntigravitySession } from './antigravity-panel.mjs'
+import { closeAntigravityTextSession } from '../transport/antigravity-bridge-client.mjs'
+import { antigravityBridgeStatus, runAntigravityText } from '../transport/antigravity-bridge-supervisor.mjs'
 import { parseAllowedModelsPatch } from '../pool/slot-model-gate.mjs'
 import { parseScheduleLevelInput, manualScheduleLevelOf } from '../pool/credential-weight.mjs'
 import { parseActiveHoursInput } from '../pool/active-hours.mjs'
@@ -485,7 +489,7 @@ async function syncInstalledKernels({
   body = {},
   refreshCluster = refreshClusterSlotPayloads,
 }) {
-  const all = listVms(project)
+  const all = listVms(project).filter(isClaudeVm)
   const wanted = Array.isArray(body.ids) ? new Set(body.ids.map(String)) : null
   const selected = wanted ? all.filter((vm) => wanted.has(vm.id)) : all
   // Local slots bind the new binaries. Cluster slots bake the same kernel, CLIs
@@ -605,6 +609,7 @@ export function createPanelHandler(ctx) {
   const refreshCluster = ctx.refreshClusterSlotPayloads || refreshClusterSlotPayloads
   const requireAuth = (...args) => ctx.requireAuth(...args)
   const cfg = ctx.cfg
+  const getRouting = () => ctx.routingConfig || {}
   const routingConfigPath = ctx.routingConfigPath
   const stickyRouter = ctx.stickyRouter
   const accountQuota = ctx.accountQuota
@@ -953,6 +958,11 @@ export function createPanelHandler(ctx) {
   }
 
   function activateVmSlot(id) {
+    if (isAntigravityVm(getVm(cfg.paths.project, id)))
+      return {
+        ok: false,
+        error: { code: 'antigravity_operation_unsupported', message: 'Antigravity 实验槽不使用活跃 Claude 账号' },
+      }
     setActiveVm(cfg.paths.project, id)
     reloadActiveVm(cfg)
     const vm = getVm(cfg.paths.project, id)
@@ -1028,6 +1038,13 @@ export function createPanelHandler(ctx) {
   async function applySlotPolicyWithRuntime(id, patch) {
     const current = getVm(cfg.paths.project, id)
     if (!current) return { ok: false, id, code: 'vm_not_found', error: 'vm not found' }
+    if (isAntigravityVm(current))
+      return {
+        ok: false,
+        id,
+        code: 'antigravity_operation_unsupported',
+        error: 'Antigravity does not use Claude slot policies',
+      }
     const desired = vmWithSlotPolicyPatch(current, patch)
     const previousEngine = resolveInferenceEngine(current, ctx.routingConfig)
     const targetEngine = resolveInferenceEngine(desired, ctx.routingConfig)
@@ -1096,8 +1113,9 @@ export function createPanelHandler(ctx) {
   }
 
   function projectSlotKernelConfig(vm) {
-    if (!vm?.id || isCodexVm(vm)) return null
+    if (!vm?.id) return null
     const full = getVm(cfg.paths.project, vm.id) || vm
+    if (!isClaudeVm(full)) return null
     return writeKernelConfig(cfg.paths.project, full, {
       routing: ctx.routingConfig,
       timezone: full.timezone,
@@ -1244,7 +1262,8 @@ export function createPanelHandler(ctx) {
       if (!requireAuth(req, res)) return
       const id = p.split('/')[3]
       if (!getVm(cfg.paths.project, id)) return json(res, 404, { error: { message: 'vm not found' } })
-      return json(res, 200, activateVmSlot(id))
+      const activated = activateVmSlot(id)
+      return json(res, activated.ok ? 200 : 400, activated)
     }
     if (req.method === 'POST' && /^\/admin\/vms\/[^/]+\/probe$/.test(p)) {
       if (!requireAuth(req, res)) return
@@ -1373,6 +1392,109 @@ export function createPanelHandler(ctx) {
         denyIfUserMissesProxy(req, res, { proxyPool, json, path: p })
       ) {
         return true
+      }
+      const agPath = p.match(/^\/api\/panel\/vms\/([^/]+)\/(.+)$/)
+      if (agPath && isValidVmId(agPath[1])) {
+        const candidate = getVm(cfg.paths.project, agPath[1])
+        if (
+          isAntigravityVm(candidate) &&
+          /^(oauth(?:\/|$)|credential(?:\/|$)|activate$|claude-reset(?:\/|$)|openai-quota(?:\/|$)|count-tokens$|probe$|test-chat$|diagnose$|official-cc-bootstrap(?:\/|$)|wrap-cli(?:\/|$)|seed-settings$|recreate$|package$|recover$|reset-fingerprint$|schedulable$)/.test(
+            agPath[2],
+          )
+        ) {
+          return json(res, 400, {
+            ok: false,
+            error: {
+              code: 'antigravity_operation_unsupported',
+              message: 'Antigravity 实验槽请使用专用账号面板与文本会话',
+            },
+          })
+        }
+      }
+      const agRoute = p.match(/^\/api\/panel\/vms\/([^/]+)\/antigravity\/(status|chat|close)$/)
+      if (
+        agRoute &&
+        ((req.method === 'GET' && agRoute[2] === 'status') || (req.method === 'POST' && agRoute[2] !== 'status'))
+      ) {
+        const vm = isValidVmId(agRoute[1]) ? getVm(cfg.paths.project, agRoute[1]) : null
+        if (!vm) return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: '槽位不存在' } })
+        if (!isAntigravityVm(vm))
+          return json(res, 400, {
+            ok: false,
+            error: { code: 'platform_mismatch', message: '此操作需要 Antigravity 槽位' },
+          })
+        const routing = getRouting()
+        const projectRoot = cfg.paths.project
+        if (agRoute[2] === 'status') {
+          const runtime = await (ctx.antigravityBridgeStatus || antigravityBridgeStatus)({ projectRoot, vm, routing })
+          return json(res, 200, panel.ok(antigravityStatusView({ routing, runtime })))
+        }
+        const actor = req.panelUserId ? `id:${req.panelUserId}` : `login:${panelIdentity(req).user || 'master'}`
+        const body = await readBody(req, 128 * 1024)
+        if (agRoute[2] === 'close') {
+          const sessionId = scopeAntigravitySession(body?.session_id, actor)
+          if (!sessionId || Object.keys(body).some((key) => key !== 'session_id')) {
+            return json(res, 400, {
+              ok: false,
+              error: { code: 'invalid_session_id', message: '需要有效的 session_id' },
+            })
+          }
+          const result = await (ctx.closeAntigravityTextSession || closeAntigravityTextSession)({
+            projectRoot,
+            vm,
+            routing,
+            sessionId,
+          })
+          if (!result.ok)
+            return json(res, 503, {
+              ok: false,
+              error: { code: result.code || 'antigravity_close_failed', message: result.message || '会话关闭失败' },
+            })
+          return json(res, 200, panel.ok({ closed: true }))
+        }
+        const prepared = prepareAntigravityChat({ vm, routing, body, actor })
+        if (!prepared.ok) return json(res, prepared.status, { ok: false, error: prepared.error })
+        const controller = new AbortController()
+        const abort = () => controller.abort()
+        req.once?.('aborted', abort)
+        res.once?.('close', abort)
+        try {
+          const result = await (ctx.runAntigravityText || runAntigravityText)({
+            projectRoot,
+            vm,
+            routing,
+            model: prepared.model,
+            prompt: prepared.prompt,
+            sessionId: prepared.bridgeSessionId,
+            signal: controller.signal,
+          })
+          if (!result.ok) {
+            const status =
+              Number.isInteger(result.status) && result.status >= 400 && result.status <= 599 ? result.status : 502
+            return json(res, status, {
+              ok: false,
+              error: {
+                code: result.code || 'antigravity_session_failed',
+                message: result.message || 'Antigravity 会话失败',
+              },
+            })
+          }
+          return json(
+            res,
+            200,
+            panel.ok({
+              ok: true,
+              text: result.response || '',
+              session_id: prepared.sessionId,
+              usage: result.usage || null,
+              usage_cumulative: result.usage_cumulative || null,
+              terminalState: result.terminalState,
+            }),
+          )
+        } finally {
+          req.removeListener?.('aborted', abort)
+          res.removeListener?.('close', abort)
+        }
       }
       if ((req.method === 'GET' || req.method === 'PUT') && p === '/api/panel/onboarding') {
         if (req.method === 'PUT') {
@@ -2312,7 +2434,8 @@ export function createPanelHandler(ctx) {
             })
           } else {
             for (const id of targets.ids) {
-              persistSlotEnginePolicy(cfg.paths.project, id, { dataplane: parsed.value })
+              if (isClaudeVm(getVm(cfg.paths.project, id)))
+                persistSlotEnginePolicy(cfg.paths.project, id, { dataplane: parsed.value })
             }
           }
         } catch (error) {
@@ -2549,6 +2672,14 @@ export function createPanelHandler(ctx) {
         const items = []
         for (const id of ids) {
           try {
+            if (isAntigravityVm(getVm(cfg.paths.project, id))) {
+              failed.push({
+                id,
+                code: 'antigravity_operation_unsupported',
+                error: 'Antigravity experimental slots do not use shared pool policy',
+              })
+              continue
+            }
             let record = null
             if (hasWeight || hasLevel) {
               record = patchVmRecord(cfg.paths.project, id, (current) => {
@@ -2677,6 +2808,11 @@ export function createPanelHandler(ctx) {
         const body = await readBody(req, 8192).catch(() => ({}))
         const currentVm = getVm(cfg.paths.project, id)
         if (!currentVm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+        if (isAntigravityVm(currentVm))
+          return json(res, 400, {
+            ok: false,
+            error: { code: 'antigravity_operation_unsupported', message: 'Antigravity 实验槽请使用专用配置面板' },
+          })
         const strictInteger = (value, min, max, label, { nullable = false } = {}) => {
           if (nullable && value === null) return null
           if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value)) {
@@ -3166,6 +3302,10 @@ export function createPanelHandler(ctx) {
         const vmId = url.searchParams.get('vm_id') || url.searchParams.get('vm') || ''
         if (vmId && userMissesVmId(req, cfg.paths.project, vmId)) {
           return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+        }
+        if (platform === 'antigravity' || (vmId && isAntigravityVm(getVm(cfg.paths.project, vmId)))) {
+          const models = listAntigravityPublicModels(getRouting().antigravity)
+          return json(res, 200, panel.ok({ platform: 'antigravity', models, source: 'antigravity-routing' }))
         }
         // A live refresh rewrites the shared Codex catalog; only admins may trigger it.
         const refresh =
@@ -3910,6 +4050,19 @@ export function createPanelHandler(ctx) {
       // POST /api/panel/vms/create — configurable seed VM + pure Claude Code home
       if (req.method === 'POST' && p === '/api/panel/vms/create') {
         const body = await readBody(req, 32 * 1024)
+        const requestedKind = normalizeVmKind(body)
+        if (requestedKind.kind === 'unknown') {
+          return json(res, 400, { ok: false, error: { code: 'invalid_platform', message: '不支持的账号平台' } })
+        }
+        const antigravity = requestedKind.platform === 'antigravity'
+        if (antigravity && (body.activate === true || body.allowed_models != null))
+          return json(res, 400, {
+            ok: false,
+            error: {
+              code: 'antigravity_operation_unsupported',
+              message: 'Antigravity 实验槽不使用活跃账号或原生池模型策略，请在专用面板配置',
+            },
+          })
         const existing = listVms(cfg.paths.project)
         // Usage, billing and account rows stay keyed by a deleted VM's id; handing that
         // id to a new slot makes it show the old account and spend. Auto-numbering skips them.
@@ -3939,14 +4092,14 @@ export function createPanelHandler(ctx) {
             })
           }
         }
-        const startNow = body.start !== false && body.status !== 'stopped'
+        const startNow = body.start !== false && body.status !== 'stopped' && (!antigravity || body.start === true)
         const wantKernel = body.kernel && OS_CATALOG[body.kernel] ? body.kernel : kernelForIndex(idx)
         const nodeId = body.node_id ? String(body.node_id) : null
         const vmDefaults = normalizeVmConfig(ctx.routingConfig?.vm)
         const requestedRuntime = body.runtime_type
         let runtime
         if (requestedRuntime == null || requestedRuntime === '') {
-          runtime = vmDefaults.default_runtime
+          runtime = antigravity ? 'docker' : vmDefaults.default_runtime
         } else {
           const kind = String(requestedRuntime).trim().toLowerCase()
           if (kind !== 'docker' && kind !== 'kvm') {
@@ -3960,6 +4113,12 @@ export function createPanelHandler(ctx) {
             })
           }
           runtime = kind
+        }
+        if (antigravity && (nodeId || runtime !== 'docker')) {
+          return json(res, 400, {
+            ok: false,
+            error: { code: 'antigravity_runtime_unsupported', message: 'Antigravity 实验槽仅支持本机 Docker' },
+          })
         }
         let machine
         try {
@@ -4081,7 +4240,7 @@ export function createPanelHandler(ctx) {
         const vm = {
           id,
           name: body.name || padVm(idx),
-          status: startNow ? 'running' : body.status || 'stopped',
+          status: startNow ? 'running' : antigravity ? 'stopped' : body.status || 'stopped',
           kernel: wantKernel,
           timezone: requestedTimezone || null,
           // Only an explicit zone is a pin. An empty zone stays unset so the
@@ -4089,7 +4248,9 @@ export function createPanelHandler(ctx) {
           timezone_source: requestedTimezone ? 'manual' : 'auto',
           locale: generated.locale || STANDARD_LOCALE,
           region: body.region || body.zone || null,
-          note: body.note || `${(OS_CATALOG[wantKernel] || {}).pretty || wantKernel} · Go slot worker`,
+          note:
+            body.note ||
+            `${(OS_CATALOG[wantKernel] || {}).pretty || wantKernel} · ${antigravity ? 'Antigravity CLI' : 'Go slot worker'}`,
           proxy: null,
           policy: {
             maxConcurrency: 0,
@@ -4140,7 +4301,20 @@ export function createPanelHandler(ctx) {
         const validInteger = (value, min, max) =>
           typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value) && value >= min && value <= max
         const invalidCreate = (value, min, max) => value !== null && !validInteger(value, min, max)
-        if (isCodexVm(vm)) {
+        if (isAntigravityVm(vm)) {
+          if (
+            (explicitConcurrency && rawConcurrency !== 1 && rawConcurrency != null) ||
+            (explicitRpm && rawRpm !== 0 && rawRpm != null) ||
+            (explicitSessions && rawSessions !== 1 && rawSessions != null)
+          ) {
+            return json(res, 400, {
+              ok: false,
+              error: { code: 'invalid_create_schedule', message: 'Antigravity 实验槽仅支持单会话调试' },
+            })
+          }
+          vm.policy = { maxConcurrency: 1, maxRpm: 0, maxSessions: 1 }
+          vm.schedule_disabled_reason = 'antigravity_experimental_text_only'
+        } else if (isCodexVm(vm)) {
           if (
             (explicitConcurrency && invalidCreate(rawConcurrency, 1, 256)) ||
             (explicitRpm && invalidCreate(rawRpm, 0, 1e6)) ||
@@ -4185,7 +4359,7 @@ export function createPanelHandler(ctx) {
         atomicWriteJson(vmPath, vm, { mode: 0o600 })
         writeGuestMachineIdFile(cfg.paths.project, id, generated.guest_machine_id)
         try {
-          seedFreshCliHome(cfg.paths.project, vm)
+          if (!isAntigravityVm(vm)) seedFreshCliHome(cfg.paths.project, vm)
         } catch (e) {}
         let allocated = null
         let proxyError = null
@@ -4364,6 +4538,15 @@ export function createPanelHandler(ctx) {
           }
           const existing = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
           existing.id = existing.id || vmId
+          if (isAntigravityVm(existing)) {
+            return json(res, 400, {
+              ok: false,
+              error: {
+                code: 'antigravity_official_login_required',
+                message: '请在 Antigravity 槽位内使用官方 CLI 登录，凭证由其钥匙串管理',
+              },
+            })
+          }
           if (isCodexVm(existing)) {
             const parsed = parseCodexImportPayload(body)
             if (!parsed.ok) {
@@ -5003,6 +5186,12 @@ export function createPanelHandler(ctx) {
 
       if (req.method === 'GET' && p === '/api/panel/model-policy') {
         const platform = String(url.searchParams.get('platform') || '').toLowerCase()
+        if (platform === 'antigravity') {
+          const models = listAntigravityPublicModels(getRouting().antigravity)
+          return json(res, 200, panel.ok({ platform, policy: null, models, effective: models }))
+        }
+        if (platform && !['openai', 'gpt', 'codex', 'anthropic', 'claude'].includes(platform))
+          return json(res, 400, { ok: false, error: { code: 'invalid_platform', message: '未知平台' } })
         if (platform === 'openai' || platform === 'gpt' || platform === 'codex') {
           const pol = getGptModelPolicy()
           const models = listGptPolicyModels()
@@ -5023,6 +5212,13 @@ export function createPanelHandler(ctx) {
       if (req.method === 'PUT' && p === '/api/panel/model-policy') {
         const body = await readBody(req, 2 * 1024 * 1024)
         const platform = String(body.platform || url.searchParams.get('platform') || '').toLowerCase()
+        if (platform === 'antigravity')
+          return json(res, 400, {
+            ok: false,
+            error: { code: 'antigravity_routing_config_required', message: '请通过 routing.antigravity 配置模型' },
+          })
+        if (platform && !['openai', 'gpt', 'codex', 'anthropic', 'claude'].includes(platform))
+          return json(res, 400, { ok: false, error: { code: 'invalid_platform', message: '未知平台' } })
         if (platform === 'openai' || platform === 'gpt' || platform === 'codex') {
           const saved = saveGptModelPolicy(body.policy || body)
           const models = listGptPolicyModels()
@@ -5045,6 +5241,13 @@ export function createPanelHandler(ctx) {
       if (req.method === 'POST' && p === '/api/panel/model-policy/reset') {
         const body = await readBody(req, 8192).catch(() => ({}))
         const platform = String(body.platform || url.searchParams.get('platform') || '').toLowerCase()
+        if (platform === 'antigravity')
+          return json(res, 400, {
+            ok: false,
+            error: { code: 'antigravity_routing_config_required', message: '请通过 routing.antigravity 配置模型' },
+          })
+        if (platform && !['openai', 'gpt', 'codex', 'anthropic', 'claude'].includes(platform))
+          return json(res, 400, { ok: false, error: { code: 'invalid_platform', message: '未知平台' } })
         if (platform === 'openai' || platform === 'gpt' || platform === 'codex') {
           const saved = resetGptModelPolicy()
           const models = listGptPolicyModels()
@@ -5188,6 +5391,7 @@ export function createPanelHandler(ctx) {
             validateOpenAIQuotaPatch(body.codex.quota)
           }
           validateInferenceWebsocketPatch(body)
+          validateAntigravityRoutingPatch(body)
         } catch (error) {
           if (error instanceof TypeError || error instanceof RangeError) {
             return json(res, 400, {

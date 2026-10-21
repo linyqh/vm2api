@@ -17,7 +17,7 @@ import { maxRequestBytes, streamIdleTimeoutMs } from '../core/config.mjs'
 import { OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
 import { cacheTtlFromRouting, normalizeCacheTtl } from '../protocol/cache-ttl.mjs'
 import { setVmSchedulable, listVms, getVm } from '../vm/vm-registry.mjs'
-import { isCodexVm } from '../vm/vm-kind.mjs'
+import { isClaudeVm } from '../vm/vm-kind.mjs'
 import { isKvmRuntime, runtimeKind } from '../vm/runtime-kind.mjs'
 import { slotExecArgv } from '../vm/slot-exec.mjs'
 import {
@@ -680,6 +680,8 @@ export function writeKernelConfig(
   { token, proxyUrl, proxyRequired, officialCcInference, timezone, routing } = {},
 ) {
   if (!projectRoot || !vm?.id) return null
+  const record = getVm(projectRoot, vm.id) || vm
+  if (!isClaudeVm(record)) return null
   const runDir = path.join(projectRoot, 'vms', vm.id, 'run')
   const homeDir = path.join(projectRoot, 'vms', vm.id, 'cli-home')
   fs.mkdirSync(runDir, { recursive: true, mode: 0o700 })
@@ -703,7 +705,6 @@ export function writeKernelConfig(
   const dataplane = resolveKernelDataplane(vm, routing || {}) || 'wrap'
   const envBin = String(process.env.KIN_CLAUDE_BIN || '').trim()
   // Callers pass partial vm snapshots (summaries, exec contexts); the vm json decides placement.
-  const record = getVm(projectRoot, vm.id) || vm
   const host = slotHost(record)
   // A macOS node runs the kernel on the host itself: real node paths instead of the container mounts.
   // Unknown until that node has connected once; the slot's own start writes the config then.
@@ -800,7 +801,7 @@ export function syncClaudeKernelConfigs(projectRoot, routing) {
   let skipped = 0
   for (const { id } of listVms(projectRoot)) {
     const vm = getVm(projectRoot, id)
-    if (!vm || isCodexVm(vm)) {
+    if (!vm || !isClaudeVm(vm)) {
       skipped += 1
       continue
     }

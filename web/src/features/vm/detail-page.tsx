@@ -22,7 +22,7 @@ import {
   weeklySplitInfo,
 } from '@/lib/fable-status'
 import { usedPctOf } from '@/lib/format'
-import { compactEmail, isCodexVm } from '@/lib/vm-kind'
+import { compactEmail, isAntigravityVm, isCodexVm } from '@/lib/vm-kind'
 import {
   accountStatus,
   claudeTier,
@@ -137,19 +137,25 @@ function VmDetailBody({
   })
   const seed = useQuery({
     ...vmSeedQueryOptions(id),
-    enabled: perms.admin && wantedTab === 'seed',
+    enabled:
+      perms.admin &&
+      wantedTab === 'seed' &&
+      !!detail.data?.vm &&
+      !isAntigravityVm(detail.data.vm),
     refetchInterval: wantedTab === 'seed' ? 2000 : false,
   })
   const seedUploadLog = useQuery({
     ...vmSeedUploadLogQueryOptions(id),
-    enabled: perms.admin && wantedTab === 'seed' && seedDebug,
+    enabled:
+      perms.admin &&
+      wantedTab === 'seed' &&
+      seedDebug &&
+      !!detail.data?.vm &&
+      !isAntigravityVm(detail.data.vm),
     refetchInterval: seedDebug && wantedTab === 'seed' ? 2000 : false,
   })
   const routing = useQuery({ ...routingQueryOptions(), enabled: perms.admin })
   usePoolSeatStream()
-
-  const tabs = vmDetailTabs(perms)
-  const tab = visibleTab(wantedTab, tabs)
 
   const [bindId, setBindId] = useState('')
   const [confirmDel, setConfirmDel] = useState(false)
@@ -161,6 +167,10 @@ function VmDetailBody({
     (perms.dashboard ? dash.data?.vms : slots.data?.items) || []
   const listVm = slotList.find((v) => v.id === id)
   const vm = ((data.vm as Vm | undefined) || listVm || { id }) as Vm
+  const tabs = vmDetailTabs(perms).filter(
+    (value) => !isAntigravityVm(vm) || value !== 'seed'
+  )
+  const tab = visibleTab(wantedTab, tabs)
   const kernel = (data.kernel as VmKernelSnapshot | undefined) || null
   const acc = (data.account as Record<string, unknown> | undefined) || {}
   const proxy = ((data.proxy as VmProxySnap | undefined) ||
@@ -387,10 +397,12 @@ function VmDetailBody({
           <span className='text-sm text-muted-foreground'>
             {vmRunning(vm) ? '运行' : '停止'}
           </span>
-          <div className='flex items-center gap-1.5 rounded-md border px-2 py-1 text-sm text-muted-foreground'>
-            调度
-            <SchedulableSwitch {...vmSchedulableProps(vm)} />
-          </div>
+          {!isAntigravityVm(vm) ? (
+            <div className='flex items-center gap-1.5 rounded-md border px-2 py-1 text-sm text-muted-foreground'>
+              调度
+              <SchedulableSwitch {...vmSchedulableProps(vm)} />
+            </div>
+          ) : null}
           {perms.power ? (
             <div className='ms-auto flex flex-wrap gap-2'>
               {vmRunning(vm) ? (

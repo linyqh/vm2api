@@ -11,7 +11,7 @@ import { ArrowRight, ChevronRight, RefreshCw } from 'lucide-react'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/utils'
-import { isCodexVm, slotNameLabel } from '@/lib/vm-kind'
+import { isClaudeVm, slotNameLabel } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { ConfirmDialog } from '@/components/confirm-dialog'
@@ -245,7 +245,7 @@ export function TelemetryPane({
   const dash = useQuery(dashboardQueryOptions())
   const routing = useQuery(routingQueryOptions())
   const vms: Vm[] = dash.data?.vms || []
-  const claude = vms.filter((vm) => !isCodexVm(vm))
+  const claude = vms.filter((vm) => isClaudeVm(vm))
   const codexCount = vms.length - claude.length
   const probed = claude.filter(
     (vm) => vm.status === 'running' && telemetryEnabled(vm.seed_policy)

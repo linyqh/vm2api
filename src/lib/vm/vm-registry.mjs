@@ -20,7 +20,8 @@ import { manualScheduleLevelOf, parseScheduleLevelInput } from '../pool/credenti
 import { vmQuotaOverrideOf } from '../pool/vm-quota-override.mjs'
 import { activeHoursOf, parseActiveHoursInput } from '../pool/active-hours.mjs'
 import { normalizeOwnerId, vmOriginOf, vmOwnerId, VM_ORIGIN } from '../admin/resource-owner.mjs'
-import { isCodexVm, normalizeVmKind } from './vm-kind.mjs'
+import { isCodexVm, isClaudeVm, isAntigravityVm, normalizeVmKind } from './vm-kind.mjs'
+import { summarizeAntigravitySlot } from './antigravity-slot.mjs'
 import { canClaudeResetCredits } from '../oauth/credential-mode.mjs'
 import { validTimezone } from '../core/timezone.mjs'
 import {
@@ -64,6 +65,8 @@ export function getVm(projectRoot, id) {
 
 export function summarizeVm(vm, projectRoot = null, routing = null) {
   const kind = normalizeVmKind(vm)
+  const claude = isClaudeVm(vm) ? vm.claude || {} : {}
+  const antigravity = isAntigravityVm(vm) ? summarizeAntigravitySlot(projectRoot, vm) : null
   const codex = kind.kind === 'codex' ? summarizeCodexSlot(projectRoot, vm) : null
   const quota = codex?.usage?.quota || {}
   const globalOpenAI = normalizeOpenAIQuotaPolicy(routing?.codex?.quota)
@@ -85,23 +88,21 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
     platform: kind.platform,
     family: kind.family,
     codex_kernel: kind.kind === 'codex',
-    email: kind.kind === 'codex' ? codex?.email || null : vm.claude?.email || null,
-    account_uuid: kind.kind === 'codex' ? null : vm.claude?.account_uuid || null,
-    org_uuid: kind.kind === 'codex' ? vm.codex?.chatgpt_account_id || null : vm.claude?.org_uuid || null,
-    has_token: kind.kind === 'codex' ? !!codex?.has_token : hasAccessPresence(vm.claude),
-    expires_at: kind.kind === 'codex' ? codex?.expires_at || null : vm.claude?.expires_at || null,
-    refreshed_at:
-      kind.kind === 'codex' ? vm.codex?.usage?.snapshot?.updated_at || null : vm.claude?.refreshed_at || null,
-    oauth_source: kind.kind === 'codex' ? 'codex-credentials' : vm.claude?.source || null,
-    credential_mode: kind.kind === 'codex' ? 'oauth' : vm.claude?.mode || 'oauth',
+    email: kind.kind === 'codex' ? codex?.email || null : claude?.email || null,
+    account_uuid: kind.kind === 'codex' ? null : claude?.account_uuid || null,
+    org_uuid: kind.kind === 'codex' ? vm.codex?.chatgpt_account_id || null : claude?.org_uuid || null,
+    has_token: kind.kind === 'codex' ? !!codex?.has_token : hasAccessPresence(claude),
+    expires_at: kind.kind === 'codex' ? codex?.expires_at || null : claude?.expires_at || null,
+    refreshed_at: kind.kind === 'codex' ? vm.codex?.usage?.snapshot?.updated_at || null : claude?.refreshed_at || null,
+    oauth_source: kind.kind === 'codex' ? 'codex-credentials' : claude?.source || null,
+    credential_mode: kind.kind === 'codex' ? 'oauth' : claude?.mode || 'oauth',
     can_claude_reset: canClaudeResetCredits(vm, {
-      hasToken: kind.kind === 'codex' ? !!codex?.has_token : hasAccessPresence(vm.claude),
+      hasToken: kind.kind === 'codex' ? !!codex?.has_token : hasAccessPresence(claude),
     }),
-    auth_scheme: kind.kind === 'codex' ? null : vm.claude?.auth_scheme || null,
-    has_refresh: kind.kind === 'codex' ? !!codex?.has_refresh : hasRefreshPresence(vm.claude),
-    refresh_error: kind.kind === 'codex' ? null : vm.claude?.refresh_error || null,
-    account_tier:
-      kind.kind === 'codex' ? 'codex' : vm.claude?.account_tier || (hasAccessPresence(vm.claude) ? 'pro' : null),
+    auth_scheme: kind.kind === 'codex' ? null : claude?.auth_scheme || null,
+    has_refresh: kind.kind === 'codex' ? !!codex?.has_refresh : hasRefreshPresence(claude),
+    refresh_error: kind.kind === 'codex' ? null : claude?.refresh_error || null,
+    account_tier: kind.kind === 'codex' ? 'codex' : claude?.account_tier || (hasAccessPresence(claude) ? 'pro' : null),
     has_session_key: false,
     max_concurrency: kind.kind === 'codex' ? openAIPolicy.max_concurrency : (vm.policy?.maxConcurrency ?? 2),
     max_concurrency_override:
@@ -133,14 +134,14 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
     timezone_source: vm.timezone_source || 'auto',
     locale: vm.locale || null,
     proxy: vm.proxy ? { ...vm.proxy, password: vm.proxy.password ? '***' : (vm.proxy.password ?? null) } : null,
-    claude_code_version: vm.claude_code_version || null,
+    claude_code_version: isClaudeVm(vm) ? vm.claude_code_version || null : null,
     stats: vm.stats || {},
     fingerprint: vm.fingerprint || null,
     schedulable: vm.schedulable !== false,
     schedule_manual: vm.schedule_manual === true,
     schedule_disabled_reason: vm.schedule_disabled_reason || null,
-    temp_unschedulable_until: vm.claude?.temp_unschedulable_until || vm.temp_unschedulable_until || null,
-    temp_unschedulable_reason: vm.claude?.temp_unschedulable_reason || vm.temp_unschedulable_reason || null,
+    temp_unschedulable_until: claude?.temp_unschedulable_until || vm.temp_unschedulable_until || null,
+    temp_unschedulable_reason: claude?.temp_unschedulable_reason || vm.temp_unschedulable_reason || null,
     owner_user_id: normalizeOwnerId(vm.owner_user_id),
     origin: vmOriginOf(vm),
     proxy_id: vm.proxy?.id || null,
@@ -171,7 +172,26 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
     plan_type: codex?.plan_type || null,
     chatgpt_subscription_active_until: kind.kind === 'codex' ? codex?.chatgpt_subscription_active_until || null : null,
     chatgpt_plan_type: kind.kind === 'codex' ? codex?.chatgpt_plan_type || null : null,
-    claude_reset_credits: kind.kind === 'codex' ? null : vm.claude_reset_credits || null,
+    claude_reset_credits: isClaudeVm(vm) ? vm.claude_reset_credits || null : null,
+    ...(antigravity
+      ? {
+          antigravity,
+          email: antigravity.email || null,
+          credential_mode: 'official_cli',
+          oauth_source: 'antigravity-keyring',
+          has_token: false,
+          has_refresh: false,
+          account_tier: null,
+          session_slots: null,
+          quota_override: null,
+          can_claude_reset: false,
+          max_concurrency: 1,
+          max_sessions: 1,
+          inference_engine: 'antigravity',
+          schedulable: false,
+          schedule_disabled_reason: 'antigravity_experimental_text_only',
+        }
+      : {}),
   }
 }
 
@@ -452,7 +472,7 @@ export function clearActiveVm(projectRoot) {
 const HARD_UNAVAILABLE = new Set(['stopped', 'dead', 'error', 'disabled'])
 
 export function vmHasClaudeCredential(vm) {
-  return hasCredentialPresence(vm?.claude)
+  return isClaudeVm(vm) && hasCredentialPresence(vm?.claude)
 }
 
 /**
@@ -465,7 +485,7 @@ export function vmHasClaudeCredential(vm) {
  * re-enable) silently drops the whole GPT pool as `no_credential`.
  */
 export function vmHasSchedulableCredential(vm, projectRoot = null) {
-  if (!vm) return false
+  if (!vm || isAntigravityVm(vm)) return false
   if (!isCodexVm(vm)) {
     if (!vmHasClaudeCredential(vm)) return false
     // An expired access token with a recorded refresh failure is not a live
@@ -484,7 +504,7 @@ export function vmHasSchedulableCredential(vm, projectRoot = null) {
  * Empty inventory slots (no Claude token) stay out of the pool.
  */
 export function isVmScheduleReady(vm, { allowMissingCredential = false } = {}) {
-  if (!vm) return false
+  if (!vm || !isClaudeVm(vm)) return false
   if (vm.schedulable === false && !isLeftoverQuotaScheduleOff(vm)) return false
   if (!allowMissingCredential && !vmHasClaudeCredential(vm)) return false
   const status = String(vm.status || '').toLowerCase()

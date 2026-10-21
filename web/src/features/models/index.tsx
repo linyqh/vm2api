@@ -15,6 +15,7 @@ import { PageHeader } from '@/components/page-header'
 import { QueryGate } from '@/components/query-gate'
 import {
   modelPolicyQueryOptions,
+  modelsQueryOptions,
   pricingQueryOptions,
 } from '@/features/models/queries'
 import { EntryStrip } from './entry-strip'
@@ -49,7 +50,9 @@ const BETA_FILTERS: [BetaFilter, string][] = [
 
 export function ModelsPage() {
   const qc = useQueryClient()
-  const [pageTab, setPageTab] = useState<'models' | 'pricing'>('models')
+  const [pageTab, setPageTab] = useState<'models' | 'antigravity' | 'pricing'>(
+    'models'
+  )
   const [catalogPlatform, setCatalogPlatform] = useState<
     'anthropic' | 'openai'
   >('anthropic')
@@ -316,13 +319,21 @@ export function ModelsPage() {
       <Tabs
         value={pageTab}
         onValueChange={(value) => {
-          if (value === 'models' || value === 'pricing') setPageTab(value)
+          if (
+            value === 'models' ||
+            value === 'antigravity' ||
+            value === 'pricing'
+          )
+            setPageTab(value)
         }}
         className='gap-4'
       >
         <TabsList aria-label='模型页分区'>
           <TabsTrigger value='models' className='cursor-pointer px-4'>
             模型
+          </TabsTrigger>
+          <TabsTrigger value='antigravity' className='cursor-pointer px-4'>
+            Antigravity
           </TabsTrigger>
           <TabsTrigger value='pricing' className='cursor-pointer px-4'>
             计费
@@ -546,11 +557,54 @@ export function ModelsPage() {
             </div>
           </QueryGate>
         </TabsContent>
+        <TabsContent value='antigravity'>
+          <AntigravityCatalog />
+        </TabsContent>
         <TabsContent value='pricing'>
           <PricingTab />
         </TabsContent>
       </Tabs>
     </PageHeader>
+  )
+}
+
+function AntigravityCatalog() {
+  const catalog = useQuery(modelsQueryOptions())
+  const items = (catalog.data?.items || []).filter(
+    (item) =>
+      item.platform === 'antigravity' || item.id.startsWith('antigravity/')
+  )
+  return (
+    <QueryGate loading={catalog.isLoading} error={catalog.error}>
+      <section className='space-y-3 rounded-lg border bg-card p-4'>
+        <h3 className='font-semibold'>Antigravity 模型目录</h3>
+        <p className='text-sm text-muted-foreground'>
+          目录按接入平台隔离。模型供应商不改变槽位平台；请在 Antigravity
+          槽位账号页配置原始模型 ID。
+        </p>
+        <p className='text-xs text-muted-foreground'>
+          此目录用于实验文本会话。通用 /v1 API 暂不支持此平台。
+        </p>
+        {items.length ? (
+          <ul className='divide-y'>
+            {items.map((item) => (
+              <li key={item.id} className='space-y-1 py-2 text-sm'>
+                <p className='font-mono break-all'>{item.id}</p>
+                <p className='text-xs text-muted-foreground'>
+                  {[item.display_name, item.vendor, item.upstream_model]
+                    .filter(Boolean)
+                    .join(' · ')}
+                </p>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className='text-sm text-muted-foreground'>
+            尚无已启用模型。请先启用实验平台并配置模型 ID。
+          </p>
+        )}
+      </section>
+    </QueryGate>
   )
 }
 

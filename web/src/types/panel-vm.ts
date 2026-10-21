@@ -294,9 +294,9 @@ export type Vm = {
   account_tier?: string
   /** Complete official usage: true = Max, false = Pro, null = unconfirmed. */
   usage_has_fable?: boolean | null
-  /** anthropic | openai。缺省按 Claude 槽展示。 */
+  /** anthropic | openai | antigravity。缺省兼容旧 Claude 槽。 */
   platform?: string | null
-  /** claude | codex */
+  /** claude | codex | antigravity */
   family?: string | null
   codex_kernel?: boolean
   inference_engine?: 'go' | 'rust' | null

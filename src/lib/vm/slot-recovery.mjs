@@ -15,6 +15,7 @@ import { slotEgressNames } from '../cluster/remote-slot.mjs'
 import { kernelFaults, rustKernelHealth, toPublicKernelHealth } from '../transport/rust-kernel-client.mjs'
 import { codexKernelHealth } from '../transport/codex-kernel-client.mjs'
 import { codexKernelTracked } from '../transport/codex-kernel-supervisor.mjs'
+import { antigravityBridgeStatus } from '../transport/antigravity-bridge-supervisor.mjs'
 import {
   egressListening,
   ensureProxyEgress,
@@ -29,7 +30,7 @@ import { resolveInferenceEngine } from './slot-engine.mjs'
 import { slotExecContainer } from './slot-exec.mjs'
 import { slotHost } from './slot-host.mjs'
 import { slotExec, startSlotReady, stopSlot } from './slot-runtime.mjs'
-import { isCodexVm } from './vm-kind.mjs'
+import { isAntigravityVm, isCodexVm } from './vm-kind.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
 import { slotDockerCpus } from './machine-spec.mjs'
 import { bindVmProxy, getVm, patchVmRecord, vmHasSchedulableCredential } from './vm-registry.mjs'
@@ -57,6 +58,7 @@ function check(id, label, status, code, message, detail) {
 }
 
 function slotEngine(vm, routing) {
+  if (isAntigravityVm(vm)) return 'antigravity'
   return isCodexVm(vm) ? 'codex' : resolveInferenceEngine(vm, routing || {})
 }
 
@@ -120,6 +122,7 @@ const DEFAULT_PROBES = Object.freeze({
   container: inspectSlotContainer,
   rustHealth: (exec) => rustKernelHealth(exec, { timeoutMs: HEALTH_TIMEOUT_MS }),
   codexHealth: (exec) => codexKernelHealth(exec, { timeoutMs: HEALTH_TIMEOUT_MS }),
+  antigravityHealth: (projectRoot, vm, routing) => antigravityBridgeStatus({ projectRoot, vm, routing }),
   localEgress: (proxy) => localEgressStatus(proxy),
   socksEgress: (projectRoot, proxyId) => egressListening(projectRoot, proxyId),
   remoteEgress: async (vm) => {
@@ -138,6 +141,14 @@ function recordCheck(vm) {
 }
 
 function credentialCheck(vm, projectRoot) {
+  if (isAntigravityVm(vm))
+    return check(
+      'credential',
+      '凭证',
+      'warn',
+      'antigravity_auth_unknown',
+      '登录状态由槽内官方客户端验证，请通过文本测试确认',
+    )
   if (vmHasSchedulableCredential(vm, projectRoot)) return check('credential', '凭证', 'ok', null, '已导入可用凭证')
   const refreshFailed = isCredentialRefreshFailed({ vm, now: Date.now() })
   return check(
@@ -234,8 +245,19 @@ async function containerCheck(vm, probes, internal) {
   return check('container', label, 'error', code, `${lead}：${bits.join('，')}${why}`, detail)
 }
 
-async function kernelCheck(vm, projectRoot, engine, hasCredential, probes, internal) {
+async function kernelCheck(vm, projectRoot, engine, hasCredential, probes, internal, routing) {
   const label = '推理内核'
+  if (engine === 'antigravity') {
+    const health = await probes.antigravityHealth(projectRoot, vm, routing)
+    if (health.ok) return check('kernel', 'Antigravity 会话桥', 'ok', null, '文本会话桥在线；登录状态由实际请求验证')
+    return check(
+      'kernel',
+      'Antigravity 会话桥',
+      'warn',
+      health.code || 'antigravity_bridge_idle',
+      '文本会话桥未就绪，请检查配置或启动槽位',
+    )
+  }
   const exec = slotExec(projectRoot, vm)
   if (engine === 'codex') {
     const health = await probes.codexHealth(exec)
@@ -341,7 +363,7 @@ export async function diagnoseSlotServices(
     await guarded('egress', '出口代理 / 出口桥', internal, () => egressCheck(vm, projectRoot, p)),
     await guarded('container', '槽位容器', internal, () => containerCheck(vm, p, internal)),
     await guarded('kernel', '推理内核', internal, () =>
-      kernelCheck(vm, projectRoot, engine, hasCredential, p, internal),
+      kernelCheck(vm, projectRoot, engine, hasCredential, p, internal, routing),
     ),
     watchdogCheck(vm, engine, watchdog, internal),
     scheduleCheck(vm),
@@ -382,20 +404,20 @@ export async function powerOnSlot({ projectRoot, id, proxyPool, routing = {}, fi
   if (!boot.ok) {
     return {
       ok: false,
-      status: 500,
+      status: boot.status || 500,
       code: boot.code || 'runtime_start_failed',
       error: boot.error || 'runtime start failed',
       boot,
     }
   }
-  const hasCred = vmHasSchedulableCredential(vm, projectRoot)
+  const hasCred = !isAntigravityVm(vm) && vmHasSchedulableCredential(vm, projectRoot)
   const runtime = boot.runtime || boot.docker?.runtime
   vm =
     patchVmRecord(projectRoot, id, (record) => {
       const next = {
         status: 'running',
         schedulable: hasCred,
-        schedule_disabled_reason: hasCred ? null : 'no_credential',
+        schedule_disabled_reason: hasCred ? null : isAntigravityVm(vm) ? 'experimental_text_only' : 'no_credential',
       }
       if (runtime) {
         const currentRuntime = record.runtime || {}
@@ -626,6 +648,7 @@ export function createSlotBridgeHealer({
     const seenProxies = new Set()
     for (const vm of vms) {
       if (vm?.status !== 'running') continue
+      if (isAntigravityVm(vm) && vmNodeId(vm)) continue
       const nodeId = vmNodeId(vm)
       if (nodeId) {
         const manager = getCluster()

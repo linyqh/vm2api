@@ -12,7 +12,10 @@ import { slotHost } from './slot-host.mjs'
 import { maxRequestBytes, readRoutingConfigFile, streamIdleTimeoutMs } from '../core/config.mjs'
 import { US_TIMEZONES, validTimezone } from '../core/timezone.mjs'
 import { runtimeKind, isKvmRuntime, RUNTIME_KVM } from './runtime-kind.mjs'
-import { isCodexVm } from './vm-kind.mjs'
+import { isAntigravityVm, isClaudeVm, isCodexVm } from './vm-kind.mjs'
+import { antigravityRuntimeSupport, writeAntigravityBridgeConfig } from '../transport/antigravity-bridge-supervisor.mjs'
+import { antigravityBridgePaths } from '../transport/antigravity-bridge-client.mjs'
+import { normalizeAntigravityRouting } from '../protocol/antigravity-route.mjs'
 import { buildWorkerTelemetry } from './worker-telemetry.mjs'
 import { kernelBinPath, writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
 import { assertCliHopAllowed, resolveOfficialCcInference } from './slot-engine.mjs'
@@ -177,6 +180,7 @@ export function inspectContainer(name) {
 
 /** Label on GPT slot containers: their PID 1 idles; the Codex kernel runs on the host. */
 export const CODEX_SLOT_ROLE = 'codex'
+export const ANTIGRAVITY_SLOT_ROLE = 'antigravity'
 
 /**
  * PID 1 of a docker slot. Claude slots run kin-kernel. A GPT slot's Codex
@@ -186,7 +190,8 @@ export const CODEX_SLOT_ROLE = 'codex'
  * few minutes under `--restart unless-stopped`.
  */
 export function slotContainerCommand(vm, { wrapKernel = false } = {}) {
-  if (isCodexVm(vm)) return ['sleep', 'infinity']
+  if (isCodexVm(vm) || isAntigravityVm(vm)) return ['sleep', 'infinity']
+  if (!isClaudeVm(vm)) throw new TypeError('Unsupported slot platform')
   return [
     wrapKernel ? '/home/kincli/.kin/kin-kernel' : '/usr/local/bin/kin-kernel',
     '--gateway-worker',
@@ -197,7 +202,9 @@ export function slotContainerCommand(vm, { wrapKernel = false } = {}) {
 
 /** A GPT slot container created before CODEX_SLOT_ROLE still runs kin-kernel as PID 1. */
 function codexContainerStale(existing, vm) {
-  return !!existing && isCodexVm(vm) && existing.role !== CODEX_SLOT_ROLE
+  if (!existing) return false
+  if (isAntigravityVm(vm)) return existing.role !== ANTIGRAVITY_SLOT_ROLE
+  return isCodexVm(vm) && existing.role !== CODEX_SLOT_ROLE
 }
 
 export function containerHasKernelMount(name) {
@@ -277,7 +284,7 @@ export function runtimePatch(vm, info, extra = {}) {
     os: meta.pretty,
     memory: memory || slotMemory(vm, routing),
     user: runtimeUser(vm),
-    worker: rest.worker || vm.runtime?.worker || 'rust',
+    worker: rest.worker || (isAntigravityVm(vm) ? 'antigravity' : vm.runtime?.worker || 'rust'),
     worker_socket: rest.worker_socket || vm.runtime?.worker_socket || null,
     worker_run_dir: rest.worker_run_dir || vm.runtime?.worker_run_dir || null,
     worker_token_file: rest.worker_token_file || vm.runtime?.worker_token_file || null,
@@ -301,8 +308,22 @@ function workerPaths(projectRoot, vmId) {
   }
 }
 
+function slotWorkerPaths(projectRoot, vm) {
+  if (!isAntigravityVm(vm)) return workerPaths(projectRoot, vm.id)
+  const paths = antigravityBridgePaths(projectRoot, vm)
+  return {
+    ...workerPaths(projectRoot, vm.id),
+    socket: paths.socketPath,
+    kernelSocket: paths.socketPath,
+    token: paths.tokenPath,
+    config: paths.configPath,
+    worker: 'antigravity',
+  }
+}
+
 function workerRuntimeExtra(worker) {
   return {
+    ...(worker.worker ? { worker: worker.worker } : {}),
     worker_socket: worker.socket,
     worker_run_dir: worker.runDir,
     worker_token_file: worker.token,
@@ -397,9 +418,13 @@ export function slotWorkerNeedsRecreate(existing, vm, paths) {
  */
 export async function reloadSlotWorker(vm, projectRoot, { routing } = {}) {
   if (!vm?.id) return { ok: false, error: 'vm required' }
+  if (isAntigravityVm(vm)) {
+    const support = antigravityRuntimeSupport(vm)
+    if (!support.ok) return support
+  }
   // Outside the cached-config fallback: invalid quotas must never reach restart.
   if (!isKvmRuntime(vm)) slotDockerCpus(vm)
-  const paths = workerPaths(projectRoot, vm.id)
+  const paths = slotWorkerPaths(projectRoot, vm)
   const name = containerName(vm.id)
   let worker
   try {
@@ -407,6 +432,8 @@ export async function reloadSlotWorker(vm, projectRoot, { routing } = {}) {
       throw new Error('slot SOCKS5 proxy is required')
     worker = writeWorkerFiles(vm, projectRoot, { routing })
   } catch (error) {
+    if (isAntigravityVm(vm))
+      return { ok: false, code: error.code || 'antigravity_config_failed', error: String(error.message || error) }
     if (!fs.existsSync(paths.config) || !fs.existsSync(paths.token)) {
       return { ok: false, error: String(error.message || error) }
     }
@@ -472,11 +499,13 @@ export function slotKernelAlive(existing, paths, vm) {
   if (isKvmRuntime(vm) || existing.runtime === 'kvm') return true
   // No kernel in a GPT slot container: running is alive.
   if (isCodexVm(vm) && existing.role === CODEX_SLOT_ROLE) return true
+  if (isAntigravityVm(vm) && existing.role === ANTIGRAVITY_SLOT_ROLE) return true
   return fs.existsSync(paths.kernelSocket)
 }
 
 /** The telemetry sidecar is a docker exec child: every container (re)start loses it. */
 function startTelemetrySidecar(name, vm) {
+  if (isAntigravityVm(vm)) return
   if (!fs.existsSync(WORKER_BIN)) return
   const target = { ...(vm || {}), runtime: { ...(vm?.runtime || {}), container: name, type: runtimeKind(vm) } }
   if (!target.id && name) target.id = `vm-${String(name).replace(/^kin-/, '')}`
@@ -507,6 +536,16 @@ function resolveSlotRouting(projectRoot, routing) {
 }
 
 export function writeWorkerFiles(vm, projectRoot, { transparent, routing } = {}) {
+  if (isAntigravityVm(vm)) {
+    const support = antigravityRuntimeSupport(vm)
+    if (!support.ok) throw Object.assign(new Error(support.error), { code: support.code })
+    const resolvedRouting = resolveSlotRouting(projectRoot, routing)
+    if (!normalizeAntigravityRouting(resolvedRouting.antigravity || {}).enabled)
+      throw Object.assign(new Error('Antigravity is disabled'), { code: 'antigravity_disabled' })
+    writeAntigravityBridgeConfig(projectRoot, vm, { routing: resolvedRouting })
+    return slotWorkerPaths(projectRoot, vm)
+  }
+  if (!isClaudeVm(vm) && !isCodexVm(vm)) throw new TypeError('Unsupported slot platform')
   assertProxyAllowed(vm.proxy)
   const paths = workerPaths(projectRoot, vm.id)
   const uid = runtimeUidNum(vm)
@@ -895,6 +934,14 @@ export function dockerSlotResourceArgs(vm, routing) {
 }
 
 export async function startVmRuntime(vm, projectRoot, { recreate = false, routing, accel: accelOpt } = {}) {
+  if (isAntigravityVm(vm)) {
+    const support = antigravityRuntimeSupport(vm)
+    if (!support.ok) return support
+    if (!normalizeAntigravityRouting(resolveSlotRouting(projectRoot, routing).antigravity || {}).enabled)
+      return { ok: false, code: 'antigravity_disabled', error: 'Antigravity is disabled' }
+  }
+  if (!isClaudeVm(vm) && !isCodexVm(vm) && !isAntigravityVm(vm))
+    return { ok: false, code: 'platform_not_supported', error: 'Unsupported slot platform' }
   if (!isKvmRuntime(vm)) slotDockerCpus(vm) // reject corrupt persisted quotas before any lifecycle changes
   if (isKvmRuntime(vm) && accelOpt !== 'kvm' && accelOpt !== 'tcg') {
     const recorded = vm.runtime?.accel
@@ -922,7 +969,7 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
   const home = path.join(projectRoot, 'vms', vm.id, 'cli-home')
   fs.mkdirSync(home, { recursive: true })
   try {
-    ensureSlotClaudeOwnership(home, runtimeUidNum(vm), Number(GID))
+    if (isClaudeVm(vm)) ensureSlotClaudeOwnership(home, runtimeUidNum(vm), Number(GID))
   } catch (error) {
     if (!kvm) throw error
   }
@@ -934,11 +981,12 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
   if (!eg.network && !eg.name) return { ok: false, error: 'egress network missing; refusing host fallback' }
 
   let existing = inspectContainer(name)
-  const paths = workerPaths(projectRoot, vm.id)
+  const paths = slotWorkerPaths(projectRoot, vm)
   const replace = recreate || !slotKernelAlive(existing, paths, vm) || codexContainerStale(existing, vm)
   // Node restart / 开机 must not bounce a live slot with a healthy worker.
   if (existing?.running && !replace) {
     runtimePatch(vm, existing, {
+      ...(isAntigravityVm(vm) ? { worker: 'antigravity' } : {}),
       worker_socket: paths.socket,
       worker_run_dir: paths.runDir,
       worker_token_file: paths.token,
@@ -949,15 +997,16 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
     return { ok: true, action: 'already-running', runtime: vm.runtime }
   }
   const codex = isCodexVm(vm)
-  if (!codex) {
+  const claude = isClaudeVm(vm)
+  if (claude) {
     try {
       materializeWrapCli(projectRoot, vm, { uid: runtimeUidNum(vm), gid: Number(GID) })
     } catch {}
   }
   const wrapKernel = path.join(home, '.kin', 'kin-kernel')
   const kernelBin = kernelBinPath()
-  const mountKernel = !codex && !!kernelBin && fs.existsSync(kernelBin)
-  if (!codex && !fs.existsSync(wrapKernel) && !mountKernel) {
+  const mountKernel = claude && !!kernelBin && fs.existsSync(kernelBin)
+  if (claude && !fs.existsSync(wrapKernel) && !mountKernel) {
     return { ok: false, error: 'kin-kernel missing; wrap CLI sample not materialized' }
   }
 
@@ -1100,12 +1149,13 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
       '--label',
       'kin.vm.runtime=docker',
       ...(codex ? ['--label', `kin.vm.role=${CODEX_SLOT_ROLE}`] : []),
+      ...(isAntigravityVm(vm) ? ['--label', `kin.vm.role=${ANTIGRAVITY_SLOT_ROLE}`] : []),
       '-v',
       `${hostOf(home)}:/home/kincli`,
       '-v',
       `${hostOf(worker.runDir)}:/run/kin`,
       ...slotGuestBinMountArgs({
-        workerBin: fs.existsSync(WORKER_BIN) ? WORKER_BIN : null,
+        workerBin: !isAntigravityVm(vm) && fs.existsSync(WORKER_BIN) ? WORKER_BIN : null,
         kernelBin: mountKernel ? kernelBin : null,
         guestBinDir: '/usr/local/bin',
         hostOf,
@@ -1115,8 +1165,7 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
       ...computerDockerArgs({ dir: computer.dir, mac: computer.mac, hostOf }),
       '-e',
       'HOME=/home/kincli',
-      '-e',
-      'CLAUDE_CONFIG_DIR=/home/kincli/.claude',
+      ...(claude ? ['-e', 'CLAUDE_CONFIG_DIR=/home/kincli/.claude'] : []),
       '-e',
       `TZ=${zone || 'UTC'}`,
       '-e',

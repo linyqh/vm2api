@@ -45,7 +45,9 @@ export function BillingPage() {
     groupBy === 'vm' && platform !== 'all'
       ? platform === 'codex'
         ? split.gpt
-        : split.claude
+        : platform === 'antigravity'
+          ? split.antigravity
+          : split.claude
       : q.data?.totals || emptyTotals()
 
   return (
@@ -92,6 +94,13 @@ export function BillingPage() {
                 onClick={() => setPlatform('codex')}
               >
                 GPT
+              </Button>
+              <Button
+                size='sm'
+                variant={platform === 'antigravity' ? 'default' : 'outline'}
+                onClick={() => setPlatform('antigravity')}
+              >
+                Antigravity
               </Button>
             </>
           ) : null}

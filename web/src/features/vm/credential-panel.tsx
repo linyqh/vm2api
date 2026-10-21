@@ -41,6 +41,7 @@ import {
 import { Textarea } from '@/components/ui/textarea'
 import { type LoginTerminalHandle, WsTerminal } from '@/components/ws-terminal'
 import { dashboardQueryOptions } from '@/features/overview/queries'
+import { AntigravityPanel } from '@/features/vm/antigravity-panel'
 import { CodexCredentialPanel } from '@/features/vm/codex-credential-panel'
 import { ConvertOauthToSetupButton } from '@/features/vm/convert-oauth-button'
 import { vmQueryOptions } from '@/features/vm/queries'
@@ -136,6 +137,12 @@ export function CredentialPanel({
   onCommitted?: (data: CommitResult, vmId: string, what: string) => void
   showConvert?: boolean
 }) {
+  if (importSurfaceFor(vm) === 'antigravity')
+    return <AntigravityPanel key={vm.id} vm={vm} />
+  if (importSurfaceFor(vm) === 'unknown')
+    return (
+      <p className='text-sm text-muted-foreground'>该平台不支持凭证导入。</p>
+    )
   if (importSurfaceFor(vm) === 'codex') {
     return <CodexCredentialPanel vm={vm} onCommitted={onCommitted} />
   }

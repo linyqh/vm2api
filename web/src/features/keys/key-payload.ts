@@ -1,4 +1,5 @@
-export type KeyGroupType = 'all' | 'anthropic' | 'openai' | 'pool'
+export type KeyGroupType =
+  'all' | 'anthropic' | 'openai' | 'antigravity' | 'pool'
 
 export type KeyLimitsDraft = {
   name: string
@@ -20,7 +21,8 @@ function nonNegative(value: number, label: string): number {
 }
 
 function groupTypeOf(value: string): KeyGroupType {
-  if (value === 'anthropic' || value === 'openai') return value
+  if (value === 'anthropic' || value === 'openai' || value === 'antigravity')
+    return value
   return 'all'
 }
 

@@ -112,15 +112,24 @@ export async function peekCurrentAccount({
           migrate: false,
         }).stickyKey
       : stickyRouter?.extractPoolKey?.(req, inbound, { platform })) || null
-  if (!poolScheduler?.peekAccount) {
-    return { ok: false, code: 'no_eligible_accounts' }
-  }
   const keyScope = keyScopeFromRequest(req)
   const poolDenial = vmPoolDenial(keyScope)
   if (poolDenial) return { ok: false, code: ErrorCode.VM_POOL_UNAVAILABLE, message: poolDenial.message }
   // Same gate as Messages: a platform-scoped key must not hop to the other platform's VMs.
   if (platform && keyScope.group_type !== 'all' && keyScope.group_type !== platform) {
     return { ok: false, code: ErrorCode.KEY_GROUP_MISMATCH, group_type: keyScope.group_type }
+  }
+  if (model && !detected.ok) return { ok: false, code: detected.code, message: detected.message, status: 400 }
+  if (platform === 'antigravity') {
+    return {
+      ok: false,
+      status: 400,
+      code: 'antigravity_experimental_text_only',
+      message: 'Antigravity 实验文本会话不支持 count_tokens，请使用专用账号面板',
+    }
+  }
+  if (!poolScheduler?.peekAccount) {
+    return { ok: false, code: 'no_eligible_accounts' }
   }
   return poolScheduler.peekAccount({
     model,
@@ -134,6 +143,10 @@ export async function peekCurrentAccount({
 /** Same client contract as Messages: Fable gate 429, capacity 529 / pool-wide limit 429 with Retry-After, else 503. */
 function sendPoolFail(res, json, peeked) {
   const code = peeked?.code || 'no_eligible_accounts'
+  if (peeked?.status === 400) {
+    const error = makeError({ type: ErrorType.INVALID_REQUEST, code, message: peeked.message || code, status: 400 })
+    return json(res, 400, error.body)
+  }
   if (code === ErrorCode.KEY_GROUP_MISMATCH) {
     const err = makeError({
       type: ErrorType.PERMISSION,

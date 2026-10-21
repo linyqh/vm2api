@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { TestModelsPayload, Vm } from '@/types/panel-vm'
 import { toast } from 'sonner'
 import { api, isApiError } from '@/lib/api'
-import { isCodexVm } from '@/lib/vm-kind'
+import { isAntigravityVm, isCodexVm } from '@/lib/vm-kind'
 import { testModelsQueryOptions } from '@/features/vm/queries'
 import type { TestChatResult } from '@/features/vm/test-chat-types'
 import { useVmPerms } from '@/features/vm/vm-perms'
@@ -15,7 +15,7 @@ export function useVmTestChat(vm: Vm) {
   const canTest = useVmPerms().testModels
   const testModels = useQuery({
     ...testModelsQueryOptions(id),
-    enabled: canTest && !!id,
+    enabled: canTest && !!id && !isAntigravityVm(vm),
   })
   const [prompt, setPrompt] = useState('hello')
   const [model, setModel] = useState('')

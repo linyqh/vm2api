@@ -3,6 +3,7 @@
  * GPT = /^gpt/i minus SKIP_GPT. Claude = claude-* family. Not URL, not pin.
  */
 import { SKIP_GPT, isGptSeriesId } from './gpt-ids.mjs'
+import { antigravityUpstreamModel } from './antigravity-route.mjs'
 export function detectInboundPlatform(model) {
   const raw = String(model || '').trim()
   if (!raw) {
@@ -11,6 +12,12 @@ export function detectInboundPlatform(model) {
       code: 'model_required',
       message: 'model is required',
     }
+  }
+  if (/(?:^|\/)antigravity(?:\/|$)/i.test(raw)) {
+    const id = /^antigravity\//i.test(raw) ? antigravityUpstreamModel(raw) : null
+    if (!id)
+      return { ok: false, code: 'model_not_supported', message: `model '${raw}' has an invalid Antigravity model ID` }
+    return { ok: true, platform: 'antigravity', model: id }
   }
   const id = raw.split('/').filter(Boolean).pop() || raw
   const lower = id.toLowerCase()

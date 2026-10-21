@@ -7,7 +7,7 @@ import {
 } from '@/lib/fable-status'
 import { fmtNum, fmtUsd } from '@/lib/format'
 import { cn } from '@/lib/utils'
-import { isCodexVm } from '@/lib/vm-kind'
+import { isAntigravityVm, isCodexVm } from '@/lib/vm-kind'
 import { vmCostLedger } from '@/lib/vm-usage'
 import { useNow } from '@/hooks/use-now'
 import { ClaudeResetActions } from '@/features/vm/claude-reset-actions'
@@ -92,6 +92,7 @@ function WindowRow({
 
 /** GPT 槽：查询 / 重置券；Claude 完整 OAuth：原生限额查询 / 重置。 */
 export function VmQuotaActions({ vm, now }: { vm: Vm; now: number }) {
+  if (isAntigravityVm(vm)) return null
   return isCodexVm(vm) ? (
     <OpenaiQuotaActions vm={vm} compact />
   ) : (
@@ -117,6 +118,12 @@ export function VmUsageWindows({
   quotaActions?: boolean
   className?: string
 }) {
+  if (isAntigravityVm(vm))
+    return (
+      <p className={cn('text-xs text-muted-foreground', className)}>
+        Antigravity 模型配额尚未同步
+      </p>
+    )
   const hasToken = Boolean(vm.has_token)
   return (
     <div className={cn('grid min-w-0 gap-1', className)}>

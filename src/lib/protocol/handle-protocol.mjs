@@ -1,3 +1,4 @@
+import { normalizeAntigravityRouting } from './antigravity-route.mjs'
 /**
  * /v1 protocol handler. URLs, auth, and response envelopes stay with the
  * server wiring; this factory owns convert → pool → Go/Rust hop → client.
@@ -569,7 +570,10 @@ export function createHandleProtocol(deps) {
       logBag.error_message = errorResult.body?.error?.message || null
       return json(res, errorResult.status, errorResult.body)
     }
-    const healthDecision = getHealthMonitor()?.decide?.(req.headers, inbound, protocol)
+    const healthDecision =
+      detectInboundPlatform(inbound?.model).platform === 'antigravity'
+        ? null
+        : getHealthMonitor()?.decide?.(req.headers, inbound, protocol)
     if (healthDecision?.action === 'fail') {
       stats.requests++
       stats.by_route[protocol] = (stats.by_route[protocol] || 0) + 1
@@ -699,6 +703,26 @@ export function createHandleProtocol(deps) {
       logBag.error_code = ErrorCode.KEY_GROUP_MISMATCH
       logBag.error_message = errorResult.body?.error?.message || null
       return json(res, 403, errorResult.body)
+    }
+    if (platform.platform === 'antigravity') {
+      const enabled = normalizeAntigravityRouting(getRouting()?.antigravity).enabled
+      stats.errors++
+      const code = enabled ? 'antigravity_experimental_text_only' : 'antigravity_disabled'
+      const message = enabled
+        ? 'Antigravity currently supports experimental panel text sessions; native API history, system, images and tools are not supported.'
+        : 'Antigravity is disabled.'
+      logBag.error_code = code
+      logBag.error_message = message
+      return json(
+        res,
+        enabled ? 400 : 503,
+        makeError({
+          type: ErrorType.INVALID_REQUEST,
+          code,
+          message,
+          status: enabled ? 400 : 503,
+        }).body,
+      )
     }
     // Codex returns before conversion. Distill does not apply to OpenAI platform models; the rest
     // of the gate scans them only when jev.openai_platform_enabled is on.

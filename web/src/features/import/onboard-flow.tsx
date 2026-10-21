@@ -8,7 +8,7 @@ import { api } from '@/lib/api'
 import { credTypeOf } from '@/lib/cred-type'
 import { importErrorMessage } from '@/lib/import-errors'
 import { cn } from '@/lib/utils'
-import { isCodexVm } from '@/lib/vm-kind'
+import { isAntigravityVm, isClaudeVm, isCodexVm } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
 import { ChoiceTiles, Segmented } from '@/components/choice-tiles'
 import { PlatformChip } from '@/components/platform-chip'
@@ -360,7 +360,9 @@ export function OnboardFlow() {
 
   // 选中的槽被别处导入了凭证 / 被删了，就从选中态退出来。
   // pinned 分支放行：换票成功的那一刻本槽正好会从 empty 里消失。
-  const stillEmpty = !!vmId && vms.some((v) => v.id === vmId && !v.has_token)
+  const stillEmpty =
+    !!vmId &&
+    vms.some((v) => v.id === vmId && (!v.has_token || isAntigravityVm(v)))
   useEffect(() => {
     if (pinnedId) return
     if (vmId && !stillEmpty) setVmId('')
@@ -369,7 +371,7 @@ export function OnboardFlow() {
   const boot = useQuery(
     officialCcBootstrapQueryOptions(
       activeId,
-      !!activeId && !!current?.has_token
+      !!activeId && !!current?.has_token && isClaudeVm(current)
     )
   )
   const bootStatus = boot.data?.status || null
@@ -515,6 +517,28 @@ export function OnboardFlow() {
     : source === 'new'
       ? draftSpecRows(draft)
       : null
+
+  if (current && isAntigravityVm(current)) {
+    return (
+      <div className='space-y-4'>
+        <div className='flex flex-wrap items-center gap-3'>
+          <PlatformChip vm={current} />
+          <span className='text-sm font-medium'>
+            {current.name || current.id}
+          </span>
+          <Button size='sm' variant='ghost' onClick={restart}>
+            换一台
+          </Button>
+          <Button size='sm' variant='outline' asChild>
+            <Link to='/vm/$id' params={{ id: current.id }}>
+              打开槽位详情与运维终端
+            </Link>
+          </Button>
+        </div>
+        <CredentialPanel vm={current} />
+      </div>
+    )
+  }
 
   return (
     <div className='grid items-start gap-x-10 gap-y-6 lg:grid-cols-[minmax(0,1fr)_17rem]'>
