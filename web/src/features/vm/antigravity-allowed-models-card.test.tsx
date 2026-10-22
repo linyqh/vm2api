@@ -13,8 +13,16 @@ describe('Antigravity slot model allowlist', () => {
       model_catalog: {
         updated_at: '2026-10-22T00:00:00Z',
         models: [
-          { id: 'gemini-example', display_name: 'Gemini from slot' },
-          { id: 'claude-example', display_name: 'Claude from slot' },
+          {
+            id: 'gemini-example',
+            display_name: 'Gemini from slot',
+            levels: ['low', 'high'],
+          },
+          {
+            id: 'claude-example',
+            display_name: 'Claude from slot',
+            levels: [],
+          },
         ],
       },
     })
@@ -24,12 +32,12 @@ describe('Antigravity slot model allowlist', () => {
           vm={{
             id: 'vm-ag',
             platform: 'antigravity',
-            allowed_models: ['antigravity/gemini-example'],
+            allowed_models: ['gemini-example'],
           }}
         />
       </QueryClientProvider>
     )
-    expect(html).toContain('Gemini from slot')
+    expect(html).toContain('Gemini from slot (low/high)')
     expect(html).toContain('Claude from slot')
     expect(html).toContain('同步账号模型')
     expect(
@@ -52,12 +60,12 @@ describe('Antigravity slot model allowlist', () => {
           vm={{
             id: 'vm-ag',
             platform: 'antigravity',
-            allowed_models: ['antigravity/gemini-example'],
+            allowed_models: ['gemini-example'],
           }}
         />
       </QueryClientProvider>
     )
-    expect(html).toContain('antigravity/gemini-example')
+    expect(html).toContain('gemini-example')
     expect(html).toContain('同步账号模型')
     expect(html).not.toContain('全选（继承）')
     client.clear()

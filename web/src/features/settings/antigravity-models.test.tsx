@@ -45,5 +45,14 @@ describe('global Antigravity settings', () => {
         'gemini-pro\nnew-model\ngemini-pro\n'
       )
     ).toEqual([disabled, 'new-model'])
+    expect(
+      antigravityModelsFromIds([disabled], 'gemini-pro\nnew-model', {
+        'gemini-pro': ['low', 'high'],
+        'new-model': ['medium'],
+      })
+    ).toEqual([
+      { ...disabled, levels: ['low', 'high'] },
+      { id: 'new-model', levels: ['medium'] },
+    ])
   })
 })

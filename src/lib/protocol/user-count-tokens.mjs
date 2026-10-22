@@ -101,7 +101,8 @@ export async function peekCurrentAccount({
   signal,
   usersRepo = null,
 } = {}) {
-  const detected = detectInboundPlatform(model)
+  const keyScope = keyScopeFromRequest(req)
+  const detected = detectInboundPlatform(model, { groupType: keyScope.group_type })
   const platform = detected.ok ? detected.platform : undefined
   const identity = resolveInboundIdentity({ inbound, body: inbound, headers: req?.headers || {} })
   const stickyKey =
@@ -112,7 +113,6 @@ export async function peekCurrentAccount({
           migrate: false,
         }).stickyKey
       : stickyRouter?.extractPoolKey?.(req, inbound, { platform })) || null
-  const keyScope = keyScopeFromRequest(req)
   const poolDenial = vmPoolDenial(keyScope)
   if (poolDenial) return { ok: false, code: ErrorCode.VM_POOL_UNAVAILABLE, message: poolDenial.message }
   // Same gate as Messages: a platform-scoped key must not hop to the other platform's VMs.
@@ -280,7 +280,8 @@ export async function handleUserCountTokens(req, res, deps) {
   const routing = typeof deps.getRoutingConfig === 'function' ? deps.getRoutingConfig() : null
   if (
     claudeCodeOnlyFromRouting(routing) &&
-    detectInboundPlatform(parsed.body.model).platform === 'anthropic' &&
+    detectInboundPlatform(parsed.body.model, { groupType: keyScopeFromRequest(req).group_type }).platform ===
+      'anthropic' &&
     !isClaudeCodeFamilyRequest(req?.headers || {}, inbound, { countTokens: true })
   ) {
     const err = claudeCodeOnlyError()

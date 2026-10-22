@@ -1,5 +1,14 @@
-/** Preserve per-model settings when an administrator only edits the ID list. */
-export function antigravityModelsFromIds(previous: unknown, text: string) {
+import type { AntigravityReasoningLevel } from '@/features/vm/antigravity-model-sync'
+
+export const ANTIGRAVITY_REASONING_LEVELS: readonly AntigravityReasoningLevel[] =
+  ['minimal', 'low', 'medium', 'high']
+
+/** Preserve per-model settings when an administrator edits the ID list or reasoning levels. */
+export function antigravityModelsFromIds(
+  previous: unknown,
+  text: string,
+  levelOverrides?: Record<string, AntigravityReasoningLevel[]>
+) {
   const models = new Map<string, string | Record<string, unknown>>()
   if (Array.isArray(previous)) {
     for (const item of previous) {
@@ -15,5 +24,16 @@ export function antigravityModelsFromIds(previous: unknown, text: string) {
         .map((id) => id.trim())
         .filter(Boolean)
     ),
-  ].map((id) => models.get(id) || id)
+  ].map((id) => {
+    const existing = models.get(id)
+    const levels = levelOverrides?.[id]
+    if (!levels) return existing || id
+    const base = existing && typeof existing === 'object' ? existing : { id }
+    return {
+      ...base,
+      levels: ANTIGRAVITY_REASONING_LEVELS.filter((level) =>
+        levels.includes(level)
+      ),
+    }
+  })
 }

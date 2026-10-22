@@ -1036,7 +1036,12 @@ test('Antigravity model namespaces cannot enter the Claude pool even through a p
       return { ok: true, credential: { has_access: true } }
     },
   })
-  for (const model of ['antigravity/claude-test', 'antigravity/gpt-test', 'prefix/antigravity/claude-test']) {
+  for (const model of [
+    'gemini-4-argon',
+    'antigravity/claude-test',
+    'antigravity/gpt-test',
+    'prefix/antigravity/claude-test',
+  ]) {
     for (const pinVmId of [null, 'vm-01']) {
       const selected = await pool.selectAndReserve({ model, pinVmId, allowWait: false })
       assert.equal(selected.ok, false, `${model} pin=${pinVmId}`)

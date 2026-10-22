@@ -5,7 +5,7 @@ import { isAntigravityVm } from '../vm/vm-kind.mjs'
 import { isClientStream } from './convert.mjs'
 import { keyScopeFromRequest, vmPoolDenial } from '../admin/key-scope.mjs'
 import { ownerScopeFromRequest } from '../admin/resource-owner.mjs'
-import { normalizeAntigravityRouting, antigravityUpstreamModel } from './antigravity-route.mjs'
+import { normalizeAntigravityRouting, antigravityModelId, resolveAntigravityVariant } from './antigravity-route.mjs'
 import {
   normalizeAntigravityRequest,
   renderAntigravityResponse,
@@ -79,9 +79,9 @@ export async function handleAntigravityProtocol({
   logBag.via = 'antigravity-slot'
   logBag.attempt_count = 0
   if (!config.enabled) return fail(503, 'antigravity_disabled', ADMISSION_MESSAGES.antigravity_disabled)
-  const model = antigravityUpstreamModel(ctx.body?.model)
-  if (!model || !config.models.some((m) => m.id === model && m.enabled))
-    return fail(400, 'model_not_allowed', '请选择已配置并启用的 Antigravity 模型。', 'model')
+  const model = antigravityModelId(ctx.body?.model)
+  const entry = model && config.models.find((m) => m.id === model && m.enabled)
+  if (!entry) return fail(400, 'model_not_allowed', '请选择已配置并启用的 Antigravity 模型。', 'model')
   const scope = (ops.keyScope || keyScopeFromRequest)(req)
   const denial = vmPoolDenial(scope)
   if (denial) return fail(403, denial.code, denial.message)
@@ -110,7 +110,24 @@ export async function handleAntigravityProtocol({
   })
   if (!normalized.ok)
     return fail(normalized.status || 400, normalized.code || 'invalid_request', normalized.message, normalized.param)
-  const request = { ...normalized.request, model }
+  const variant = resolveAntigravityVariant(entry, normalized.request.reasoning?.effort)
+  if (!variant.ok)
+    return fail(
+      400,
+      'reasoning_effort_not_supported',
+      variant.message,
+      protocol === 'openai.chat'
+        ? 'reasoning_effort'
+        : protocol === 'openai.responses'
+          ? 'reasoning.effort'
+          : 'output_config.effort',
+    )
+  logBag.reasoning_effort = variant.level
+  const request = {
+    ...normalized.request,
+    model: variant.upstream,
+    ...(variant.level ? { reasoning: { effort: variant.level } } : {}),
+  }
   const stream = isClientStream(inbound, req.headers)
   const id = `${protocol === 'anthropic.messages' ? 'msg_' : protocol === 'openai.responses' ? 'resp_' : 'chatcmpl_'}${crypto.randomBytes(16).toString('hex')}`
   const makeStream = () =>
@@ -169,6 +186,7 @@ export async function handleAntigravityProtocol({
       const picked = pickAntigravityCandidates(list(projectRoot, routing), {
         projectRoot,
         model,
+        upstreamModel: variant.upstream,
         routing,
         scope,
         ownerScope,

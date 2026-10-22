@@ -12,7 +12,7 @@ import { buildVmDetail, buildVmList } from '../../src/lib/admin/panel-api.mjs'
 import { antigravityPoolRuntime } from '../../src/lib/pool/antigravity-slot-pool.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 
-const routing = { antigravity: { enabled: true, models: ['gemini-example'] } }
+const routing = { antigravity: { enabled: true, models: ['gemini-example-low', 'gemini-example-medium'] } }
 const vm = {
   id: 'vm-ag',
   platform: 'antigravity',
@@ -88,7 +88,7 @@ test('routing GET exposes Antigravity defaults and only normalized public config
       routingConfig: {
         antigravity: {
           enabled: true,
-          models: ['antigravity/gemini-example'],
+          models: ['gemini-example-low', 'gemini-example-high'],
           token: 'private-cli-token',
           keyring: { password: 'private-keyring-password' },
         },
@@ -101,7 +101,9 @@ test('routing GET exposes Antigravity defaults and only normalized public config
   assert.deepEqual(configured.response.body.data.antigravity, {
     ...defaults,
     enabled: true,
-    models: [{ id: 'gemini-example', display_name: 'gemini-example', vendor: null, enabled: true }],
+    models: [
+      { id: 'gemini-example', display_name: 'gemini-example', vendor: null, enabled: true, levels: ['low', 'high'] },
+    ],
   })
   assert.doesNotMatch(JSON.stringify(configured.response.body), /private-cli-token|private-keyring-password/)
 })
@@ -121,7 +123,15 @@ test('routing PUT persists Antigravity settings and GET returns them for the set
   const expected = {
     enabled: true,
     cli_bin: '/home/kincli/.local/bin/agy',
-    models: [{ id: 'gemini-example', display_name: 'Gemini example', vendor: 'google', enabled: true }],
+    models: [
+      {
+        id: 'gemini-example',
+        display_name: 'Gemini example',
+        vendor: 'google',
+        enabled: true,
+        levels: ['low', 'medium'],
+      },
+    ],
     max_sessions: 3,
     idle_ttl_seconds: 900,
     timeout_ms: 240000,
@@ -149,8 +159,12 @@ test('routing PUT persists Antigravity settings and GET returns them for the set
 })
 
 test('experimental input rejects history, tools, disallowed models and invalid session ids', () => {
-  const good = { model: 'antigravity/gemini-example', prompt: 'hello' }
-  assert.equal(prepareAntigravityChat({ vm, routing, body: good }).ok, true)
+  const good = { model: 'gemini-example', prompt: 'hello' }
+  assert.equal(prepareAntigravityChat({ vm, routing, body: good }).model, 'gemini-example-medium')
+  assert.equal(
+    prepareAntigravityChat({ vm, routing, body: { ...good, model: 'antigravity/gemini-example' } }).ok,
+    false,
+  )
   for (const body of [
     { ...good, messages: [] },
     { ...good, tools: [] },
@@ -178,7 +192,7 @@ test('tenant chat uses a scoped session, returns verified text, and close reuses
     {
       runAntigravityText: async (input) => {
         bridgeId = input.sessionId
-        assert.equal(input.model, 'gemini-example')
+        assert.equal(input.model, 'gemini-example-medium')
         assert.equal(input.prompt, 'hello')
         assert.equal(input.signal.aborted, false)
         return { ok: true, response: 'world', terminalState: 'verified', usage: { input_tokens: 2 } }
@@ -413,7 +427,7 @@ test('Antigravity panel list and detail preserve actual scheduling and independe
       concurrencyOverride: true,
       maxRpm: 12,
       rpmOverride: true,
-      allowed_models: ['antigravity/gemini-example'],
+      allowed_models: ['gemini-example'],
       weight: 7,
     },
   }
@@ -441,7 +455,7 @@ test('Antigravity panel list and detail preserve actual scheduling and independe
     assert.equal(view.inflight, 1)
     assert.equal(view.rpm, 1)
     assert.equal(view.scheduling_inherited.max_concurrency, 2)
-    assert.deepEqual(view.allowed_models, ['antigravity/gemini-example'])
+    assert.deepEqual(view.allowed_models, ['gemini-example'])
     assert.equal(view.weight, 7)
     assert.equal(view.has_token, false)
     assert.equal(view.quota_policy, null)
@@ -498,7 +512,7 @@ test('AG creation defaults to stopped local Docker and never seeds Claude config
     platform: 'antigravity',
     status: 'running',
     auto_allocate_proxy: false,
-    allowed_models: ['antigravity/gemini-example'],
+    allowed_models: ['gemini-example'],
   })
   await h.call('POST', 'vms/create')
   assert.equal(h.response.status, 200, JSON.stringify(h.response.body))
@@ -508,7 +522,7 @@ test('AG creation defaults to stopped local Docker and never seeds Claude config
   assert.equal(saved.status, 'stopped')
   assert.equal(saved.schedulable, false)
   const stored = JSON.parse(fs.readFileSync(path.join(project, 'vms', `${saved.id}.json`), 'utf8'))
-  assert.deepEqual(stored.policy.allowed_models, ['antigravity/gemini-example'])
+  assert.deepEqual(stored.policy.allowed_models, ['gemini-example'])
   assert.equal(fs.existsSync(path.join(project, 'vms', saved.id, 'cli-home', '.claude')), false)
 })
 
@@ -531,7 +545,7 @@ test('AG rejects unrelated generic credential mutations', async (t) => {
 test('generic AG requests use independent admission and never use the Claude scheduler', async () => {
   for (const enabled of [false, true]) {
     const res = Object.assign(new EventEmitter(), { headersSent: false })
-    const body = { model: 'antigravity/gemini-example', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }
+    const body = { model: 'gemini-example', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }
     const handler = createHandleProtocol({
       cfg: { rewrite: { enabled: false }, intercept: { rules: [] }, limits: { max_body_bytes: 1024 }, paths: {} },
       requireAuth: () => true,

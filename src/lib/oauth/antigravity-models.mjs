@@ -6,7 +6,11 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { antigravityAuthVerifyArgv } from './antigravity-auth-login.mjs'
 import { antigravityRuntimeSupport } from '../transport/antigravity-bridge-supervisor.mjs'
-import { antigravityUpstreamModel, normalizeAntigravityRouting } from '../protocol/antigravity-route.mjs'
+import {
+  antigravityModelId,
+  normalizeAntigravityModels,
+  normalizeAntigravityRouting,
+} from '../protocol/antigravity-route.mjs'
 import { isValidVmId } from '../vm/vm-file.mjs'
 import { summarizeAntigravitySlot } from '../vm/antigravity-slot.mjs'
 
@@ -43,7 +47,7 @@ export function parseAntigravityModels(stdout) {
   for (const line of stdout.split(/\r?\n/)) {
     if (!line.trim()) continue
     const fields = line.split('\t')
-    const id = antigravityUpstreamModel(fields[0])
+    const id = antigravityModelId(fields[0])
     if (!id || fields.length !== 2 || fields[0] !== id || /[\x00-\x1f\x7f]/.test(fields[1])) return null
     const displayName = fields[1].trim()
     if (!displayName || displayName.length > 240 || models.length >= 512) return null
@@ -65,9 +69,26 @@ export function readAntigravityModelCatalog(projectRoot, vm) {
     if (raw.version !== 1 || raw.vm_id !== vm.id || raw.owner_user_id !== String(vm.owner_user_id ?? '')) return null
     if (raw.credential_updated_at !== (summarizeAntigravitySlot(projectRoot, vm).updated_at ?? null)) return null
     if (!Number.isFinite(Date.parse(raw.updated_at))) return null
-    const models = normalizeAntigravityRouting({ models: raw.models }).models
-    if (!models.length || models.length !== raw.models?.length) return null
-    return { version: 1, updated_at: raw.updated_at, models }
+    const models = Array.isArray(raw.models) ? raw.models : []
+    const valid = models.every(
+      (row) =>
+        row &&
+        antigravityModelId(row.id) === row.id &&
+        typeof row.display_name === 'string' &&
+        row.display_name.length <= 240 &&
+        !/[\x00-\x1f\x7f]/.test(row.display_name),
+    )
+    if (!models.length || models.length > 512 || !valid) return null
+    return {
+      version: 1,
+      updated_at: raw.updated_at,
+      models: models.map((row) => ({
+        id: row.id,
+        display_name: row.display_name,
+        vendor: modelVendor(row.id),
+        enabled: row.enabled !== false,
+      })),
+    }
   } catch {
     return null
   } finally {
@@ -75,11 +96,17 @@ export function readAntigravityModelCatalog(projectRoot, vm) {
   }
 }
 
+/** `model` is the upstream variant (`gemini-4-argon-high`) the slot's account must list. */
 export function slotAntigravitySupportsModel(projectRoot, vm, model) {
-  const id = antigravityUpstreamModel(model)
+  const id = antigravityModelId(model)
   return (
     !!id && !!readAntigravityModelCatalog(projectRoot, vm)?.models.some((entry) => entry.id === id && entry.enabled)
   )
+}
+
+/** Slot catalog grouped by base model for display and allowlists. */
+export function foldAntigravityModelCatalog(catalog) {
+  return catalog ? { ...catalog, models: normalizeAntigravityModels(catalog.models) } : null
 }
 
 function writeCatalog(root, vm, models) {
@@ -104,11 +131,11 @@ function writeCatalog(root, vm, models) {
   return { version: 1, updated_at: value.updated_at, models }
 }
 
-/** Existing administrator choices win, including disabled models and vendor metadata. */
+/** Existing administrator choices win, including disabled models, levels and vendor metadata. */
 export function mergeAntigravityCatalogModels(previous, discovered) {
-  const models = normalizeAntigravityRouting({ models: previous }).models
+  const models = normalizeAntigravityModels(previous)
   const known = new Set(models.map((model) => model.id.toLowerCase()))
-  for (const model of discovered) {
+  for (const model of normalizeAntigravityModels(discovered)) {
     if (!known.has(model.id.toLowerCase())) {
       models.push(model)
       known.add(model.id.toLowerCase())

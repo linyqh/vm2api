@@ -56,7 +56,7 @@ test('Antigravity candidates enforce owner, key, runtime, login, operator and ac
   // Pin diagnostics bypass the operator switch, never credentials or model availability.
   assert.deepEqual(pick([{ ...vm, schedulable: false }], { pin: vm.id }), [vm.id])
   assert.deepEqual(pick([{ ...vm, antigravity: { authenticated: false } }], { pin: vm.id }), [])
-  assert.equal(antigravitySlotAllowsModel({ allowed_models: ['antigravity/model-one'] }, 'model-one'), true)
+  assert.equal(antigravitySlotAllowsModel({ allowed_models: ['model-one'] }, 'model-one-high'), true)
   assert.equal(antigravitySlotAllowsModel({ allowed_models: ['claude-opus-5'] }, 'claude-opus-5-5'), false)
 })
 

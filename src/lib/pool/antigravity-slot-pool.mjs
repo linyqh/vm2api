@@ -6,7 +6,7 @@ import { slotNetworkForVm } from '../vm/egress.mjs'
 import { activeHoursOf, evaluateActiveHours } from './active-hours.mjs'
 import { keyAllowsVm } from '../admin/key-scope.mjs'
 import { vmMatchesOwnerScope } from '../admin/resource-owner.mjs'
-import { antigravityUpstreamModel, normalizeAntigravityRouting } from '../protocol/antigravity-route.mjs'
+import { normalizeAntigravityRouting, splitAntigravityVariant } from '../protocol/antigravity-route.mjs'
 import { slotAntigravitySupportsModel } from '../oauth/antigravity-models.mjs'
 
 /** Antigravity owns its execution seats; Claude/GPT limits and credentials never enter this pool. */
@@ -124,11 +124,16 @@ export function createAntigravityPoolRuntime({ now = Date.now, maxWaiters = 100 
 
 export const antigravityPoolRuntime = createAntigravityPoolRuntime()
 
+/** Allowlists name base models; entries saved by earlier releases may still carry `antigravity/` or a level suffix. */
 export function antigravitySlotAllowsModel(vm, model) {
-  const id = antigravityUpstreamModel(model)
-  if (!id) return false
+  const base = splitAntigravityVariant(model)?.base
+  if (!base) return false
   const allowed = vm?.allowed_models ?? vm?.policy?.allowed_models
-  return !Array.isArray(allowed) || !allowed.length || allowed.some((entry) => antigravityUpstreamModel(entry) === id)
+  return (
+    !Array.isArray(allowed) ||
+    !allowed.length ||
+    allowed.some((entry) => splitAntigravityVariant(String(entry).replace(/^antigravity\//i, ''))?.base === base)
+  )
 }
 
 export function pickAntigravityCandidates(
@@ -136,6 +141,7 @@ export function pickAntigravityCandidates(
   {
     projectRoot,
     model,
+    upstreamModel = model,
     routing = {},
     scope,
     ownerScope,
@@ -161,7 +167,7 @@ export function pickAntigravityCandidates(
     if (vm.antigravity?.authenticated !== true || !['running', 'paused'].includes(vm.status)) continue
     if (vmNodeId(vm) || isKvmRuntime(vm) || !slotNetworkForVm(vm) || proxyBlockedReason(vm.proxy)) continue
     if (!pin && vm.schedulable === false) continue
-    if (!antigravitySlotAllowsModel(vm, model) || !supportsModel(projectRoot, vm, model)) {
+    if (!antigravitySlotAllowsModel(vm, model) || !supportsModel(projectRoot, vm, upstreamModel)) {
       modelMissing = true
       continue
     }

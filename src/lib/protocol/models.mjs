@@ -17,6 +17,7 @@ import { hasClaudeCode1mSuffix, stripClaudeCode1mSuffix } from './context-1m.mjs
 import { isGptSeriesId } from './gpt-ids.mjs'
 import { listGptPolicyModels } from './gpt-model-policy.mjs'
 import { listAntigravityPublicModels } from './antigravity-route.mjs'
+import { detectInboundPlatform } from './platform-detect.mjs'
 
 const FAMILY_ALIASES = new Map([
   ['sonnet', 'sonnet'],
@@ -71,8 +72,14 @@ export function gatewayModelCatalog({ groupType = 'all', antigravityRouting = {}
   } catch {}
   const gpt = groupType === 'all' || groupType === 'openai' ? listGptPublicModels() : []
   const claude = groupType === 'all' || groupType === 'anthropic' ? listOfficialModels() : []
+  // Same-name Claude/GPT models reach Antigravity only with an Antigravity-group key; list
+  // each ID once, under the platform this key actually reaches.
   const antigravity =
-    groupType === 'all' || groupType === 'antigravity' ? listAntigravityPublicModels(antigravityRouting) : []
+    groupType === 'all' || groupType === 'antigravity'
+      ? listAntigravityPublicModels(antigravityRouting).filter(
+          (model) => detectInboundPlatform(model.id, { groupType }).platform === 'antigravity',
+        )
+      : []
   return {
     object: 'list',
     data: [...gpt, ...claude, ...antigravity],

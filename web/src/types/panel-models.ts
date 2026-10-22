@@ -5,6 +5,8 @@ export type ModelCatalogItem = {
   vendor?: string
   upstream_model?: string
   display_name?: string
+  reasoning_levels?: string[]
+  default_reasoning_level?: string | null
 }
 
 export type ModelsPayload = {

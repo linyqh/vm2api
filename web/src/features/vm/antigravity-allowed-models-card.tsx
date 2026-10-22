@@ -14,7 +14,10 @@ import { vmQueryOptions } from './queries'
 import { useVmPerms } from './vm-perms'
 
 function canonical(id: string) {
-  return id.replace(/^antigravity\//i, '').toLowerCase()
+  return id
+    .replace(/^antigravity\//i, '')
+    .replace(/-(?:minimal|low|medium|high)$/i, '')
+    .toLowerCase()
 }
 
 export function AntigravityAllowedModelsCard({ vm }: { vm: Vm }) {
@@ -47,9 +50,18 @@ export function AntigravityAllowedModelsCard({ vm }: { vm: Vm }) {
     onError: (error: Error) => toast.error(error.message),
   })
   const toggle = (id: string, checked: boolean) => {
-    const current = allowed || models.map((model) => `antigravity/${model.id}`)
-    const next = current.filter((entry) => canonical(entry) !== canonical(id))
-    if (checked) next.push(`antigravity/${id.replace(/^antigravity\//i, '')}`)
+    const base = id.replace(/^antigravity\//i, '')
+    const current = (allowed || models.map((model) => model.id)).map((entry) =>
+      entry
+        .replace(/^antigravity\//i, '')
+        .replace(/-(?:minimal|low|medium|high)$/i, '')
+    )
+    const next = [
+      ...new Set(
+        current.filter((entry) => canonical(entry) !== canonical(base))
+      ),
+    ]
+    if (checked) next.push(base)
     if (!next.length) {
       toast.error('请至少保留一个模型；暂停 API 请求可关闭槽位调度。')
       return
@@ -92,6 +104,7 @@ export function AntigravityAllowedModelsCard({ vm }: { vm: Vm }) {
                   className='text-xs font-normal'
                 >
                   {model.display_name || model.id}
+                  {model.levels?.length ? ` (${model.levels.join('/')})` : ''}
                 </Label>
               </div>
             ))}

@@ -5,23 +5,32 @@ import { toast } from 'sonner'
 import { api } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
-import { antigravityModelsFromIds } from '@/features/settings/antigravity-models'
+import {
+  ANTIGRAVITY_REASONING_LEVELS,
+  antigravityModelsFromIds,
+} from '@/features/settings/antigravity-models'
 import { routingQueryOptions } from '@/features/settings/queries'
 import { useVmPerms } from '@/features/vm/vm-perms'
 import {
   AntigravityModelSync,
   type AntigravityModelCatalog,
+  type AntigravityReasoningLevel,
 } from './antigravity-model-sync'
 
 export type AntigravityStatus = {
   enabled?: boolean
   ready?: boolean
   authenticated?: boolean | null
-  models?: { id: string; display_name?: string }[]
+  models?: {
+    id: string
+    display_name?: string
+    levels?: AntigravityReasoningLevel[]
+  }[]
   model_catalog?: AntigravityModelCatalog | null
   runtime?: { supported?: boolean }
   error?: string | { code?: string; message?: string } | null
@@ -149,8 +158,8 @@ function AntigravityPanelContent({
             授权后同步账号模型，启用平台并开启槽位调度即可使用 API。
           </p>
           <p className='text-xs text-muted-foreground'>
-            支持 Messages、Chat Completions 与 Responses API，模型名称使用
-            antigravity/ 前缀。
+            支持 Messages、Chat Completions 与 Responses API，直接使用官方模型
+            ID；推理强度通过请求参数选择。
           </p>
           <dl className='grid grid-cols-2 gap-2 text-sm'>
             <dt className='text-muted-foreground'>平台</dt>
@@ -315,6 +324,9 @@ export function AntigravitySettings() {
   const [enabled, setEnabled] = useState(false)
   const [cli, setCli] = useState('agy')
   const [models, setModels] = useState('')
+  const [levels, setLevels] = useState<
+    Record<string, AntigravityReasoningLevel[]>
+  >({})
   useEffect(() => {
     if (!routing.data) return
     const value = (routing.data.antigravity || {}) as Record<string, unknown>
@@ -330,7 +342,50 @@ export function AntigravitySettings() {
             .join('\n')
         : ''
     )
+    const nextLevels: Record<string, AntigravityReasoningLevel[]> = {}
+    if (Array.isArray(value.models)) {
+      for (const m of value.models) {
+        if (
+          m &&
+          typeof m === 'object' &&
+          typeof (m as { id?: unknown }).id === 'string' &&
+          Array.isArray((m as { levels?: unknown }).levels)
+        ) {
+          const item = m as { id: string; levels: unknown[] }
+          nextLevels[item.id] = item.levels.filter(
+            (level): level is AntigravityReasoningLevel =>
+              ANTIGRAVITY_REASONING_LEVELS.includes(
+                level as AntigravityReasoningLevel
+              )
+          )
+        }
+      }
+    }
+    setLevels(nextLevels)
   }, [routing.data])
+  const modelIds = [
+    ...new Set(
+      models
+        .split('\n')
+        .map((id) => id.trim())
+        .filter(Boolean)
+    ),
+  ]
+  const toggleLevel = (
+    id: string,
+    level: AntigravityReasoningLevel,
+    checked: boolean
+  ) => {
+    setLevels((prev) => {
+      const current = prev[id] || []
+      const next = checked
+        ? ANTIGRAVITY_REASONING_LEVELS.filter(
+            (item) => current.includes(item) || item === level
+          )
+        : current.filter((item) => item !== level)
+      return { ...prev, [id]: next }
+    })
+  }
   const save = useMutation({
     mutationFn: () =>
       api('/api/panel/routing', {
@@ -343,7 +398,8 @@ export function AntigravitySettings() {
             models: antigravityModelsFromIds(
               (routing.data?.antigravity as Record<string, unknown> | undefined)
                 ?.models,
-              models
+              models,
+              levels
             ),
           },
         }),
@@ -396,6 +452,43 @@ export function AntigravitySettings() {
             onChange={(e) => setModels(e.target.value)}
           />
         </div>
+        {modelIds.length ? (
+          <div className='space-y-2'>
+            <Label>推理强度（levels）</Label>
+            <div className='space-y-1.5 rounded-md border p-2'>
+              {modelIds.map((id) => {
+                const active = levels[id] || []
+                return (
+                  <div
+                    key={id}
+                    className='flex flex-wrap items-center justify-between gap-2 text-xs'
+                  >
+                    <span className='font-mono break-all'>{id}</span>
+                    <div className='flex flex-wrap gap-3'>
+                      {ANTIGRAVITY_REASONING_LEVELS.map((level) => (
+                        <div key={level} className='flex items-center gap-1'>
+                          <Checkbox
+                            id={`agy-level-${id}-${level}`}
+                            checked={active.includes(level)}
+                            onCheckedChange={(checked) =>
+                              toggleLevel(id, level, checked === true)
+                            }
+                          />
+                          <Label
+                            htmlFor={`agy-level-${id}-${level}`}
+                            className='text-xs font-normal'
+                          >
+                            {level}
+                          </Label>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        ) : null}
         <Button
           size='sm'
           disabled={!routing.data || save.isPending}

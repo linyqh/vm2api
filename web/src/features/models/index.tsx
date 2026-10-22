@@ -571,8 +571,7 @@ export function ModelsPage() {
 function AntigravityCatalog() {
   const catalog = useQuery(modelsQueryOptions())
   const items = (catalog.data?.items || []).filter(
-    (item) =>
-      item.platform === 'antigravity' || item.id.startsWith('antigravity/')
+    (item) => item.platform === 'antigravity'
   )
   return (
     <QueryGate loading={catalog.isLoading} error={catalog.error}>
@@ -583,8 +582,8 @@ function AntigravityCatalog() {
           平台设置中从已授权槽位同步官方模型目录。
         </p>
         <p className='text-xs text-muted-foreground'>
-          支持 Messages、Chat Completions 与 Responses API。调用时保留
-          antigravity/ 前缀。
+          支持 Messages、Chat Completions 与 Responses API，直接使用官方模型
+          ID；同名 Claude / GPT 模型需使用 antigravity 分组密钥调用。
         </p>
         {items.length ? (
           <ul className='divide-y'>
@@ -592,7 +591,13 @@ function AntigravityCatalog() {
               <li key={item.id} className='space-y-1 py-2 text-sm'>
                 <p className='font-mono break-all'>{item.id}</p>
                 <p className='text-xs text-muted-foreground'>
-                  {[item.display_name, item.vendor, item.upstream_model]
+                  {[
+                    item.display_name,
+                    item.vendor,
+                    item.reasoning_levels?.length
+                      ? `推理：${item.reasoning_levels.join(' / ')}${item.default_reasoning_level ? `（默认 ${item.default_reasoning_level}）` : ''}`
+                      : null,
+                  ]
                     .filter(Boolean)
                     .join(' · ')}
                 </p>

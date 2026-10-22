@@ -1,10 +1,12 @@
 import crypto from 'node:crypto'
 import {
   normalizeAntigravityRouting,
-  antigravityUpstreamModel,
+  antigravityModelId,
+  resolveAntigravityVariant,
   ANTIGRAVITY_CAPABILITIES,
 } from '../protocol/antigravity-route.mjs'
 import { isAntigravityVm } from '../vm/vm-kind.mjs'
+import { antigravitySlotAllowsModel } from '../pool/antigravity-slot-pool.mjs'
 
 function failure(status, code, message) {
   return { ok: false, status, error: { code, message } }
@@ -27,18 +29,14 @@ export function prepareAntigravityChat({ vm, routing, body, actor = 'master' } =
   if (typeof body.prompt !== 'string' || !body.prompt.trim() || Buffer.byteLength(body.prompt) > 64 * 1024) {
     return failure(400, 'invalid_prompt', 'prompt 必须是非空文本，且不超过 64 KiB')
   }
-  const model = typeof body.model === 'string' ? antigravityUpstreamModel(body.model) : null
-  if (!model || !config.models.some((entry) => entry.id === model && entry.enabled)) {
-    return failure(400, 'model_not_allowed', '请选择管理员配置并启用的 Antigravity 模型')
-  }
-  const allowed = vm.policy?.allowed_models
-  if (
-    Array.isArray(allowed) &&
-    allowed.length &&
-    !allowed.some((id) => id === model || id === `antigravity/${model}`)
-  ) {
+  const id = typeof body.model === 'string' ? antigravityModelId(body.model) : null
+  const entry = id && config.models.find((model) => model.id === id && model.enabled)
+  if (!entry) return failure(400, 'model_not_allowed', '请选择管理员配置并启用的 Antigravity 模型')
+  if (!antigravitySlotAllowsModel({ allowed_models: vm.policy?.allowed_models }, id)) {
     return failure(403, 'model_not_allowed', '此槽位未允许该模型')
   }
+  // The text session runs the official CLI, which takes the level-specific variant.
+  const model = resolveAntigravityVariant(entry, null).upstream
   if (
     body.session_id != null &&
     (typeof body.session_id !== 'string' || !/^[a-zA-Z0-9_-]{1,96}$/.test(body.session_id))

@@ -115,17 +115,12 @@ export function antigravityNativeRequest(request) {
     if (request.response_format.type === 'json_schema')
       generationConfig.responseJsonSchema = request.response_format.schema
   }
-  if (request.thinking || request.reasoning) {
-    const thinking = request.thinking || {}
-    const config = { includeThoughts: thinking.type !== 'disabled' }
-    if (thinking.budget_tokens != null) config.thinkingBudget = thinking.budget_tokens
-    if (request.reasoning?.effort) {
-      const level = { minimal: 'MINIMAL', low: 'LOW', medium: 'MEDIUM', high: 'HIGH' }[request.reasoning.effort]
-      if (!level) reject('feature_not_supported', 'Unsupported Antigravity reasoning effort')
-      config.thinkingLevel = level
-    }
-    if (thinking.type === 'disabled') config.thinkingBudget = 0
-    generationConfig.thinkingConfig = config
+  // The control plane resolves the level and selects the matching variant; Gemini's
+  // thinkingLevel carries it. Token budgets are not part of the level contract.
+  if (request.reasoning?.effort) {
+    const level = { minimal: 'MINIMAL', low: 'LOW', medium: 'MEDIUM', high: 'HIGH' }[request.reasoning.effort]
+    if (!level) reject('feature_not_supported', 'Unsupported Antigravity reasoning effort')
+    generationConfig.thinkingConfig = { includeThoughts: request.thinking?.type !== 'disabled', thinkingLevel: level }
   }
   const body = { contents, generationConfig }
   if (request.system?.length)

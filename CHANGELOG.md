@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Antigravity 去掉 `antigravity/` 模型前缀，改为直接使用官方基础模型 ID（如 `gemini-4-argon`），旧前缀返回 `model_not_supported`。上游按推理强度拆分的变体（`-minimal` / `-low` / `-medium` / `-high`）在目录中折叠为基础模型并记录可用 `levels`（公开模型列表返回 `reasoning_levels` 与 `default_reasoning_level`）；请求通过 `reasoning_effort`、`reasoning.effort` 或 `output_config.effort` 选择档位（未传时默认取 `medium` 或最近可用档位），传入该模型不支持的档位返回 400 `reasoning_effort_not_supported`。`gemini-*` 直接路由至 Antigravity；同名 Claude / GPT 模型在 `antigravity` 分组密钥下路由至 Antigravity，其他分组保持原平台。面板同步支持展示与编辑 `levels`，槽位模型白名单直接保存基础模型 ID。
 - 修复 Antigravity 调用 `gemini-4-argon-*` 返回 `Antigravity service returned HTTP 404`。适配器原先走 `aicode.googleapis.com` 的 experience 接口，该接口不提供 Argon；现改为与官方 CLI 1.4.4 相同的 Cloud Code `v1internal:streamGenerateContent` 外层与 User-Agent，`project` 取自 `loadCodeAssist`。所有账号模型（Gemini 4 Argon、Gemini 3.8、Claude、GPT-OSS）的文本、工具往返、图片与推理均已实测通过。额度查询改为先请求 daily 端点。
 - Antigravity 槽位显示账号额度。数据来自官方 CLI `/usage` 所用的 `retrieveUserQuotaSummary`，按模型组列出 5 小时与周窗口的剩余比例和重置倒计时，显示在机架卡片、列表和槽位详情中。平台启用后每 10 分钟刷新一次，也可手动刷新（`POST /api/panel/vms/:id/antigravity/quota/refresh`）；失败时保留上次有效额度并标出原因。
 

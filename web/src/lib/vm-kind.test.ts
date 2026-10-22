@@ -138,7 +138,8 @@ describe('Antigravity platform isolation', () => {
     expect(vmKindOf(vm)).toBe('antigravity')
     expect(isCodexVm(vm)).toBe(false)
     expect(platformLabel(vm)).toBe('Antigravity')
-    expect(kindFromModel('antigravity/claude-sonnet-5', 'openai.chat')).toBe(
+    expect(kindFromModel('gemini-4-argon', 'openai.chat')).toBe('antigravity')
+    expect(kindFromModel('claude-sonnet-5-5', 'antigravity')).toBe(
       'antigravity'
     )
     expect(vmKindOf({ id: 'unknown', platform: 'unsupported' })).toBe('unknown')
@@ -146,13 +147,13 @@ describe('Antigravity platform isolation', () => {
   it('keeps provider catalogs separate even when model vendors match', () => {
     const items = [
       { id: 'claude-sonnet-5', platform: 'anthropic' },
-      { id: 'antigravity/claude-sonnet-5', platform: 'antigravity' },
-      { id: 'antigravity/gemini-pro', family: 'antigravity' },
+      { id: 'claude-sonnet-5-5', platform: 'antigravity' },
+      { id: 'gemini-4-argon', family: 'antigravity' },
       { id: 'gpt-5.4', platform: 'openai' },
     ]
     expect(catalogForVm(items, vm).map((m) => m.id)).toEqual([
-      'antigravity/claude-sonnet-5',
-      'antigravity/gemini-pro',
+      'claude-sonnet-5-5',
+      'gemini-4-argon',
     ])
     expect(
       catalogForVm(items, { id: 'native', platform: 'anthropic' }).map(

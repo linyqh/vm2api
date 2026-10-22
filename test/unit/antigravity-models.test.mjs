@@ -11,6 +11,7 @@ import {
   readAntigravityModelCatalog,
   slotAntigravitySupportsModel,
   mergeAntigravityCatalogModels,
+  foldAntigravityModelCatalog,
 } from '../../src/lib/oauth/antigravity-models.mjs'
 import { createPanelHandler } from '../../src/lib/admin/panel-routes.mjs'
 import { parseAllowedModelsPatch } from '../../src/lib/pool/slot-model-gate.mjs'
@@ -22,7 +23,8 @@ const vm = {
   runtime: { type: 'docker', network: 'kin-ag-egress' },
   proxy: { id: 'p-test', enabled: true },
 }
-const stdout = 'gemini-example\tGemini Example\nclaude-example\tClaude Example\n'
+const stdout =
+  'gemini-example-low\tGemini Example (Low)\ngemini-example-high\tGemini Example (High)\nclaude-example\tClaude Example\n'
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-models-'))
@@ -34,7 +36,8 @@ function fixture(t) {
 
 test('official catalog parser accepts only public bounded TSV model metadata', () => {
   assert.deepEqual(parseAntigravityModels(stdout), [
-    { id: 'gemini-example', display_name: 'Gemini Example', vendor: 'google', enabled: true },
+    { id: 'gemini-example-low', display_name: 'Gemini Example (Low)', vendor: 'google', enabled: true },
+    { id: 'gemini-example-high', display_name: 'Gemini Example (High)', vendor: 'google', enabled: true },
     { id: 'claude-example', display_name: 'Claude Example', vendor: 'anthropic', enabled: true },
   ])
   for (const raw of ['', 'Login with Google', 'id\tname\textra', 'id\tname\u001b', 'a'.repeat(300000)])
@@ -59,10 +62,15 @@ test('catalog sync is slot-local, model-only and persists private metadata tied 
   assert.equal(result.ok, true, JSON.stringify(result))
   assert.deepEqual(argv.slice(-6), ['timeout', '-k', '2s', '15s', 'agy', 'models'])
   assert.equal(argv.includes('kin-ag'), true)
-  assert.equal(result.models.length, 2)
+  assert.equal(result.models.length, 3)
   assert.doesNotMatch(JSON.stringify(result), /private diagnostics|owner/)
-  assert.equal(slotAntigravitySupportsModel(root, vm, 'antigravity/gemini-example'), true)
+  assert.equal(slotAntigravitySupportsModel(root, vm, 'gemini-example-high'), true)
+  assert.equal(slotAntigravitySupportsModel(root, vm, 'gemini-example'), false)
   assert.equal(slotAntigravitySupportsModel(root, vm, 'gpt-example'), false)
+  assert.deepEqual(foldAntigravityModelCatalog(readAntigravityModelCatalog(root, vm)).models, [
+    { id: 'gemini-example', display_name: 'Gemini Example', vendor: 'google', enabled: true, levels: ['low', 'high'] },
+    { id: 'claude-example', display_name: 'Claude Example', vendor: 'anthropic', enabled: true, levels: [] },
+  ])
   assert.equal(readAntigravityModelCatalog(root, { ...vm, owner_user_id: 'changed' }), null)
   const file = path.join(root, 'data', 'antigravity-models', `${vm.id}.json`)
   assert.equal(fs.statSync(file).mode & 0o777, 0o600)
@@ -78,7 +86,7 @@ test('catalog sync is slot-local, model-only and persists private metadata tied 
   })
   assert.equal(failed.ok, false)
   assert.doesNotMatch(JSON.stringify(failed), /secret-token/)
-  assert.equal(readAntigravityModelCatalog(root, vm).models.length, 2)
+  assert.equal(readAntigravityModelCatalog(root, vm).models.length, 3)
 })
 
 test('catalog metadata never follows a symlink or publishes a stale owner result', async (t) => {
@@ -103,12 +111,13 @@ test('catalog metadata never follows a symlink or publishes a stale owner result
   assert.equal(changed.code, 'antigravity_owner_changed')
 })
 
-test('global model merge preserves disabled choices and display/vendor overrides', () => {
-  const old = { id: 'gemini-example', display_name: 'Custom', enabled: false, vendor: 'private' }
+test('global model merge folds variants and preserves disabled choices, levels and display/vendor overrides', () => {
+  const old = { id: 'gemini-example', display_name: 'Custom', enabled: false, vendor: 'private', levels: ['high'] }
   assert.deepEqual(mergeAntigravityCatalogModels([old], parseAntigravityModels(stdout)), [
     old,
-    { id: 'claude-example', display_name: 'Claude Example', vendor: 'anthropic', enabled: true },
+    { id: 'claude-example', display_name: 'Claude Example', vendor: 'anthropic', enabled: true, levels: [] },
   ])
+  assert.deepEqual(mergeAntigravityCatalogModels([], parseAntigravityModels(stdout))[0].levels, ['low', 'high'])
 })
 
 test('model access is invalidated by account replacement and rejects linked catalog files', async (t) => {
@@ -128,12 +137,12 @@ test('model access is invalidated by account replacement and rejects linked cata
   assert.equal(readAntigravityModelCatalog(root, vm), null)
 })
 
-test('AG allowlists accept only normalized account model IDs in their own namespace', () => {
-  assert.deepEqual(parseAllowedModelsPatch(['gemini-example', 'antigravity/claude-example'], { vm }), {
+test('AG allowlists store base official IDs; the retired prefix is rejected', () => {
+  assert.deepEqual(parseAllowedModelsPatch(['gemini-example', 'claude-example'], { vm }), {
     ok: true,
-    value: ['antigravity/gemini-example', 'antigravity/claude-example'],
+    value: ['gemini-example', 'claude-example'],
   })
-  for (const model of ['../../secret', 'google/model', '', 'a\nheader', 23])
+  for (const model of ['../../secret', 'google/model', 'antigravity/gemini-example', '', 'a\nheader', 23])
     assert.equal(parseAllowedModelsPatch([model], { vm }).ok, false)
 })
 

@@ -64,14 +64,11 @@ export function kindFromModel(
   model?: string | null,
   protocol?: string | null
 ): VmKind {
+  const raw = String(model || '').trim()
   const proto = String(protocol || '')
     .trim()
     .toLowerCase()
-  if (
-    /^antigravity\//i.test(String(model || '').trim()) ||
-    proto === 'antigravity'
-  )
-    return 'antigravity'
+  if (/^gemini-/i.test(raw) || proto === 'antigravity') return 'antigravity'
   if (
     proto === 'openai' ||
     proto === 'codex' ||
@@ -80,7 +77,7 @@ export function kindFromModel(
   ) {
     return 'codex'
   }
-  if (isGptCatalogId(String(model || ''), proto)) return 'codex'
+  if (isGptCatalogId(raw, proto)) return 'codex'
   return 'claude'
 }
 
@@ -175,7 +172,7 @@ export function catalogForVm<
           : platform === 'anthropic'
             ? 'claude'
             : 'unknown'
-      : /^antigravity\//i.test(item.id) || item.family === 'antigravity'
+      : /^gemini-/i.test(item.id) || item.family === 'antigravity'
         ? 'antigravity'
         : isGptCatalogId(item.id, item.family)
           ? 'codex'

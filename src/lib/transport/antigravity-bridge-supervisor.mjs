@@ -11,7 +11,7 @@ import { vmNodeId } from '../cluster/placement.mjs'
 import { slotNetworkForVm } from '../vm/egress.mjs'
 import { replaceSlotOwnedFile, chownSlotRuntimeFile, slotRuntimeOwner } from '../oauth/oauth-credentials.mjs'
 import { publishAntigravitySlotAssets } from '../oauth/antigravity-auth-login.mjs'
-import { normalizeAntigravityRouting } from '../protocol/antigravity-route.mjs'
+import { normalizeAntigravityRouting, antigravityUpstreamIds } from '../protocol/antigravity-route.mjs'
 import { antigravityBridgePaths, callAntigravityBridge } from './antigravity-bridge-client.mjs'
 
 const execFileAsync = promisify(execFile)
@@ -82,7 +82,7 @@ export function writeAntigravityBridgeConfig(projectRoot, vm, { routing = {} } =
     internal_token: token,
     cli_bin: options.cli_bin,
     workdir: '/home/kincli/.kin/antigravity-workspace',
-    models: options.models,
+    models: antigravityUpstreamIds(options.models.filter((model) => model.enabled)),
     max_sessions: options.max_sessions,
     idle_ttl_seconds: options.idle_ttl_seconds,
     timeout_ms: options.timeout_ms,

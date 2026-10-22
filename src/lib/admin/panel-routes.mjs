@@ -156,6 +156,7 @@ import {
 import { prepareAntigravityChat, antigravityStatusView, scopeAntigravitySession } from './antigravity-panel.mjs'
 import {
   readAntigravityModelCatalog,
+  foldAntigravityModelCatalog,
   syncAntigravityModels,
   mergeAntigravityCatalogModels,
 } from '../oauth/antigravity-models.mjs'
@@ -1613,7 +1614,7 @@ export function createPanelHandler(ctx) {
                     typeof runtime.authenticated === 'boolean' ? runtime.authenticated : auth.authenticated,
                 },
               }),
-              model_catalog: readAntigravityModelCatalog(projectRoot, vm),
+              model_catalog: foldAntigravityModelCatalog(readAntigravityModelCatalog(projectRoot, vm)),
               quota: readAntigravityQuota(projectRoot, vm),
             }),
           )

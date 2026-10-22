@@ -8,9 +8,17 @@ import { Label } from '@/components/ui/label'
 import { antigravityModelSyncRequest } from './antigravity-model-sync-api'
 import { vmsListQueryOptions } from './queries'
 
+export type AntigravityReasoningLevel = 'minimal' | 'low' | 'medium' | 'high'
+
 export type AntigravityModelCatalog = {
   updated_at: string
-  models: { id: string; display_name?: string; enabled?: boolean }[]
+  models: {
+    id: string
+    display_name?: string
+    vendor?: string | null
+    enabled?: boolean
+    levels?: AntigravityReasoningLevel[]
+  }[]
 }
 
 export function AntigravityModelSync({

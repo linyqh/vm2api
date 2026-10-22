@@ -4,7 +4,7 @@ import { getModelEntry, getPolicyCatalogIds, resolvePolicyModelId } from '../pro
 import { getGptPolicyCatalogIds } from '../protocol/gpt-model-policy.mjs'
 import { isCodexCatalogModel } from '../protocol/models.mjs'
 import { isCodexVm, isAntigravityVm } from '../vm/vm-kind.mjs'
-import { antigravityUpstreamModel } from '../protocol/antigravity-route.mjs'
+import { antigravityModelId } from '../protocol/antigravity-route.mjs'
 
 export function normalizeAllowedModels(raw) {
   if (raw == null) return null
@@ -63,9 +63,9 @@ export function parseAllowedModelsPatch(raw, opts = {}) {
   if (opts.platform === 'antigravity' || isAntigravityVm(opts.vm)) {
     const ids = []
     for (const item of raw) {
-      const id = typeof item === 'string' ? antigravityUpstreamModel(item) : null
+      const id = typeof item === 'string' ? antigravityModelId(item) : null
       if (!id) return { ok: false, error: 'Invalid Antigravity model ID' }
-      ids.push(`antigravity/${id}`)
+      ids.push(id)
     }
     return { ok: true, value: normalizeAllowedModels(ids) }
   }

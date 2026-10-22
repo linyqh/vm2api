@@ -8,7 +8,7 @@ import {
 } from '../../src/lib/protocol/antigravity-convert.mjs'
 import { createAntigravityUpstream } from '../../scripts/antigravity-upstream.mjs'
 
-const model = 'antigravity/gemini-test'
+const model = 'gemini-test'
 const weather = {
   name: 'weather',
   description: 'Weather in a city',
@@ -585,7 +585,7 @@ test('native Google terminal signature events complete successfully through all 
           ),
       },
     )
-    const stream = createAntigravityProtocolStream(protocol, { model: 'antigravity/native-model', includeUsage: true })
+    const stream = createAntigravityProtocolStream(protocol, { model: 'native-model', includeUsage: true })
     let wire = ''
     const result = await upstream.infer(
       { model: 'native-model', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] },

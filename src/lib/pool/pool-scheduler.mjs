@@ -875,7 +875,9 @@ export class PoolScheduler extends EventEmitter {
     // reports it as retry_after so the client can time the next attempt.
     candidates.rest_until = null
     // Antigravity sessions belong to their dedicated bridge, including pinned calls.
-    if (/(?:^|\/)antigravity(?:\/|$)/i.test(String(model || '').trim())) return candidates
+    const detected = detectInboundPlatform(model, { groupType: keyScope?.group_type })
+    if ((model && !detected.ok) || detected.platform === 'antigravity' || keyScope?.group_type === 'antigravity')
+      return candidates
     const pin = pinVmId ? String(pinVmId).trim() : ''
     for (const summary of summaries) {
       if (signal?.aborted) throw makeAbortError()

@@ -61,8 +61,8 @@ async function invoke({
   const actualBody =
     body ||
     (protocol === 'openai.responses'
-      ? { model: 'antigravity/model-one', input: 'hello' }
-      : { model: 'antigravity/model-one', messages: [{ role: 'user', content: 'hello' }] })
+      ? { model: 'model-one', input: 'hello' }
+      : { model: 'model-one', messages: [{ role: 'user', content: 'hello' }] })
   let runs = 0,
     billed = 0
   await handleAntigravityProtocol({
@@ -82,7 +82,10 @@ async function invoke({
       response.headersSent = true
       response.status = 200
     },
-    routing: { antigravity: { enabled: true, models: ['model-one'] }, pool: { fallback_wait_timeout_ms: 1 } },
+    routing: {
+      antigravity: { enabled: true, models: ['model-one-low', 'model-one-medium', 'model-one-high'] },
+      pool: { fallback_wait_timeout_ms: 1 },
+    },
     projectRoot: '/unused',
     apiKeyStore: keyStore,
     accountGate,
@@ -133,6 +136,48 @@ test('disconnected requests never start upstream inference', async () => {
   assert.equal(h.logBag.final_state, 'cancelled')
 })
 
+test('reasoning effort selects the upstream variant and carries the level; base ID is what gets logged', async () => {
+  const cases = [
+    ['openai.chat', { reasoning_effort: 'high' }, 'model-one-high', 'high'],
+    ['openai.responses', { reasoning: { effort: 'low' } }, 'model-one-low', 'low'],
+    ['anthropic.messages', { output_config: { effort: 'high' }, max_tokens: 64 }, 'model-one-high', 'high'],
+    ['openai.chat', {}, 'model-one-medium', 'medium'],
+  ]
+  for (const [protocol, extra, upstream, level] of cases) {
+    let sent
+    const body =
+      protocol === 'openai.responses'
+        ? { model: 'model-one', input: 'hello', ...extra }
+        : { model: 'model-one', messages: [{ role: 'user', content: 'hello' }], ...extra }
+    const h = await invoke({
+      protocol,
+      body,
+      inference: async ({ request }) => {
+        sent = request
+        return success
+      },
+    })
+    assert.equal(h.res.status, 200, JSON.stringify(h.res.body))
+    assert.equal(sent.model, upstream)
+    assert.deepEqual(sent.reasoning, { effort: level })
+    assert.equal(h.logBag.upstream_model, 'model-one')
+    assert.equal(h.logBag.reasoning_effort, level)
+    assert.equal(h.res.body.model, 'model-one')
+  }
+  const unsupported = await invoke({
+    body: { model: 'model-one', reasoning_effort: 'minimal', messages: [{ role: 'user', content: 'hi' }] },
+  })
+  assert.equal(unsupported.res.status, 400)
+  assert.equal(unsupported.res.body.error.code, 'reasoning_effort_not_supported')
+  assert.match(unsupported.res.body.error.message, /low, medium, high/)
+  assert.equal(unsupported.runs, 0)
+  for (const model of ['model-one-high', 'antigravity/model-one']) {
+    const legacy = await invoke({ body: { model, messages: [{ role: 'user', content: 'hi' }] } })
+    assert.equal(legacy.res.body.error.code, 'model_not_allowed', model)
+    assert.equal(legacy.runs, 0)
+  }
+})
+
 test('Antigravity handler returns native envelopes and usage for all three public protocols', async () => {
   for (const protocol of ['openai.chat', 'openai.responses', 'anthropic.messages']) {
     const h = await invoke({ protocol })
@@ -157,7 +202,7 @@ test('Antigravity handler returns native envelopes and usage for all three publi
 test('Antigravity stream preserves deltas and ends with exactly one verified terminal', async () => {
   const h = await invoke({
     body: {
-      model: 'antigravity/model-one',
+      model: 'model-one',
       stream: true,
       messages: [{ role: 'user', content: 'hello' }],
       stream_options: { include_usage: true },
@@ -186,7 +231,7 @@ test('Uncommitted transient failures switch accounts, while committed streams ne
   assert.equal(h.res.status, 200)
   const partial = await invoke({
     slots,
-    body: { model: 'antigravity/model-one', stream: true, messages: [{ role: 'user', content: 'hello' }] },
+    body: { model: 'model-one', stream: true, messages: [{ role: 'user', content: 'hello' }] },
     inference: async ({ onEvent }) => {
       onEvent({ type: 'text_delta', text: 'part' })
       return { ok: false, status: 502, code: 'upstream_stream_incomplete', message: 'Stream interrupted' }
@@ -200,7 +245,7 @@ test('Uncommitted transient failures switch accounts, while committed streams ne
 test('Responses continuation carries canonical history only for its key and model', async () => {
   const store = createAntigravityResponseStore()
   const first = await invoke({ protocol: 'openai.responses', store })
-  const body = { model: 'antigravity/model-one', previous_response_id: first.res.body.id, input: 'continue' }
+  const body = { model: 'model-one', previous_response_id: first.res.body.id, input: 'continue' }
   let history
   const next = await invoke({
     protocol: 'openai.responses',
@@ -224,12 +269,12 @@ test('Responses continuation carries canonical history only for its key and mode
   assert.equal(stolen.runs, 0)
   const noStore = await invoke({
     protocol: 'openai.responses',
-    body: { model: 'antigravity/model-one', input: 'private', store: false },
+    body: { model: 'model-one', input: 'private', store: false },
     store,
   })
   const missing = await invoke({
     protocol: 'openai.responses',
-    body: { model: 'antigravity/model-one', input: 'continue', previous_response_id: noStore.res.body.id },
+    body: { model: 'model-one', input: 'continue', previous_response_id: noStore.res.body.id },
     store,
   })
   assert.equal(missing.res.status, 404)

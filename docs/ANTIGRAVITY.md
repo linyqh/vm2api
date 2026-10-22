@@ -10,8 +10,8 @@ Antigravity 使用独立槽位、Google OAuth 和账号模型目录。控制面�
 2. 点击“绑定凭证 → 生成授权链接”，在本机浏览器完成 Google 授权，再将页面给出的单行授权码粘贴回面板。认证可以在平台接入关闭时执行；不会自动打开 API 调度。
 3. 镜像包含经 SHA-512 校验并固定为 1.4.4 的官方 Linux amd64 CLI；首次授权将其放入槽位 `/home/kincli/.local/bin/agy`。默认 `cli_bin: "agy"` 即可。
 4. 在槽位测试页点击“同步账号模型”，读取同一槽位中的官方 `agy models`。管理员也可在“设置 → Antigravity”选择已授权槽位，“同步账号模型并加入全局目录”。同步不发送推理请求。
-5. 在平台设置中启用 Antigravity API 接入，再开启所需槽位的调度开关。创建空槽时默认调度关闭。全局模型目录保留已有模型的禁用、显示名称及供应商设置；新增模型不会覆盖这些选择。
-6. 使用 `antigravity/<官方模型 ID>` 调用 API。模型供应商不改变账号平台，例如 Antigravity 中的 Claude 模型仍由 Antigravity 槽位承载。
+5. 在平台设置中启用 Antigravity API 接入，再开启所需槽位的调度开关。创建空槽时默认调度关闭。上游按推理强度拆分的变体（`-minimal` / `-low` / `-medium` / `-high`）会自动折叠为基础模型并汇总可用 `levels`；全局模型目录保留已有模型的禁用、可用 `levels`、显示名称及供应商设置，新增模型不会覆盖这些选择。
+6. 直接使用官方基础模型 ID（如 `gemini-4-argon`）调用 API，旧的 `antigravity/` 前缀已废弃并返回 `model_not_supported`。`gemini-*` 默认路由到 Antigravity；同名 Claude / GPT 模型（如 `claude-sonnet-5-5`、`gpt-oss-120b`）在使用 `antigravity` 分组密钥时路由到 Antigravity 槽位，其他密钥分组仍走原平台。
 7. 先验收首条生成，再验收历史、工具往返、流式取消、续聊，以及槽位重启后的授权持久化。
 
 官方 CLI 在容器中管理自身的文件凭证存储，凭证保存在持久挂载的 `/home/kincli`。OAuth 管理器只保存公开的认证状态元数据；授权码仅传给该次官方客户端的输入，不写入数据库或日志。
@@ -26,11 +26,13 @@ OAuth 会话按操作者、槽位和所属用户隔离，有效期 30 分钟。�
 
 ## API 与调度
 
-| 接口 | 模型命名 |
-| --- | --- |
-| `POST /v1/messages` | `antigravity/<模型 ID>` |
-| `POST /v1/chat/completions` | `antigravity/<模型 ID>` |
-| `POST /v1/responses` | `antigravity/<模型 ID>` |
+| 接口 | 模型命名 | 推理强度参数 |
+| --- | --- | --- |
+| `POST /v1/messages` | `<基础模型 ID>`（如 `gemini-4-argon`） | `output_config.effort` |
+| `POST /v1/chat/completions` | `<基础模型 ID>`（如 `gemini-4-argon`） | `reasoning_effort` |
+| `POST /v1/responses` | `<基础模型 ID>`（如 `gemini-4-argon`） | `reasoning.effort` |
+
+公开目录（`/v1/models`）返回基础模型 ID、`reasoning_levels`（取自模型配置的 `levels`：`minimal`、`low`、`medium`、`high`）及 `default_reasoning_level`。未显式传推理强度时，控制面默认选用 `medium`（若该模型不含 `medium` 则取最近可用档位），自动映射到对应上游变体（`<id>-<level>`）与 `thinkingConfig.thinkingLevel`；无档位后缀的模型保持原 ID。若传入模型 `levels` 未包含的推理强度（或对无推理档位的模型传入该参数），在访问上游前返回 HTTP 400 `reasoning_effort_not_supported`。直接传 `-low` / `-high` 等变体后缀或旧 `antigravity/` 前缀均会拒绝。
 
 适配层保留结构化的历史、system 指令、图片、工具定义、工具调用及工具结果；不将这些内容拼接为单个 prompt。无法表示的参数或内容会明确拒绝。模型返回工具调用后，由调用方执行工具，再将结果提交给后续请求；槽位不执行调用方的本地命令或函数。
 

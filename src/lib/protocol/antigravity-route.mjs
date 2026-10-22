@@ -1,5 +1,9 @@
 /** Independent Antigravity account platform backed by the slot's authenticated runtime. */
-export const ANTIGRAVITY_MODEL_PREFIX = 'antigravity/'
+// Official reasoning levels, lowest first. The account service exposes each level as its own
+// upstream variant (`gemini-4-argon-high`) and expects the same `thinkingConfig.thinkingLevel`.
+export const ANTIGRAVITY_LEVELS = Object.freeze(['minimal', 'low', 'medium', 'high'])
+export const ANTIGRAVITY_DEFAULT_LEVEL = 'medium'
+const VARIANT = new RegExp(`^(.+)-(${ANTIGRAVITY_LEVELS.join('|')})$`, 'i')
 export const ANTIGRAVITY_CAPABILITIES = Object.freeze({
   experimental_text_session: true,
   streaming: true,
@@ -20,31 +24,102 @@ function boundedInteger(value, fallback, min, max) {
   return Number.isFinite(number) ? Math.min(max, Math.max(min, Math.floor(number))) : fallback
 }
 
-export function antigravityUpstreamModel(value) {
-  const raw = String(value || '').trim()
-  const id = /^antigravity\//i.test(raw) ? raw.slice(ANTIGRAVITY_MODEL_PREFIX.length) : raw
+export function antigravityModelId(value) {
+  const id = String(value || '').trim()
   return /^[a-z0-9][a-z0-9._:-]{0,199}$/i.test(id) ? id : null
 }
 
+/** `gemini-4-argon-high` → base `gemini-4-argon`, level `high`; IDs without a level suffix are their own base. */
+export function splitAntigravityVariant(value) {
+  const id = antigravityModelId(value)
+  if (!id) return null
+  const match = id.match(VARIANT)
+  return match ? { base: match[1], level: match[2].toLowerCase() } : { base: id, level: null }
+}
+
+export function antigravityVariantId(base, level) {
+  return level ? `${base}-${level}` : base
+}
+
+function sortLevels(levels) {
+  return ANTIGRAVITY_LEVELS.filter((level) => levels.has(level))
+}
+
+/**
+ * Public catalog rows are base models with their available levels. Catalog rows stored by
+ * earlier releases were one row per upstream variant; they fold into their base model and
+ * keep only the variants the administrator left enabled.
+ */
 export function normalizeAntigravityModels(value) {
-  const models = []
-  const seen = new Set()
+  const rows = new Map()
   for (const item of Array.isArray(value) ? value : []) {
     const row = typeof item === 'string' ? { id: item } : objectOf(item)
-    const id = antigravityUpstreamModel(row.id)
-    if (!id || seen.has(id.toLowerCase())) continue
-    seen.add(id.toLowerCase())
+    const variant = splitAntigravityVariant(row.id)
+    if (!variant) continue
+    const key = variant.base.toLowerCase()
     const vendor = String(row.vendor || '')
       .trim()
       .toLowerCase()
-    models.push({
-      id,
-      display_name: String(row.display_name || id).trim() || id,
+    const display = String(row.display_name || '')
+      .replace(/\s*\((?:minimal|low|medium|high)\)\s*$/i, '')
+      .trim()
+    const entry = rows.get(key) || {
+      id: variant.base,
+      display_name: display || variant.base,
       vendor: /^[a-z][a-z0-9-]{0,39}$/.test(vendor) ? vendor : null,
-      enabled: row.enabled !== false,
-    })
+      enabled: false,
+      all: new Set(),
+      on: new Set(),
+    }
+    const levels = variant.level
+      ? [variant.level]
+      : Array.isArray(row.levels)
+        ? row.levels.map((level) => String(level).toLowerCase()).filter((level) => ANTIGRAVITY_LEVELS.includes(level))
+        : []
+    for (const level of levels) {
+      entry.all.add(level)
+      if (row.enabled !== false) entry.on.add(level)
+    }
+    if (row.enabled !== false) entry.enabled = true
+    rows.set(key, entry)
   }
-  return models
+  return [...rows.values()].map(({ all, on, ...entry }) => ({
+    ...entry,
+    levels: sortLevels(on.size ? on : all),
+  }))
+}
+
+/**
+ * Picks the upstream variant for a base model. No requested effort uses the default level,
+ * or the nearest available one; an explicit level must exist for the model.
+ */
+export function resolveAntigravityVariant(entry, effort) {
+  const levels = entry?.levels || []
+  const requested = typeof effort === 'string' && effort.trim() ? effort.trim().toLowerCase() : null
+  if (!levels.length) {
+    if (requested)
+      return { ok: false, message: `模型 ${entry.id} 不支持推理等级，请去掉 reasoning_effort / reasoning.effort。` }
+    return { ok: true, level: null, upstream: entry.id }
+  }
+  if (requested) {
+    if (!levels.includes(requested))
+      return { ok: false, message: `模型 ${entry.id} 支持的推理等级：${levels.join(', ')}；收到 ${requested}。` }
+    return { ok: true, level: requested, upstream: antigravityVariantId(entry.id, requested) }
+  }
+  const target = ANTIGRAVITY_LEVELS.indexOf(ANTIGRAVITY_DEFAULT_LEVEL)
+  const level = [...levels].sort(
+    (a, b) =>
+      Math.abs(ANTIGRAVITY_LEVELS.indexOf(a) - target) - Math.abs(ANTIGRAVITY_LEVELS.indexOf(b) - target) ||
+      ANTIGRAVITY_LEVELS.indexOf(a) - ANTIGRAVITY_LEVELS.indexOf(b),
+  )[0]
+  return { ok: true, level, upstream: antigravityVariantId(entry.id, level) }
+}
+
+/** Upstream variant IDs the slot runtime may call. */
+export function antigravityUpstreamIds(models) {
+  return models.flatMap((model) =>
+    model.levels.length ? model.levels.map((level) => antigravityVariantId(model.id, level)) : [model.id],
+  )
 }
 
 export function normalizeAntigravityRouting(raw = {}) {
@@ -91,7 +166,12 @@ export function validateAntigravityRoutingPatch(body = {}) {
       !Array.isArray(raw.models) ||
       raw.models.some((item) => {
         const row = typeof item === 'string' ? { id: item } : objectOf(item)
-        return !antigravityUpstreamModel(row.id) || ('enabled' in row && typeof row.enabled !== 'boolean')
+        return (
+          !antigravityModelId(row.id) ||
+          ('enabled' in row && typeof row.enabled !== 'boolean') ||
+          ('levels' in row &&
+            (!Array.isArray(row.levels) || row.levels.some((level) => !ANTIGRAVITY_LEVELS.includes(level))))
+        )
       })
     ) {
       throw Object.assign(new TypeError('antigravity.models 必须是有效的模型 ID 或模型对象数组'), {
@@ -106,19 +186,23 @@ export function listAntigravityPublicModels(routing = {}) {
   if (!config.enabled) return []
   return config.models
     .filter((model) => model.enabled)
-    .map((model) => ({
-      id: `${ANTIGRAVITY_MODEL_PREFIX}${model.id}`,
-      object: 'model',
-      type: 'model',
-      display_name: model.display_name,
-      owned_by: model.vendor || 'antigravity',
-      platform: 'antigravity',
-      family: 'antigravity',
-      vendor: model.vendor,
-      upstream_model: model.id,
-      enabled: true,
-      experimental: false,
-      capabilities: ANTIGRAVITY_CAPABILITIES,
-      source: 'antigravity-routing',
-    }))
+    .map((model) => {
+      const variant = resolveAntigravityVariant(model, null)
+      return {
+        id: model.id,
+        object: 'model',
+        type: 'model',
+        display_name: model.display_name,
+        owned_by: model.vendor || 'antigravity',
+        platform: 'antigravity',
+        family: 'antigravity',
+        vendor: model.vendor,
+        reasoning_levels: model.levels,
+        default_reasoning_level: variant.level,
+        enabled: true,
+        experimental: false,
+        capabilities: ANTIGRAVITY_CAPABILITIES,
+        source: 'antigravity-routing',
+      }
+    })
 }

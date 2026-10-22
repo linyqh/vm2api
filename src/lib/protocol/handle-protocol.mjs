@@ -290,7 +290,17 @@ export function createHandleProtocol(deps) {
     return jevScopeWaits(jev, 'claude')
   }
 
-  async function applyProtocolIntercept({ req, inbound, body, fp, logBag, requestId, res, account = null }) {
+  async function applyProtocolIntercept({
+    req,
+    inbound,
+    body,
+    fp,
+    logBag,
+    requestId,
+    res,
+    account = null,
+    platform = null,
+  }) {
     const official =
       isOfficialClaudeCodeTraffic(req.headers, inbound) ||
       isOfficialClaudeClient(fp.client_class) ||
@@ -315,6 +325,7 @@ export function createHandleProtocol(deps) {
       devices: deviceRepo(),
       requestId,
       account,
+      platform,
     })
     if (!decision || decision.action !== 'block') {
       if (decision?.intercept) logBag.intercept = decision.intercept
@@ -555,11 +566,12 @@ export function createHandleProtocol(deps) {
     // model are third-party by construction. Master-key pinned calls are the panel's own
     // test chat and health monitor, not inbound clients.
     const routingNow = getRouting()
+    const groupType = keyScopeFromRequest(req).group_type
     const panelDiagnostics = req.apiKeyKind === 'master' && isValidVmId(String(req.headers['x-kin-vm'] || '').trim())
     if (
       claudeCodeOnlyFromRouting(routingNow) &&
       !panelDiagnostics &&
-      detectInboundPlatform(inbound?.model).platform === 'anthropic' &&
+      detectInboundPlatform(inbound?.model, { groupType }).platform === 'anthropic' &&
       (protocol !== 'anthropic.messages' ||
         isHealthShape(req.headers, inbound, getHealthMonitor()?.getConfig?.() || DEFAULT_HEALTH_PROBE, protocol) ||
         !isClaudeCodeFamilyRequest(req.headers, inbound, { routing: routingNow }))
@@ -571,7 +583,7 @@ export function createHandleProtocol(deps) {
       return json(res, errorResult.status, errorResult.body)
     }
     const healthDecision =
-      detectInboundPlatform(inbound?.model).platform === 'antigravity'
+      detectInboundPlatform(inbound?.model, { groupType }).platform === 'antigravity'
         ? null
         : getHealthMonitor()?.decide?.(req.headers, inbound, protocol)
     if (healthDecision?.action === 'fail') {
@@ -664,7 +676,7 @@ export function createHandleProtocol(deps) {
       ctx = { ...ctx, body: modelRewrite.body }
       logBag.upstream_model = modelRewrite.upstreamModel || null
     }
-    const platform = detectInboundPlatform(ctx.body?.model)
+    const platform = detectInboundPlatform(ctx.body?.model, { groupType })
     if (!platform.ok) {
       stats.errors++
       const errorResult = makeError({
@@ -705,7 +717,18 @@ export function createHandleProtocol(deps) {
       return json(res, 403, errorResult.body)
     }
     if (platform.platform === 'antigravity') {
-      if (await applyProtocolIntercept({ req, inbound, body: ctx.body, fp, logBag, requestId: logCtx.request_id, res }))
+      if (
+        await applyProtocolIntercept({
+          req,
+          inbound,
+          body: ctx.body,
+          fp,
+          logBag,
+          requestId: logCtx.request_id,
+          res,
+          platform: 'antigravity',
+        })
+      )
         return
       return handleAntigravityProtocol({
         req,
@@ -732,13 +755,16 @@ export function createHandleProtocol(deps) {
             requestId: logCtx.request_id,
             res,
             account: scopeAccountFromVm(vm),
+            platform: 'antigravity',
           }),
         recordUsage: () =>
           attachPricing(logBag, {
             managedKey: req.apiKeyRecord,
             rateMultiplier: deps.groupsRepo.rateMultiplier(req.apiKeyRecord?.group_id ?? 1),
             bill: !!req.apiKeyRecord,
-            pricingModel: ctx.body.model,
+            // A vendor name must not inherit that vendor's direct API price; the namespaced
+            // id resolves to no catalog price.
+            pricingModel: `antigravity/${ctx.body.model}`,
           }),
         ops: deps.antigravityOps || {},
       })

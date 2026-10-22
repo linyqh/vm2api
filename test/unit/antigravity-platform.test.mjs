@@ -9,8 +9,10 @@ import { scopeStickyKey } from '../../src/lib/pool/sticky-router.mjs'
 import { gatewayModelCatalog, validateOfficialModel, resolveCatalogModel } from '../../src/lib/protocol/models.mjs'
 import {
   ANTIGRAVITY_CAPABILITIES,
-  antigravityUpstreamModel,
+  antigravityModelId,
   normalizeAntigravityRouting,
+  normalizeAntigravityModels,
+  resolveAntigravityVariant,
   listAntigravityPublicModels,
   validateAntigravityRoutingPatch,
 } from '../../src/lib/protocol/antigravity-route.mjs'
@@ -44,26 +46,85 @@ test('unknown explicit platform never falls through to Claude or legacy Codex', 
   assert.equal(normalizeVmKind({ codex_kernel: true }).kind, 'codex')
 })
 
-test('Antigravity namespace survives model vendor detection', () => {
-  for (const id of ['claude-sonnet-test', 'gemini-test', 'gpt-test']) {
-    assert.deepEqual(detectInboundPlatform(`antigravity/${id}`), { ok: true, platform: 'antigravity', model: id })
+test('bare official IDs pick the platform; an Antigravity key group claims same-name Claude/GPT models', () => {
+  assert.deepEqual(detectInboundPlatform('gemini-4-argon'), {
+    ok: true,
+    platform: 'antigravity',
+    model: 'gemini-4-argon',
+  })
+  for (const groupType of [undefined, 'all', 'anthropic']) {
+    assert.equal(detectInboundPlatform('claude-sonnet-5-5', { groupType }).platform, 'anthropic', groupType)
+    assert.equal(detectInboundPlatform('gemini-4-argon', { groupType }).platform, 'antigravity', groupType)
   }
-  assert.equal(detectInboundPlatform('Antigravity/gemini-test').platform, 'antigravity')
-  assert.equal(detectInboundPlatform('claude-sonnet-test').platform, 'anthropic')
-  assert.equal(detectInboundPlatform('gemini-test').ok, false)
+  assert.equal(detectInboundPlatform('gpt-oss-120b', { groupType: 'all' }).platform, 'openai')
+  for (const id of ['claude-sonnet-5-5', 'gpt-oss-120b', 'gemini-4-argon']) {
+    assert.deepEqual(detectInboundPlatform(id, { groupType: 'antigravity' }), {
+      ok: true,
+      platform: 'antigravity',
+      model: id,
+    })
+  }
   for (const id of [
-    'antigravity',
-    'antigravity/',
-    'antigravity//claude-test',
-    'antigravity/../claude-test',
+    'antigravity/gemini-4-argon',
+    'antigravity/claude-sonnet-5-5',
+    'Antigravity/claude-test',
     'prefix/antigravity/claude-test',
+    'gemini test',
   ]) {
     assert.equal(detectInboundPlatform(id).ok, false, id)
+    assert.equal(detectInboundPlatform(id, { groupType: 'antigravity' }).ok, false, id)
   }
-  assert.equal(antigravityUpstreamModel('--model'), null)
-  assert.equal(antigravityUpstreamModel('gemini test'), null)
-  assert.equal(validateOfficialModel('antigravity/claude-sonnet-5').error.code, 'platform_mismatch')
+  assert.equal(antigravityModelId('--model'), null)
+  assert.equal(validateOfficialModel('antigravity/claude-sonnet-5').ok, false)
   assert.equal(resolveCatalogModel('antigravity/claude-sonnet-5', ['claude-sonnet-5']).ok, false)
+})
+
+test('upstream variants fold into base models; admin-disabled variants drop out of the level list', () => {
+  const models = normalizeAntigravityModels([
+    { id: 'gemini-4-argon-low', display_name: 'Gemini 4 Argon (Low)', vendor: 'google' },
+    { id: 'gemini-4-argon-high', display_name: 'Gemini 4 Argon (High)' },
+    { id: 'gemini-4-argon-medium', enabled: false },
+    { id: 'gpt-oss-120b-medium', enabled: false },
+    { id: 'claude-sonnet-5-5', levels: ['high', 'low', 'bogus'] },
+    'plain-model',
+  ])
+  assert.deepEqual(models, [
+    { id: 'gemini-4-argon', display_name: 'Gemini 4 Argon', vendor: 'google', enabled: true, levels: ['low', 'high'] },
+    { id: 'gpt-oss-120b', display_name: 'gpt-oss-120b', vendor: null, enabled: false, levels: ['medium'] },
+    {
+      id: 'claude-sonnet-5-5',
+      display_name: 'claude-sonnet-5-5',
+      vendor: null,
+      enabled: true,
+      levels: ['low', 'high'],
+    },
+    { id: 'plain-model', display_name: 'plain-model', vendor: null, enabled: true, levels: [] },
+  ])
+  assert.deepEqual(normalizeAntigravityModels(models), models)
+})
+
+test('level resolution defaults to medium or the nearest level and rejects levels the model lacks', () => {
+  const argon = { id: 'gemini-4-argon', levels: ['low', 'medium', 'high'] }
+  assert.deepEqual(resolveAntigravityVariant(argon, null), {
+    ok: true,
+    level: 'medium',
+    upstream: 'gemini-4-argon-medium',
+  })
+  assert.deepEqual(resolveAntigravityVariant(argon, 'HIGH'), {
+    ok: true,
+    level: 'high',
+    upstream: 'gemini-4-argon-high',
+  })
+  assert.equal(resolveAntigravityVariant({ id: 'm', levels: ['low', 'high'] }, null).level, 'low')
+  assert.equal(resolveAntigravityVariant({ id: 'm', levels: ['high'] }, null).upstream, 'm-high')
+  for (const effort of ['minimal', 'xhigh', 'max', 'none'])
+    assert.equal(resolveAntigravityVariant(argon, effort).ok, false)
+  assert.deepEqual(resolveAntigravityVariant({ id: 'plain', levels: [] }, null), {
+    ok: true,
+    level: null,
+    upstream: 'plain',
+  })
+  assert.equal(resolveAntigravityVariant({ id: 'plain', levels: [] }, 'low').ok, false)
 })
 
 test('Antigravity key scope intersects platform, live pool and VM list', () => {
@@ -96,7 +157,7 @@ test('routing remains opt-in and advertises its independent API capabilities', (
     idle_ttl_seconds: 600,
     timeout_ms: 180000,
   })
-  assert.deepEqual(listAntigravityPublicModels({ models: ['gemini-test'] }), [])
+  assert.deepEqual(listAntigravityPublicModels({ models: ['gemini-test-low'] }), [])
   assert.equal(ANTIGRAVITY_CAPABILITIES.client_tools, true)
   assert.equal(ANTIGRAVITY_CAPABILITIES.history_import, true)
   assert.deepEqual(ANTIGRAVITY_CAPABILITIES.protocols, [
@@ -119,26 +180,34 @@ test('routing remains opt-in and advertises its independent API capabilities', (
   assert.doesNotThrow(() => validateAntigravityRoutingPatch({ unrelated_setting: true }))
 })
 
-test('local catalog preserves platform and vendor separately and filters by key group', () => {
+test('local catalog lists base IDs with levels, once, under the platform the key reaches', () => {
   const antigravityRouting = {
     enabled: true,
     models: [
-      { id: 'claude-test', vendor: 'anthropic', display_name: 'AG Claude' },
-      'gemini-test',
+      { id: 'claude-test-low', vendor: 'anthropic', display_name: 'AG Claude (Low)' },
+      'gemini-test-low',
+      'gemini-test-high',
       { id: 'disabled-test', enabled: false },
-      'CLAUDE-TEST',
     ],
   }
   const agCatalog = gatewayModelCatalog({ groupType: 'antigravity', antigravityRouting })
   assert.deepEqual(
-    agCatalog.data.map((row) => row.id),
-    ['antigravity/claude-test', 'antigravity/gemini-test'],
+    agCatalog.data.map((row) => [row.id, row.reasoning_levels, row.default_reasoning_level]),
+    [
+      ['claude-test', ['low'], 'low'],
+      ['gemini-test', ['low', 'high'], 'low'],
+    ],
   )
   const model = agCatalog.data[0]
   assert.equal(model.platform, 'antigravity')
   assert.equal(model.vendor, 'anthropic')
-  assert.equal(model.upstream_model, 'claude-test')
+  assert.equal(model.display_name, 'AG Claude')
   assert.equal(model.owned_by, 'anthropic')
+  const all = gatewayModelCatalog({ groupType: 'all', antigravityRouting }).data
+  assert.deepEqual(
+    all.filter((row) => row.platform === 'antigravity').map((row) => row.id),
+    ['gemini-test'],
+  )
   for (const groupType of ['anthropic', 'openai', 'unknown']) {
     assert.equal(
       gatewayModelCatalog({ groupType, antigravityRouting }).data.some((row) => row.platform === 'antigravity'),

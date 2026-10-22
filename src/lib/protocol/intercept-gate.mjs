@@ -131,13 +131,14 @@ export async function evaluateProtocolIntercept({
   devices,
   requestId,
   account = null,
+  platform = null,
   fetchImpl,
 } = {}) {
   // GPT / Codex skips every layer unless the panel opts it in. Once a scope
   // is set, the slot decides GPT: a scope with no GPT pair and no named
   // account is out of range. Claude stays in the gate until a Claude pair
   // or a named account is selected; a GPT-only scope does not turn it off.
-  if (/^antigravity\//i.test(String(inbound?.model || body?.model || ''))) {
+  if (platform === 'antigravity') {
     if (jevScopeConfigured(jev)) {
       if (!jevScopeWaits(jev, 'antigravity')) return pass('scope')
       if (!account) return pass('scope-wait')
