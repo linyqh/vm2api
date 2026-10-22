@@ -157,6 +157,7 @@ test('routing remains opt-in and advertises its independent API capabilities', (
     idle_ttl_seconds: 600,
     timeout_ms: 180000,
     queue_timeout_ms: 120000,
+    affinity_wait_ms: 15000,
   })
   assert.deepEqual(listAntigravityPublicModels({ models: ['gemini-test-low'] }), [])
   assert.equal(ANTIGRAVITY_CAPABILITIES.client_tools, true)
@@ -174,6 +175,8 @@ test('routing remains opt-in and advertises its independent API capabilities', (
     { max_sessions: 0 },
     { timeout_ms: 999 },
     { queue_timeout_ms: 300001 },
+    { affinity_wait_ms: -1 },
+    { affinity_wait_ms: 120001 },
     { models: ['--bad'] },
     { cli_bin: 'agy\nother' },
   ]) {

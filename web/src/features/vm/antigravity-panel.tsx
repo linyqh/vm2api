@@ -26,6 +26,7 @@ export function AntigravitySettings() {
   const [cli, setCli] = useState('agy')
   const [maxSessions, setMaxSessions] = useState('1')
   const [queueSec, setQueueSec] = useState('120')
+  const [affinitySec, setAffinitySec] = useState('15')
   const [models, setModels] = useState('')
   const [levels, setLevels] = useState<
     Record<string, AntigravityReasoningLevel[]>
@@ -37,6 +38,7 @@ export function AntigravitySettings() {
     setCli(typeof value.cli_bin === 'string' ? value.cli_bin : 'agy')
     setMaxSessions(String(value.max_sessions ?? 1))
     setQueueSec(String(Number(value.queue_timeout_ms ?? 120000) / 1000))
+    setAffinitySec(String(Number(value.affinity_wait_ms ?? 15000) / 1000))
     setModels(
       Array.isArray(value.models)
         ? value.models
@@ -102,6 +104,7 @@ export function AntigravitySettings() {
             cli_bin: cli.trim() || 'agy',
             max_sessions: Number(maxSessions),
             queue_timeout_ms: Math.round(Number(queueSec) * 1000),
+            affinity_wait_ms: Math.round(Number(affinitySec) * 1000),
             models: antigravityModelsFromIds(
               (routing.data?.antigravity as Record<string, unknown> | undefined)
                 ?.models,
@@ -179,6 +182,21 @@ export function AntigravitySettings() {
             />
             <p className='text-xs text-muted-foreground'>
               槽位全满时请求最多等待多久，超时返回 429。
+            </p>
+          </div>
+          <div className='space-y-1'>
+            <Label htmlFor='agy-affinity-wait'>缓存亲和等待（秒，0–120）</Label>
+            <Input
+              id='agy-affinity-wait'
+              type='number'
+              min={0}
+              max={120}
+              value={affinitySec}
+              onChange={(e) => setAffinitySec(e.target.value)}
+            />
+            <p className='text-xs text-muted-foreground'>
+              会话绑定的槽位正忙时，先等它空出来再换槽，避免整段前缀在新槽冷写、缓存不命中。0
+              表示不等。
             </p>
           </div>
         </div>

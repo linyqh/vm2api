@@ -66,6 +66,7 @@ test('routing GET exposes Antigravity defaults and only normalized public config
     idle_ttl_seconds: 600,
     timeout_ms: 180000,
     queue_timeout_ms: 120000,
+    affinity_wait_ms: 15000,
   }
   const h = harness(
     project,
@@ -136,6 +137,7 @@ test('routing PUT persists Antigravity settings and GET returns them for the set
     idle_ttl_seconds: 900,
     timeout_ms: 240000,
     queue_timeout_ms: 90000,
+    affinity_wait_ms: 0,
   }
   const h = harness(
     project,

@@ -1,9 +1,13 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { handleAntigravityProtocol } from '../../src/lib/protocol/handle-antigravity.mjs'
 import { createAntigravityPoolRuntime } from '../../src/lib/pool/antigravity-slot-pool.mjs'
 import { createAntigravityResponseStore } from '../../src/lib/protocol/antigravity-response-store.mjs'
+import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
 
 const slot = {
   id: 'vm-ag-01',
@@ -35,6 +39,7 @@ async function invoke({
   store = createAntigravityResponseStore(),
   keyStore = null,
   routing = null,
+  stickyRouter = null,
 } = {}) {
   const req = Object.assign(
     new EventEmitter(),
@@ -87,6 +92,7 @@ async function invoke({
       antigravity: { enabled: true, models: ['model-one-low', 'model-one-medium', 'model-one-high'] },
     },
     projectRoot: '/unused',
+    stickyRouter,
     apiKeyStore: keyStore,
     accountGate,
     recordUsage: () => {
@@ -371,4 +377,64 @@ test('A slot runs as many concurrent requests as its resolved max_concurrency al
     [200, 200, 200],
   )
   assert.equal(peak, 3)
+})
+
+function affinityHarness(t, affinityWaitMs) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-ag-sticky-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const router = new StickyRouter({ dataDir: dir, config: { sticky: { enabled: true, ttl_seconds: 600 } } })
+  const runtime = createAntigravityPoolRuntime()
+  const slots = [slot, { ...slot, id: 'vm-ag-02' }]
+  const routing = {
+    antigravity: {
+      enabled: true,
+      models: ['model-one-medium'],
+      queue_timeout_ms: 2000,
+      affinity_wait_ms: affinityWaitMs,
+    },
+  }
+  const turn = async (messages) =>
+    (
+      await invoke({
+        body: { model: 'model-one', messages },
+        slots,
+        runtime,
+        routing,
+        stickyRouter: router,
+        requestPatch: { headers: { 'x-session-id': 'ses-cache' } },
+      })
+    ).logBag.vm_id
+  const hold = (id, ms) => {
+    const lease = runtime.acquire(id, { concurrency: 1 })
+    setTimeout(() => lease.release(), ms)
+  }
+  return { turn, hold, other: (id) => (id === slot.id ? 'vm-ag-02' : slot.id) }
+}
+
+const opening = [{ role: 'user', content: 'build the app' }]
+const followUp = [...opening, { role: 'assistant', content: 'done' }, { role: 'user', content: 'now add tests' }]
+
+test('A busy warm slot is awaited instead of re-sending the prefix cold on another account', async (t) => {
+  const { turn, hold } = affinityHarness(t, 1000)
+  const home = await turn(opening)
+  hold(home, 60)
+  assert.equal(await turn(followUp), home)
+})
+
+test('Same-session side requests with another prefix never move the conversation off its warm slot', async (t) => {
+  const { turn, hold, other } = affinityHarness(t, 1000)
+  const home = await turn(opening)
+  hold(home, 60)
+  assert.equal(await turn([{ role: 'user', content: 'generate a title for this chat' }]), other(home))
+  assert.equal(await turn(followUp), home)
+})
+
+test('After a spill the binding follows the slot that now holds the longest cached prefix', async (t) => {
+  const { turn, hold, other } = affinityHarness(t, 0)
+  const home = await turn(opening)
+  hold(home, 60)
+  const spilled = await turn(followUp)
+  assert.equal(spilled, other(home))
+  await new Promise((resolve) => setTimeout(resolve, 80))
+  assert.equal(await turn([...followUp, { role: 'assistant', content: 'ok' }, { role: 'user', content: 'ship it' }]), spilled)
 })

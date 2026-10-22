@@ -144,6 +144,7 @@ export function normalizeAntigravityRouting(raw = {}) {
     idle_ttl_seconds: boundedInteger(src.idle_ttl_seconds, 600, 1, 86400),
     timeout_ms: boundedInteger(src.timeout_ms, 180000, 1000, 3600000),
     queue_timeout_ms: boundedInteger(src.queue_timeout_ms, 120000, 1000, 300000),
+    affinity_wait_ms: boundedInteger(src.affinity_wait_ms, 15000, 0, 120000),
   }
 }
 
@@ -177,6 +178,7 @@ export function validateAntigravityRoutingPatch(body = {}) {
     ['idle_ttl_seconds', 1, 86400],
     ['timeout_ms', 1000, 3600000],
     ['queue_timeout_ms', 1000, 300000],
+    ['affinity_wait_ms', 0, 120000],
   ]) {
     if (field in raw && (!Number.isInteger(raw[field]) || raw[field] < min || raw[field] > max)) {
       throw Object.assign(new TypeError(`antigravity.${field} 必须是 ${min} 到 ${max} 的整数`), {

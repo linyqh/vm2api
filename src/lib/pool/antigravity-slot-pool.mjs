@@ -161,6 +161,7 @@ export function pickAntigravityCandidates(
   let retryAt = null
   let capacity = false
   let modelMissing = false
+  let preferredBusy = false
   for (const vm of slots) {
     if (!keyAllowsVm(scope, vm) || !vmMatchesOwnerScope(vm, pin ? { type: 'any' } : ownerScope)) continue
     if (excluded.has(vm.id)) continue
@@ -188,6 +189,7 @@ export function pickAntigravityCandidates(
     if (state.inFlight >= concurrency || (maxRpm > 0 && state.rpm >= maxRpm)) {
       capacity = true
       retryAt = Math.min(retryAt || Infinity, now + 1000)
+      if (vm.id === preferred && state.inFlight >= concurrency) preferredBusy = true
       continue
     }
     candidates.push({ vm, concurrency, maxRpm })
@@ -201,6 +203,7 @@ export function pickAntigravityCandidates(
   return {
     candidates,
     retryAt,
+    preferredBusy,
     error: candidates.length
       ? null
       : capacity

@@ -143,11 +143,20 @@ export async function handleAntigravityProtocol({
   const run = ops.runInference || runAntigravityInference
   const excluded = new Set()
   // The sticky namespace includes this API key. A caller-supplied session ID
-  // cannot accidentally share another tenant's account preference.
+  // cannot accidentally share another tenant's account preference. Upstream
+  // prompt caches live per account and per prefix, so side requests that reuse
+  // the session ID (title generation, summaries) get their own affinity row.
   const rawSticky = stickyRouter?.extractPoolKey?.(req, ctx.body, { platform: 'antigravity' }) || null
-  const stickyKey = rawSticky && responseScope ? `antigravity:${responseScope}:${rawSticky}` : null
+  const prefix = crypto
+    .createHash('sha256')
+    .update(JSON.stringify([request.model, request.system, request.tools, request.messages[0]]))
+    .digest('hex')
+    .slice(0, 16)
+  const stickyKey = rawSticky && responseScope ? `antigravity:${responseScope}:${rawSticky}:${prefix}` : null
   const preferred = previous?.vmId || (stickyKey ? stickyRouter?.resolve?.(stickyKey)?.vmId : null)
   const deadline = Date.now() + config.queue_timeout_ms
+  // A short wait for the warm slot is cheaper than re-sending the whole prefix cold elsewhere.
+  let affinityUntil = preferred ? Date.now() + config.affinity_wait_ms : 0
   const budget = Math.min(16, Math.max(1, Number(routing.failover?.max_total_attempts) || 4))
   const controller = new AbortController()
   const abort = () => {
@@ -196,6 +205,14 @@ export async function handleAntigravityProtocol({
         runtime,
         ...(ops.supportsModel ? { supportsModel: ops.supportsModel } : {}),
       })
+      if (picked.preferredBusy && Date.now() < affinityUntil) {
+        try {
+          await runtime.wait({ deadline: Math.min(affinityUntil, deadline), signal: controller.signal })
+        } catch {
+          affinityUntil = 0
+        }
+        continue
+      }
       let admission = null
       for (const candidate of picked.candidates) {
         const lease = runtime.acquire(candidate.vm.id, candidate)
@@ -304,7 +321,12 @@ export async function handleAntigravityProtocol({
           logBag.final_state = last.terminalState || 'verified'
           logBag.stop_reason = last.stop_reason || 'end_turn'
           logBag.first_token_ms ??= Math.max(0, Date.now() - requestStartedAt)
-          if (stickyKey) stickyRouter?.bind?.(stickyKey, { vmId: vm.id, accountId: vm.id })
+          if (stickyKey) {
+            // The serving slot now holds the longest cached prefix; a plain bind keeps the first slot forever.
+            const bound = stickyRouter?.resolve?.(stickyKey)?.vmId
+            if (bound && bound !== vm.id) stickyRouter?.rebindFamily?.(stickyKey, { vmId: vm.id, accountId: vm.id })
+            else stickyRouter?.bind?.(stickyKey, { vmId: vm.id, accountId: vm.id })
+          }
           if (protocol === 'openai.responses' && ctx.body.store !== false)
             responseStore.put(id, {
               scope: responseScope,

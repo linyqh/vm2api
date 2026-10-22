@@ -55,6 +55,9 @@ Gemini 3 及以上模型要求回传的工具调用携带 `thoughtSignature`，�
 | --- | --- | --- | --- |
 | `max_sessions` | 1 | 1–20 | 每个槽位同时在飞的请求数，也是槽内 bridge 的并发上限。修改后需在各槽位运维页「重载 Antigravity bridge」，否则推理返回 409 `antigravity_runtime_reload_required` |
 | `queue_timeout_ms` | 120000 | 1000–300000 | 全部候选槽位满载时的排队上限，超时返回 429 `antigravity_capacity_unavailable`；与 Claude 池的 `pool.fallback_wait_timeout_ms` 无关 |
+| `affinity_wait_ms` | 15000 | 0–120000 | 会话绑定的槽位正忙时，先等它空出来的最长时间，超时再换槽；`0` 表示直接换槽 |
+
+上游提示缓存按账号和前缀隔离。粘性键由会话标识（或首条用户消息指纹）加上前缀指纹（模型变体、system、tools、首条消息）组成：同一会话里前缀不同的旁路请求（例如客户端并发发出的标题生成）单独绑定，不会占用或改写主对话的槽位。请求成功后，绑定移到实际服务的槽位，因为最新的缓存前缀在那里。
 
 槽位默认跟随 `max_sessions`。`PATCH /api/panel/vms/:id` 传 `{"max_concurrency": n}` 可把单槽钉到 1–`max_sessions`，传 `null` 恢复跟随；Antigravity 槽位的该接口只接受这一个字段。
 
