@@ -90,8 +90,13 @@ function AntigravityPanelContent({
   )
   const [result, setResult] = useState<AntigravityChatResult | null>(null)
   const [failure, setFailure] = useState('')
-  const models = status.data?.models || []
-  const selected = model || models[0]?.id || ''
+  const enabledIds = new Set((status.data?.models || []).map((m) => m.id))
+  const models = [
+    ...(status.data?.models || []),
+    ...(status.data?.model_catalog?.models || []),
+  ].filter((m, i, all) => all.findIndex((o) => o.id === m.id) === i)
+  const selected =
+    model || models.find((m) => enabledIds.has(m.id))?.id || models[0]?.id || ''
   const chat = useMutation({
     mutationFn: (request: {
       model: string
@@ -223,23 +228,37 @@ function AntigravityPanelContent({
           <CardContent className='space-y-3 pt-0'>
             <div className='space-y-1'>
               <Label htmlFor={`agy-model-${vm.id}`}>模型 ID</Label>
-              <Input
+              <select
                 id={`agy-model-${vm.id}`}
+                className='h-9 w-full rounded-md border bg-background px-3 text-sm'
                 value={selected}
-                disabled={busy || !!session}
+                disabled={busy || !!session || !models.length}
                 onChange={(e) => {
                   setModel(e.target.value)
                   setResult(null)
                 }}
-                list={`agy-models-${vm.id}`}
-              />
-              <datalist id={`agy-models-${vm.id}`}>
+              >
+                {!models.length ? (
+                  <option value=''>暂无模型，请先同步账号模型</option>
+                ) : null}
+                {selected && !models.some((m) => m.id === selected) ? (
+                  <option value={selected}>{selected}</option>
+                ) : null}
                 {models.map((m) => (
                   <option key={m.id} value={m.id}>
-                    {m.display_name || m.id}
+                    {m.display_name && m.display_name !== m.id
+                      ? `${m.display_name} (${m.id})`
+                      : m.id}
+                    {enabledIds.has(m.id) ? '' : ' · 未在全局目录启用'}
                   </option>
                 ))}
-              </datalist>
+              </select>
+              {selected && !enabledIds.has(selected) ? (
+                <p className='text-xs text-muted-foreground'>
+                  该模型尚未加入全局目录或未启用，发送会被拒绝。请管理员在“设置
+                  → Antigravity”同步并启用。
+                </p>
+              ) : null}
             </div>
             <div className='space-y-1'>
               <Label htmlFor={`agy-prompt-${vm.id}`}>消息</Label>
