@@ -304,6 +304,55 @@ test('401 refresh uses official CLI ownership and retries once without exposing 
   assert.equal(JSON.stringify(failed).includes(token.access_token), false)
 })
 
+test('expired token: a stalled CLI refresh outlives the aborted caller and failures name the cause', async () => {
+  let current = { access_token: 'stale', expiry: new Date(Date.now() - 1000).toISOString() }
+  let finish
+  let refreshes = 0
+  const provider = upstream(
+    async (_url, options) => {
+      assert.equal(options.headers.authorization, 'Bearer fresh')
+      return sse([result([{ text: 'OK' }], 'STOP')])
+    },
+    {
+      readToken: () => current,
+      refresh: () => {
+        refreshes++
+        return new Promise((resolve) => (finish = resolve))
+      },
+    },
+  )
+  const caller = new AbortController()
+  const pending = provider.infer(basic, { signal: caller.signal })
+  await new Promise((resolve) => setImmediate(resolve))
+  caller.abort()
+  assert.equal((await pending).code, 'client_cancelled')
+  const next = provider.infer(basic)
+  current = { access_token: 'fresh', expiry: new Date(Date.now() + 3600_000).toISOString() }
+  finish()
+  assert.equal((await next).ok, true)
+  assert.equal(refreshes, 1, 'the in-flight refresh is shared, not restarted by the next caller')
+
+  current = { access_token: 'stale', expiry: new Date(Date.now() - 1000).toISOString() }
+  const failed = await upstream(() => assert.fail('network'), {
+    readToken: () => current,
+    refresh: async () => {
+      throw new Error('official CLI did not finish within 90s')
+    },
+  }).infer(basic)
+  assert.equal(failed.status, 503)
+  assert.equal(failed.code, 'antigravity_token_refresh_failed')
+  assert.match(failed.message, /did not finish within 90s/)
+  const unchanged = await upstream(() => assert.fail('network'), {
+    readToken: () => current,
+    refresh: async () => {},
+  }).infer(basic)
+  assert.equal(
+    unchanged.code,
+    'antigravity_token_refresh_failed',
+    'a CLI exit that left the token expired is not success',
+  )
+})
+
 test('Cloud Code project comes from loadCodeAssist once per token and missing projects fail closed', async () => {
   const seen = []
   const provider = createAntigravityUpstream(config, {

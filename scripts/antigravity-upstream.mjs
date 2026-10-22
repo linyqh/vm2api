@@ -192,7 +192,19 @@ export function antigravityNativeUsage(value) {
   }
 }
 
-function cliRefresh(config, signal) {
+// A stalled refresh (e.g. slot DNS down) must outlive short callers such as the 20 s quota poll.
+const REFRESH_TIMEOUT_MS = 90_000
+function refreshFailureDetail(error, stderr, stdout) {
+  if (error.killed || error.signal) return `official CLI did not finish within ${REFRESH_TIMEOUT_MS / 1000}s`
+  const line = String(stderr || stdout || '')
+    .split('\n')
+    .map((text) => text.trim())
+    .filter(Boolean)
+    .at(-1)
+  const safe = line?.replace(/ya29\.[\w.-]+|1\/\/[\w.-]+|eyJ[\w.-]+/g, '[redacted]').slice(0, 200)
+  return `official CLI exited with ${error.code ?? 'error'}${safe ? `: ${safe}` : ''}`
+}
+function cliRefresh(config) {
   return new Promise((resolve, rejectPromise) => {
     const home = process.env.HOME || '/home/kincli'
     execFile(
@@ -201,12 +213,21 @@ function cliRefresh(config, signal) {
       {
         cwd: home,
         env: { HOME: home, PATH: `${home}/.local/bin:/usr/bin:/bin`, LANG: 'C.UTF-8' },
-        timeout: 30_000,
+        timeout: REFRESH_TIMEOUT_MS,
         maxBuffer: 2 * 1024 * 1024,
-        signal,
       },
-      (error) => (error ? rejectPromise(new Error('official token refresh failed')) : resolve()),
+      (error, stdout, stderr) =>
+        error ? rejectPromise(new Error(refreshFailureDetail(error, stderr, stdout))) : resolve(),
     )
+  })
+}
+function untilAborted(promise, signal) {
+  if (!signal) return promise
+  return new Promise((resolve, rejectPromise) => {
+    const onAbort = () => rejectPromise(Object.assign(new Error('cancelled'), { name: 'AbortError' }))
+    if (signal.aborted) return onAbort()
+    signal.addEventListener('abort', onAbort, { once: true })
+    promise.then(resolve, rejectPromise).finally(() => signal.removeEventListener('abort', onAbort))
   })
 }
 function loadProject(token, fetchImpl, signal) {
@@ -297,12 +318,25 @@ export function createAntigravityUpstream(config = {}, dependencies = {}) {
       reject('antigravity_auth_expired', 'Antigravity credentials are unavailable; authorize this slot again', 401)
     }
     if (force || !Number.isFinite(Date.parse(value.expiry)) || Date.parse(value.expiry) <= Date.now() + 60_000) {
-      refreshWork ||= refresh(config, signal).finally(() => {
-        refreshWork = null
-        projectCache = null
-      })
-      await refreshWork
+      refreshWork ||= Promise.resolve()
+        .then(() => refresh(config))
+        .finally(() => {
+          refreshWork = null
+          projectCache = null
+        })
+      try {
+        await untilAborted(refreshWork, signal)
+      } catch (error) {
+        if (error?.name === 'AbortError') throw error
+        reject('antigravity_token_refresh_failed', `Antigravity token refresh failed: ${error?.message || error}`, 503)
+      }
       value = tokenReader()
+      if (!(Date.parse(value.expiry) > Date.now()))
+        reject(
+          'antigravity_token_refresh_failed',
+          'Antigravity token refresh failed: official CLI left the token expired (check slot network and DNS)',
+          503,
+        )
     }
     return value.access_token
   }
