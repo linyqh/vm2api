@@ -54,6 +54,7 @@ Gemini 3 及以上模型要求回传的工具调用携带 `thoughtSignature`，�
 | 字段 | 默认 | 范围 | 作用 |
 | --- | --- | --- | --- |
 | `max_sessions` | 1 | 1–20 | 每个槽位同时在飞的请求数，也是槽内 bridge 的并发上限。修改后需在各槽位运维页「重载 Antigravity bridge」，否则推理返回 409 `antigravity_runtime_reload_required` |
+| `timeout_ms` | 180000 | 1000–3600000 | 上游连续多久没有新数据就中断，按空闲计时，不限制总时长，超时返回 504 `antigravity_timeout`。Gemini 的工具调用参数要整段生成完才一次下发，写整份文件时可能几分钟没有数据；常有这类长工具调用就调大。修改后同样需要「重载 Antigravity bridge」 |
 | `queue_timeout_ms` | 120000 | 1000–300000 | 全部候选槽位满载时的排队上限，超时返回 429 `antigravity_capacity_unavailable`；与 Claude 池的 `pool.fallback_wait_timeout_ms` 无关 |
 | `affinity_wait_ms` | 15000 | 0–120000 | 会话绑定的槽位正忙时，先等它空出来的最长时间，超时再换槽；`0` 表示直接换槽 |
 

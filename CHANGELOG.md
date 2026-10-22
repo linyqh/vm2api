@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- 修复 Antigravity 长输出在 3 分钟左右被切断，客户端看到「Antigravity did not return a complete valid response」并反复重试。`antigravity.timeout_ms`（默认 180 秒）原来是整次请求的总时长上限；Gemini 的工具调用参数要整段生成完才一次下发，让模型写一整份文件时，上游一直在生成却会被强行中断。现在改为空闲超时：只要上游还在发数据就不中断，连续 `timeout_ms` 没有新数据才中断。超时的错误码原先被中断异常自带的数字 code（20）盖掉，日志里记成 `20.0`、提示文字也是通用的；现在返回 504 `antigravity_timeout`，提示里写明是超时。
 - 提升 Antigravity 提示缓存命中率。线上日志显示命中为 0 的会话，每一轮都落在不同账号：opencode 等客户端会和主对话同时发一个同会话 ID 的标题生成请求，单槽并发为 1 时它占住了会话绑定的槽，主对话被挤到别的号，而上游缓存按账号隔离；会话绑定又锁在第一次成功的槽，下一轮回到没有该前缀缓存的号。现在粘性键加入前缀指纹（模型变体、system、tools、首条消息），旁路请求单独绑定；绑定槽正忙时先等 `antigravity.affinity_wait_ms`（默认 15 秒，0–120 秒，设置 → Antigravity 可改）再换槽；换槽成功后绑定移到实际服务的槽。旧的 Antigravity 粘性记录不再使用，各会话下一轮重新绑定。
 - 修复宿主机防火墙重载（如 `firewall-cmd --reload`）后 SOCKS 出口槽位断网：重载会清掉 kin-egress 的 iptables 转发规则，而进程仍在监听，watchdog 只看进程就判定正常，槽内 DNS 与出站全部超时。watchdog 现每分钟核对该出口的 NAT / INPUT / FORWARD 规则，缺失即重新下发；槽位诊断的出口检查也会报出「转发规则丢失」。Antigravity 槽位因此表现为授权约 1 小时后「过期」，实际是 access token 无法续期。
 - Antigravity token 续期不再随调用方超时一起被杀：官方 CLI 换票有独立的 90 秒上限，额度查询（20 秒）或请求取消只结束本次等待，后续请求共用同一次续期。续期失败或 CLI 退出后 token 仍过期时返回 503 `antigravity_token_refresh_failed`，并附 CLI 的退出原因（超时 / 退出码与末行输出，token 已脱敏），不再显示为笼统的授权失效或流不完整。

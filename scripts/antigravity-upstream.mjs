@@ -356,10 +356,18 @@ export function createAntigravityUpstream(config = {}, dependencies = {}) {
       const controller = new AbortController()
       const abort = () => controller.abort()
       signal?.addEventListener('abort', abort, { once: true })
-      const timer = setTimeout(() => {
-        timedOut = true
-        abort()
-      }, Number(config.timeout_ms) || 180_000)
+      // Idle, not total: Gemini emits a function call only once its arguments are complete, so a
+      // large tool call (a whole file) streams nothing for minutes while still generating.
+      const idleMs = Number(config.timeout_ms) || 180_000
+      let timer
+      const arm = () => {
+        clearTimeout(timer)
+        timer = setTimeout(() => {
+          timedOut = true
+          abort()
+        }, idleMs)
+      }
+      arm()
       const emit = (event) => {
         committed = true
         onEvent?.(event)
@@ -508,6 +516,7 @@ export function createAntigravityUpstream(config = {}, dependencies = {}) {
         }
         if (!response.body) throw new Error('missing stream')
         for await (const chunk of response.body) {
+          arm()
           bytes += chunk.length
           if (bytes > (Number(config.max_response_bytes) || 16 * 1024 * 1024)) throw new Error('response too large')
           buffer = (buffer + decoder.decode(chunk, { stream: true })).replace(/\r\n/g, '\n')
@@ -541,17 +550,23 @@ export function createAntigravityUpstream(config = {}, dependencies = {}) {
       } catch (error) {
         controller.abort()
         const cancelled = signal?.aborted || closed
+        // The abort raises a DOMException whose numeric `code` (20) must not mask the timeout.
+        const code = typeof error?.code === 'string' ? error.code : null
         return {
           ok: false,
           status: cancelled ? 499 : timedOut ? 504 : error.status || 502,
           code: cancelled
             ? 'client_cancelled'
-            : error.code || (timedOut ? 'antigravity_timeout' : 'antigravity_stream_incomplete'),
-          message: error.status
-            ? error.message
-            : cancelled
-              ? 'Request cancelled'
-              : 'Antigravity did not return a complete valid response',
+            : timedOut
+              ? 'antigravity_timeout'
+              : code || 'antigravity_stream_incomplete',
+          message: cancelled
+            ? 'Request cancelled'
+            : timedOut
+              ? `Antigravity sent no data for ${Math.round(idleMs / 1000)} s; raise antigravity.timeout_ms for long outputs`
+              : error.status
+                ? error.message
+                : 'Antigravity did not return a complete valid response',
           content,
           usage,
           stop_reason: null,

@@ -283,6 +283,58 @@ test('partial streams cannot become successful and retain output commitment', as
   assert.equal(response.terminalState, 'incomplete')
 })
 
+function timedUpstream(timeoutMs, fetchImpl) {
+  return createAntigravityUpstream(
+    { ...config, timeout_ms: timeoutMs },
+    { readToken: () => token, loadProject: async () => 'account-project', fetch: fetchImpl },
+  )
+}
+
+test('timeout_ms bounds silence, not total time: a stream that keeps sending outlives it', async () => {
+  const frames = [...Array.from({ length: 6 }, () => result([{ text: 'x' }])), result([{ text: '.' }], 'STOP')]
+  const provider = timedUpstream(150, async (_url, { signal }) => {
+    const encoder = new TextEncoder()
+    let index = 0
+    return new Response(
+      new ReadableStream({
+        async pull(controller) {
+          if (index === frames.length) return controller.close()
+          await new Promise((resolve) => setTimeout(resolve, 60))
+          if (signal.aborted) return controller.error(new DOMException('aborted', 'AbortError'))
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ response: frames[index++] })}\n\n`))
+        },
+      }),
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    )
+  })
+  const started = Date.now()
+  const response = await provider.infer(basic)
+  assert.ok(Date.now() - started > 300)
+  assert.equal(response.ok, true)
+  assert.equal(response.content[0].text, 'xxxxxx.')
+})
+
+test('a silent stream ends as antigravity_timeout, not the abort exception code', async () => {
+  const provider = timedUpstream(100, async (_url, { signal }) => {
+    const encoder = new TextEncoder()
+    return new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ response: result([{ text: 'Writing' }]) })}\n\n`))
+          signal.addEventListener('abort', () => controller.error(new DOMException('aborted', 'AbortError')))
+        },
+      }),
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    )
+  })
+  const response = await provider.infer(basic)
+  assert.equal(response.ok, false)
+  assert.equal(response.status, 504)
+  assert.equal(response.code, 'antigravity_timeout')
+  assert.match(response.message, /antigravity\.timeout_ms/)
+  assert.equal(response.output_committed, true)
+})
+
 test('401 refresh uses official CLI ownership and retries once without exposing upstream error body', async () => {
   let calls = 0,
     refreshes = 0
