@@ -244,6 +244,31 @@ test('Antigravity OAuth routes bind the caller and return public session fields 
   assert.equal(fs.readFileSync(path.join(project, 'vms', `${vm.id}.json`), 'utf8'), JSON.stringify(vm))
 })
 
+test('a completed Antigravity login syncs the slot catalog without a manual click', async (t) => {
+  const project = fixture(t)
+  const synced = []
+  const done = { ok: true, session: { session_id: 's-1', status: 'authenticated', authenticated: true } }
+  const pending = { ok: true, session: { session_id: 's-1', status: 'awaiting_code', authenticated: false } }
+  for (const result of [pending, done]) {
+    const h = harness(
+      project,
+      tenant,
+      { session_id: 's-1', code: 'manual-code' },
+      {
+        completeAntigravityAuthLogin: async () => result,
+        syncAntigravityModels: async ({ vm: target }) => {
+          synced.push(target.id)
+          return { ok: true, models: [] }
+        },
+      },
+    )
+    await h.call('POST', 'vms/vm-ag/antigravity/oauth/complete')
+    assert.equal(h.response.status, 200, JSON.stringify(h.response.body))
+  }
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(synced, ['vm-ag'])
+})
+
 test('foreign tenants and read-only operators cannot access any OAuth session endpoint', async (t) => {
   const project = fixture(t)
   for (const who of [

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Antigravity 槽位 OAuth 授权成功后自动同步该槽位的账号模型目录（管理员授权时同时合并进全局目录），无需再手动点「同步账号模型」。此前新授权的槽位没有模型目录，测试与调度都会返回 `antigravity_model_unavailable`。同步在后台进行，通常几秒内完成；失败时仍可手动同步。
 - Antigravity 槽位的「测试链接」改用与 Claude / GPT 相同的测试流程：选择模型、推理强度与最大输出后，经 `/v1/messages` loopback 并以 `x-kin-vm` 固定到该槽位发一条真实对话，按槽位 / 凭证 / 代理 / 模型 / 发起请求 / 结果分阶段展示日志、回复与 usage，同样支持定时测试。固定到 Antigravity 槽位的面板测试按 antigravity 分组路由，同名 Claude / GPT 模型（如 `claude-opus-5-5`）也走该槽位。旧的会话式「纯文本测试」及 `POST /api/panel/vms/:id/antigravity/chat`、`/close` 已移除；槽内 bridge 的 `/text` 接口暂时保留。
 - 模型页 Antigravity 分区的模型卡片与 Claude / GPT 显示一致：上下文、输出上限、Thinking（可用推理档位），以及供应商与默认档位；支持按供应商筛选。点击卡片或「配置」可编辑对外启用、显示名称、供应商、可用档位、上下文窗口与输出上限。上下文与输出上限在同步账号模型时从 models.dev 自动填入（优先厂商官方条目，否则取多数提供方一致的值），管理员已设置的值不会被覆盖；`/v1/models` 的 Antigravity 模型同时返回 `context_window` 与 `max_output_tokens`。
 - 模型页的 Antigravity 移到 Anthropic / OpenAI 同级的平台分区，显示官方模型矩阵卡片，可直接逐个或批量启用、开关 API 接入，并从已授权槽位同步账号模型。

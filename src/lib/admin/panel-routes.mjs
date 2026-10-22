@@ -653,6 +653,27 @@ export function createPanelHandler(ctx) {
   const officialCcStatsHandler = (...args) => ctx.officialCcStatsHandler(...args)
   const refreshWorkerCredentialForVm = (...args) => ctx.refreshWorkerCredentialForVm(...args)
   const fetchWorkerModels = (...args) => ctx.fetchWorkerModels(...args)
+  async function syncSlotAntigravityModels(vm, publishGlobal) {
+    const result = await (ctx.syncAntigravityModels || syncAntigravityModels)({
+      projectRoot: cfg.paths.project,
+      vm,
+      routing: getRouting(),
+      ops: { getVm: () => getVm(cfg.paths.project, vm.id) },
+    })
+    if (result.ok && publishGlobal) {
+      const routing = getRouting()
+      const config = normalizeAntigravityRouting(routing.antigravity)
+      persistRoutingPatch({
+        antigravity: {
+          ...config,
+          // The first catalog publish switches the platform on; later administrator choices are kept.
+          enabled: config.enabled || config.models.length === 0,
+          models: mergeAntigravityCatalogModels(routing.antigravity?.models, result.models),
+        },
+      })
+    }
+    return result
+  }
   function restoreSchedulableIfReady(vmId) {
     const vm = getVm(cfg.paths.project, vmId)
     if (!vmHasSchedulableCredential(vm, cfg.paths.project)) {
@@ -1510,6 +1531,14 @@ export function createPanelHandler(ctx) {
               ok: false,
               error: { code: 'antigravity_auth_response_invalid', message: '授权会话状态无效' },
             })
+          // A fresh login has no catalog for its credential yet; without one the slot serves no model.
+          if (session.authenticated === true && !readAntigravityModelCatalog(cfg.paths.project, vm)) {
+            void syncSlotAntigravityModels(vm, panelIdentity(req).role === 'admin')
+              .then((synced) => {
+                if (!synced.ok) console.warn('[antigravity] post-login model sync failed', vm.id, synced.code)
+              })
+              .catch((error) => console.warn('[antigravity] post-login model sync failed', vm.id, error?.message))
+          }
           return json(
             res,
             200,
@@ -1543,26 +1572,9 @@ export function createPanelHandler(ctx) {
         if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).length)
           return json(res, 400, { ok: false, error: { code: 'invalid_request', message: '模型同步请求字段无效' } })
         const publishGlobal = panelIdentity(req).role === 'admin'
-        const result = await (ctx.syncAntigravityModels || syncAntigravityModels)({
-          projectRoot: cfg.paths.project,
-          vm,
-          routing: getRouting(),
-          ops: { getVm: () => getVm(cfg.paths.project, vm.id) },
-        })
+        const result = await syncSlotAntigravityModels(vm, publishGlobal)
         if (!result.ok)
           return json(res, result.status || 502, { ok: false, error: { code: result.code, message: result.message } })
-        if (publishGlobal) {
-          const routing = getRouting()
-          const config = normalizeAntigravityRouting(routing.antigravity)
-          persistRoutingPatch({
-            antigravity: {
-              ...config,
-              // The first catalog publish switches the platform on; later administrator choices are kept.
-              enabled: config.enabled || config.models.length === 0,
-              models: mergeAntigravityCatalogModels(routing.antigravity?.models, result.models),
-            },
-          })
-        }
         return json(res, 200, panel.ok({ ...result, published_global: publishGlobal }))
       }
       const agQuotaRoute = p.match(/^\/api\/panel\/vms\/([^/]+)\/antigravity\/quota\/refresh$/)
