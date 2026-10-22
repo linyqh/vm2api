@@ -275,6 +275,52 @@ export function parseModelsDev(json) {
   return out
 }
 
+const LIMIT_VENDORS = [
+  ['gemini-', 'google'],
+  ['claude-', 'anthropic'],
+  ['gpt-', 'openai'],
+]
+
+function modeOf(values) {
+  const counts = new Map()
+  for (const v of values) counts.set(v, (counts.get(v) || 0) + 1)
+  let best = null
+  for (const [v, n] of counts)
+    if (best == null || n > counts.get(best) || (n === counts.get(best) && v > best)) best = v
+  return best
+}
+
+/**
+ * Context/output limits for vendor model IDs that Antigravity can serve. The vendor's own
+ * provider wins; otherwise the value most resellers agree on (e.g. gpt-oss-120b).
+ */
+export function parseModelLimits(json) {
+  const rows = new Map()
+  if (!json || typeof json !== 'object') return {}
+  for (const [provider, entry] of Object.entries(json)) {
+    const models = entry?.models
+    if (!models || typeof models !== 'object') continue
+    for (const [rawId, row] of Object.entries(models)) {
+      const id = String(rawId).split('/').pop().toLowerCase()
+      const vendor = LIMIT_VENDORS.find(([prefix]) => id.startsWith(prefix))?.[1]
+      const context = Number(row?.limit?.context)
+      const output = Number(row?.limit?.output)
+      if (!vendor || !(context > 0) || !(output > 0)) continue
+      const list = rows.get(id) || []
+      list.push({ firstParty: provider === vendor && rawId === id, context, output })
+      rows.set(id, list)
+    }
+  }
+  const out = {}
+  for (const [id, list] of rows) {
+    const own = list.find((item) => item.firstParty)
+    out[id] = own
+      ? { context: own.context, output: own.output }
+      : { context: modeOf(list.map((item) => item.context)), output: modeOf(list.map((item) => item.output)) }
+  }
+  return out
+}
+
 function countSnapshotModels(snap) {
   let n = 0
   for (const platform of ['anthropic', 'openai']) {
@@ -365,6 +411,7 @@ export async function syncModelsDev({ fetchImpl } = {}) {
       error: null,
       anthropic: parsed.anthropic,
       openai: parsed.openai,
+      limits: parseModelLimits(json),
     }
     persistSnapshot(snap)
     invalidatePriceCatalog()
@@ -376,6 +423,7 @@ export async function syncModelsDev({ fetchImpl } = {}) {
       error: String(e?.message || e),
       anthropic: prev.anthropic || {},
       openai: prev.openai || {},
+      limits: prev.limits || {},
     }
     persistSnapshot(snap)
     invalidatePriceCatalog()
@@ -612,4 +660,14 @@ export function modelsDevMeta(platform, id) {
   const row = readSnapshot()?.[platform]?.[id]
   if (!row) return null
   return { name: row.name ?? null, context: row.context ?? null }
+}
+
+/** models.dev context/output limits for a vendor model ID; null when unknown or unreadable. */
+export function modelsDevLimits(id) {
+  try {
+    const row = readSnapshot()?.limits?.[String(id || '').toLowerCase()]
+    return row ? { context: row.context, output: row.output } : null
+  } catch {
+    return null
+  }
 }

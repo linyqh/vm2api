@@ -24,6 +24,13 @@ function boundedInteger(value, fallback, min, max) {
   return Number.isFinite(number) ? Math.min(max, Math.max(min, Math.floor(number))) : fallback
 }
 
+const MAX_TOKEN_LIMIT = 100_000_000
+
+function tokenLimit(value) {
+  const number = Number(value)
+  return Number.isInteger(number) && number > 0 && number <= MAX_TOKEN_LIMIT ? number : null
+}
+
 export function antigravityModelId(value) {
   const id = String(value || '').trim()
   return /^[a-z0-9][a-z0-9._:-]{0,199}$/i.test(id) ? id : null
@@ -81,11 +88,15 @@ export function normalizeAntigravityModels(value) {
       if (row.enabled !== false) entry.on.add(level)
     }
     if (row.enabled !== false) entry.enabled = true
+    entry.context_window ??= tokenLimit(row.context_window)
+    entry.max_output_tokens ??= tokenLimit(row.max_output_tokens)
     rows.set(key, entry)
   }
-  return [...rows.values()].map(({ all, on, ...entry }) => ({
+  return [...rows.values()].map(({ all, on, context_window, max_output_tokens, ...entry }) => ({
     ...entry,
     levels: sortLevels(on.size ? on : all),
+    ...(context_window ? { context_window } : {}),
+    ...(max_output_tokens ? { max_output_tokens } : {}),
   }))
 }
 
@@ -170,13 +181,17 @@ export function validateAntigravityRoutingPatch(body = {}) {
           !antigravityModelId(row.id) ||
           ('enabled' in row && typeof row.enabled !== 'boolean') ||
           ('levels' in row &&
-            (!Array.isArray(row.levels) || row.levels.some((level) => !ANTIGRAVITY_LEVELS.includes(level))))
+            (!Array.isArray(row.levels) || row.levels.some((level) => !ANTIGRAVITY_LEVELS.includes(level)))) ||
+          ['context_window', 'max_output_tokens'].some((field) => row[field] != null && tokenLimit(row[field]) == null)
         )
       })
     ) {
-      throw Object.assign(new TypeError('antigravity.models 必须是有效的模型 ID 或模型对象数组'), {
-        code: 'invalid_antigravity',
-      })
+      throw Object.assign(
+        new TypeError('antigravity.models 必须是有效的模型 ID 或模型对象数组（token 上限须为正整数）'),
+        {
+          code: 'invalid_antigravity',
+        },
+      )
     }
   }
 }
@@ -199,6 +214,8 @@ export function listAntigravityPublicModels(routing = {}) {
         vendor: model.vendor,
         reasoning_levels: model.levels,
         default_reasoning_level: variant.level,
+        context_window: model.context_window ?? null,
+        max_output_tokens: model.max_output_tokens ?? null,
         enabled: true,
         experimental: false,
         capabilities: ANTIGRAVITY_CAPABILITIES,

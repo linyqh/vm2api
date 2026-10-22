@@ -15,6 +15,7 @@ import {
 } from '../../src/lib/oauth/antigravity-models.mjs'
 import { createPanelHandler } from '../../src/lib/admin/panel-routes.mjs'
 import { parseAllowedModelsPatch } from '../../src/lib/pool/slot-model-gate.mjs'
+import { parseModelLimits } from '../../src/lib/admin/price-catalog.mjs'
 
 const vm = {
   id: 'vm-ag',
@@ -118,6 +119,30 @@ test('global model merge folds variants and preserves disabled choices, levels a
     { id: 'claude-example', display_name: 'Claude Example', vendor: 'anthropic', enabled: true, levels: [] },
   ])
   assert.deepEqual(mergeAntigravityCatalogModels([], parseAntigravityModels(stdout))[0].levels, ['low', 'high'])
+})
+
+test('token limits prefer the vendor provider, fall back to the reseller majority, and never override admin values', () => {
+  const limits = parseModelLimits({
+    google: { models: { 'gemini-example': { limit: { context: 1048576, output: 32768 } } } },
+    reseller: {
+      models: {
+        'google/gemini-example': { limit: { context: 1000000, output: 1000000 } },
+        'openai/gpt-oss-x': { limit: { context: 131072, output: 32768 } },
+      },
+    },
+    other: { models: { 'gpt-oss-x': { limit: { context: 131072, output: 32768 } } } },
+    third: { models: { 'gpt-oss-x': { limit: { context: 128000, output: 8192 } } } },
+  })
+  assert.deepEqual(limits['gemini-example'], { context: 1048576, output: 32768 })
+  assert.deepEqual(limits['gpt-oss-x'], { context: 131072, output: 32768 })
+  const merged = mergeAntigravityCatalogModels(
+    [{ id: 'gemini-example', context_window: 200000 }],
+    [{ id: 'gpt-oss-x' }],
+    (id) => (limits[id] ? { context: limits[id].context, output: limits[id].output } : null),
+  )
+  assert.equal(merged[0].context_window, 200000)
+  assert.equal(merged[0].max_output_tokens, 32768)
+  assert.equal(merged[1].context_window, 131072)
 })
 
 test('model access is invalidated by account replacement and rejects linked catalog files', async (t) => {

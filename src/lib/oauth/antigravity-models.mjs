@@ -13,6 +13,7 @@ import {
 } from '../protocol/antigravity-route.mjs'
 import { isValidVmId } from '../vm/vm-file.mjs'
 import { summarizeAntigravitySlot } from '../vm/antigravity-slot.mjs'
+import { modelsDevLimits } from '../admin/price-catalog.mjs'
 
 const execFileAsync = promisify(execFile)
 const active = new Map()
@@ -131,8 +132,11 @@ function writeCatalog(root, vm, models) {
   return { version: 1, updated_at: value.updated_at, models }
 }
 
-/** Existing administrator choices win, including disabled models, levels and vendor metadata. */
-export function mergeAntigravityCatalogModels(previous, discovered) {
+/**
+ * Existing administrator choices win, including disabled models, levels, vendor metadata and
+ * token limits. Limits still unset come from models.dev.
+ */
+export function mergeAntigravityCatalogModels(previous, discovered, limitsFor = modelsDevLimits) {
   const models = normalizeAntigravityModels(previous)
   const known = new Set(models.map((model) => model.id.toLowerCase()))
   for (const model of normalizeAntigravityModels(discovered)) {
@@ -141,7 +145,15 @@ export function mergeAntigravityCatalogModels(previous, discovered) {
       known.add(model.id.toLowerCase())
     }
   }
-  return models
+  return models.map((model) => {
+    if (model.context_window && model.max_output_tokens) return model
+    const limits = limitsFor(model.id)
+    return {
+      ...model,
+      ...(!model.context_window && limits?.context ? { context_window: limits.context } : {}),
+      ...(!model.max_output_tokens && limits?.output ? { max_output_tokens: limits.output } : {}),
+    }
+  })
 }
 
 export async function syncAntigravityModels({ projectRoot, vm, routing = {}, ops = {} } = {}) {

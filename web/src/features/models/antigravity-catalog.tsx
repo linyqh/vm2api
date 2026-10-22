@@ -35,9 +35,12 @@ import {
   AntigravityModelSync,
   type AntigravityModelCatalog,
 } from '@/features/vm/antigravity-model-sync'
-import { EditorRow, Fact, Metric, Panel } from './model-row'
+import { EditorRow, Fact, Metric, Panel, formatK } from './model-row'
 
-type CatalogModel = AntigravityModelCatalog['models'][number]
+type CatalogModel = AntigravityModelCatalog['models'][number] & {
+  context_window?: number
+  max_output_tokens?: number
+}
 
 const VENDORS: Record<string, string> = {
   google: 'Google',
@@ -313,26 +316,36 @@ function AntigravityModelCard({
 
             <div className='grid gap-2 text-xs sm:grid-cols-3'>
               <Metric
-                label='供应商'
+                label='上下文'
                 value={
-                  model.vendor ? VENDORS[model.vendor] || model.vendor : '—'
+                  model.context_window ? formatK(model.context_window) : '—'
                 }
                 strong
               />
               <Metric
-                label='推理档位'
-                value={levels.length ? `${levels.length} 档` : '无'}
+                label='输出上限'
+                value={
+                  model.max_output_tokens
+                    ? formatK(model.max_output_tokens)
+                    : '—'
+                }
               />
-              <Metric label='默认档位' value={fallback || '—'} />
+              <Metric
+                label='Thinking'
+                value={levels.length ? `${levels.join('/')}` : '不支持'}
+              />
             </div>
 
             <div className='flex flex-wrap gap-1.5'>
-              {levels.length ? (
-                levels.map((level) => (
-                  <Badge key={level} variant='outline' className='font-mono'>
-                    {level}
-                  </Badge>
-                ))
+              {model.vendor ? (
+                <Badge variant='outline'>
+                  {VENDORS[model.vendor] || model.vendor}
+                </Badge>
+              ) : null}
+              {fallback ? (
+                <Badge variant='outline' className='font-mono'>
+                  默认 {fallback}
+                </Badge>
               ) : (
                 <span className='text-xs text-muted-foreground'>
                   不支持推理强度参数
@@ -430,6 +443,33 @@ function AntigravityModelCard({
                   </SelectContent>
                 </Select>
               </EditorRow>
+              {(
+                [
+                  ['context_window', '上下文窗口'],
+                  ['max_output_tokens', '输出上限'],
+                ] as const
+              ).map(([field, label]) => (
+                <EditorRow key={field} label={label}>
+                  <Input
+                    className='field-count h-8 w-full sm:w-[150px]'
+                    type='number'
+                    min={0}
+                    value={draft[field] || ''}
+                    placeholder='未设置'
+                    onChange={(event) =>
+                      setDraft({
+                        ...draft,
+                        [field]:
+                          Math.floor(Number(event.target.value)) || undefined,
+                      })
+                    }
+                  />
+                  <span className='text-xs text-muted-foreground'>token</span>
+                </EditorRow>
+              ))}
+              <p className='text-xs text-muted-foreground'>
+                同步账号模型时从 models.dev 自动填入，已设置的值不会被覆盖。
+              </p>
             </Panel>
 
             <Panel title='推理强度' icon={<Gauge className='size-4' />}>
@@ -482,6 +522,22 @@ function AntigravityModelCard({
             </Panel>
 
             <Panel title='能力' icon={<Gauge className='size-4' />} compact>
+              <Fact
+                label='上下文'
+                value={
+                  model.context_window
+                    ? model.context_window.toLocaleString()
+                    : '—'
+                }
+              />
+              <Fact
+                label='输出上限'
+                value={
+                  model.max_output_tokens
+                    ? model.max_output_tokens.toLocaleString()
+                    : '—'
+                }
+              />
               <Fact label='默认档位' value={fallback || '—'} />
               <Fact label='协议' value='Messages / Chat / Responses' />
               <Fact
