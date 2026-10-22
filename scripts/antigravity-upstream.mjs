@@ -15,6 +15,10 @@ const QUOTA_ORIGINS = [CODE_ASSIST, 'https://cloudcode-pa.googleapis.com']
 const USER_AGENT =
   'antigravity/cli/1.4.4 (aidev_client; os_type=linux; arch=amd64; cl=1003595037; auth_method=consumer)'
 const MIME = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp'])
+// Google's documented bypass for replayed function calls whose signature the caller dropped.
+const SKIP_SIGNATURE = 'skip_thought_signature_validator'
+const SIGNATURE_TTL_MS = 30 * 60_000
+const SIGNATURE_CACHE_LIMIT = 4096
 export const ANTIGRAVITY_API_CAPABILITIES = Object.freeze({
   text: true,
   stream: true,
@@ -32,6 +36,12 @@ function reject(code, message, status = 400) {
 }
 function signature(block) {
   return block.thought_signature || block.signature
+}
+function callKey(id, name, input) {
+  return crypto
+    .createHash('sha256')
+    .update(JSON.stringify([id, name, input]))
+    .digest('hex')
 }
 function inlineImage(block) {
   const source = block.source
@@ -99,7 +109,11 @@ export function antigravityNativeRequest(request) {
   const contents = request.messages.map((message) => {
     if (!['user', 'assistant'].includes(message.role) || !Array.isArray(message.content))
       reject('invalid_messages', 'Invalid structured message')
-    return { role: message.role === 'assistant' ? 'model' : 'user', parts: message.content.map(part) }
+    const parts = message.content.map(part)
+    // Gemini 3+ rejects a model turn whose function calls carry no signature (HTTP 400).
+    const calls = parts.filter((item) => item.functionCall)
+    if (calls.length && !calls.some((item) => item.thoughtSignature)) calls[0].thoughtSignature = SKIP_SIGNATURE
+    return { role: message.role === 'assistant' ? 'model' : 'user', parts }
   })
   const generationConfig = {}
   for (const [from, to] of Object.entries({
@@ -247,6 +261,34 @@ export function createAntigravityUpstream(config = {}, dependencies = {}) {
     projectToken,
     active = new Set(),
     closed = false
+  // Anthropic/OpenAI clients drop the non-standard tool signature, so replays are restored here.
+  const signatures = new Map()
+  function rememberSignature(block) {
+    const now = Date.now()
+    for (const [key, entry] of signatures) {
+      if (entry.expires > now && signatures.size < SIGNATURE_CACHE_LIMIT) break
+      signatures.delete(key)
+    }
+    const key = callKey(block.id, block.name, block.input)
+    signatures.delete(key)
+    signatures.set(key, { signature: block.thought_signature, expires: now + SIGNATURE_TTL_MS })
+  }
+  function withCachedSignatures(request) {
+    const now = Date.now()
+    let restored = false
+    const messages = request.messages.map((message) => {
+      if (message.role !== 'assistant') return message
+      const content = message.content.map((block) => {
+        if (block.type !== 'tool_use' || signature(block)) return block
+        const entry = signatures.get(callKey(block.id, block.name, block.input))
+        if (!entry || entry.expires <= now) return block
+        restored = true
+        return { ...block, thought_signature: entry.signature }
+      })
+      return { ...message, content }
+    })
+    return restored ? { ...request, messages } : request
+  }
   async function token(signal, force = false) {
     let value
     try {
@@ -299,6 +341,7 @@ export function createAntigravityUpstream(config = {}, dependencies = {}) {
         if (block[field] === sig) return
         if (block[field]) throw new Error('conflicting signature')
         block[field] = sig
+        if (block.type === 'tool_use') rememberSignature(block)
         if (block.type === 'thinking' && current === index)
           emit({ type: 'content_block_delta', index, delta: { type: 'signature_delta', signature: sig } })
         else emit({ type: 'thought_signature', index, signature: sig })
@@ -336,6 +379,7 @@ export function createAntigravityUpstream(config = {}, dependencies = {}) {
             input: call.args,
             ...(sig ? { thought_signature: sig } : {}),
           }
+          if (sig) rememberSignature(block)
           const index = content.length
           content.push(block)
           emit({ type: 'content_block_start', index, content_block: { ...block, input: {} } })
@@ -367,7 +411,7 @@ export function createAntigravityUpstream(config = {}, dependencies = {}) {
           projectToken === access && projectCache ? projectCache : await projectOf(access, controller.signal)
         projectCache = project
         projectToken = access
-        const native = antigravityNativeRequest(request)
+        const native = antigravityNativeRequest(withCachedSignatures(request))
         const send = () =>
           fetchImpl(`${CODE_ASSIST}/v1internal:streamGenerateContent?alt=sse`, {
             method: 'POST',

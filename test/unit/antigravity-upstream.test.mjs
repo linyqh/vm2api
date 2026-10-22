@@ -224,6 +224,55 @@ test('reasoning and function calls stream with IDs, JSON arguments, signatures a
   assert.ok(events.some((event) => event.delta?.partial_json === '{"city":"Paris"}'))
 })
 
+test('replayed tool calls missing their signature get the cached one, else the skip validator', async () => {
+  const bodies = []
+  const provider = upstream(async (_url, init) => {
+    bodies.push(JSON.parse(init.body).request)
+    return bodies.length === 1
+      ? sse([
+          result(
+            [{ functionCall: { id: 'call_1', name: 'read', args: { path: '/tmp' } }, thoughtSignature: 'tool-sig' }],
+            'STOP',
+          ),
+        ])
+      : sse([result([{ text: 'done' }], 'STOP')])
+  })
+  const tools = [{ name: 'read', input_schema: { type: 'object' } }]
+  assert.equal((await provider.infer({ ...basic, tools })).ok, true)
+  const replay = (id) => ({
+    ...basic,
+    tools,
+    messages: [
+      basic.messages[0],
+      {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'reasoning replayed as text' },
+          { type: 'tool_use', id, name: 'read', input: { path: '/tmp' } },
+          { type: 'tool_use', id: `${id}-b`, name: 'read', input: { path: '/b' } },
+        ],
+      },
+      {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: id, content: [{ type: 'text', text: 'ok' }] },
+          { type: 'tool_result', tool_use_id: `${id}-b`, content: [{ type: 'text', text: 'ok' }] },
+        ],
+      },
+    ],
+  })
+  assert.equal((await provider.infer(replay('call_1'))).ok, true)
+  assert.deepEqual(
+    bodies[1].contents[1].parts.map((part) => part.thoughtSignature),
+    [undefined, 'tool-sig', undefined],
+  )
+  assert.equal((await provider.infer(replay('call_unknown'))).ok, true)
+  assert.deepEqual(
+    bodies[2].contents[1].parts.map((part) => part.thoughtSignature),
+    [undefined, 'skip_thought_signature_validator', undefined],
+  )
+})
+
 test('partial streams cannot become successful and retain output commitment', async () => {
   const provider = upstream(async () => sse([result([{ text: 'partial' }])]))
   const response = await provider.infer(basic)

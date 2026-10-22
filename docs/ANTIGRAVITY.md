@@ -36,6 +36,8 @@ OAuth 会话按操作者、槽位和所属用户隔离，有效期 30 分钟。�
 
 适配层保留结构化的历史、system 指令、图片、工具定义、工具调用及工具结果；不将这些内容拼接为单个 prompt。无法表示的参数或内容会明确拒绝。模型返回工具调用后，由调用方执行工具，再将结果提交给后续请求；槽位不执行调用方的本地命令或函数。
 
+Gemini 3 及以上模型要求回传的工具调用携带 `thoughtSignature`，否则返回 HTTP 400。适配器在响应中通过 `tool_use.thought_signature`（Chat 为 `tool_calls[].thought_signature`）暴露签名，但标准 Anthropic / OpenAI SDK 会丢弃该字段。因此槽位运行时按工具调用 ID、名称与参数缓存签名 30 分钟（进程内，有条目上限），后续请求缺失签名时自动补回；未命中（过期、换槽位或运行时重启）时，对该轮首个工具调用填入 Google 规定的 `skip_thought_signature_validator`，保证请求可继续，代价是该轮推理上下文连续性减弱。
+
 图片支持 inline base64 与 data URL，远程 URL 图片会明确拒绝。工具与结构化输出的 `strict: true`、`parallel_tool_calls: false` / `disable_parallel_tool_use: true` 暂不支持，会在访问上游前拒绝；不会静默忽略这些约束。
 
 暂不支持生成前的 `count_tokens`；生成响应与日志返回上游提供的实际用量。
