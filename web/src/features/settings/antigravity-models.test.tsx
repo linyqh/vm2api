@@ -26,7 +26,7 @@ describe('global Antigravity settings', () => {
     expect(html).toContain('槽内客户端路径')
     expect(html).toContain('模型 ID，每行一个')
     expect(html).toContain('保存平台配置')
-    expect(html).toContain('同步账号模型并加入全局目录')
+    expect(html).toContain('同步账号模型')
     expect(html).not.toContain('提交授权码')
     client.clear()
   })

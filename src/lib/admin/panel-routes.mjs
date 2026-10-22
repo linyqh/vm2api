@@ -1541,16 +1541,9 @@ export function createPanelHandler(ctx) {
             error: { code: 'platform_mismatch', message: '此操作需要 Antigravity 槽位' },
           })
         const body = await readBody(req, 4096)
-        if (
-          !body ||
-          typeof body !== 'object' ||
-          Array.isArray(body) ||
-          Object.keys(body).some((key) => key !== 'publish_global') ||
-          ('publish_global' in body && typeof body.publish_global !== 'boolean')
-        )
+        if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).length)
           return json(res, 400, { ok: false, error: { code: 'invalid_request', message: '模型同步请求字段无效' } })
-        if (body.publish_global === true && panelIdentity(req).role !== 'admin')
-          return json(res, 403, { ok: false, error: { code: 'forbidden', message: '只有管理员可以发布全局模型目录' } })
+        const publishGlobal = panelIdentity(req).role === 'admin'
         const result = await (ctx.syncAntigravityModels || syncAntigravityModels)({
           projectRoot: cfg.paths.project,
           vm,
@@ -1559,16 +1552,19 @@ export function createPanelHandler(ctx) {
         })
         if (!result.ok)
           return json(res, result.status || 502, { ok: false, error: { code: result.code, message: result.message } })
-        if (body.publish_global === true) {
+        if (publishGlobal) {
           const routing = getRouting()
+          const config = normalizeAntigravityRouting(routing.antigravity)
           persistRoutingPatch({
             antigravity: {
-              ...normalizeAntigravityRouting(routing.antigravity),
+              ...config,
+              // The first catalog publish switches the platform on; later administrator choices are kept.
+              enabled: config.enabled || config.models.length === 0,
               models: mergeAntigravityCatalogModels(routing.antigravity?.models, result.models),
             },
           })
         }
-        return json(res, 200, panel.ok({ ...result, published_global: body.publish_global === true }))
+        return json(res, 200, panel.ok({ ...result, published_global: publishGlobal }))
       }
       const agQuotaRoute = p.match(/^\/api\/panel\/vms\/([^/]+)\/antigravity\/quota\/refresh$/)
       if (req.method === 'POST' && agQuotaRoute) {

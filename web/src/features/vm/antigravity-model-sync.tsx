@@ -5,6 +5,7 @@ import { api } from '@/lib/api'
 import { isAntigravityVm } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
+import { useVmPerms } from '@/features/vm/vm-perms'
 import { antigravityModelSyncRequest } from './antigravity-model-sync-api'
 import { vmsListQueryOptions } from './queries'
 
@@ -21,14 +22,9 @@ export type AntigravityModelCatalog = {
   }[]
 }
 
-export function AntigravityModelSync({
-  vmId,
-  publishGlobal = false,
-}: {
-  vmId?: string
-  publishGlobal?: boolean
-}) {
+export function AntigravityModelSync({ vmId }: { vmId?: string }) {
   const qc = useQueryClient()
+  const perms = useVmPerms()
   const [selected, setSelected] = useState('')
   const vms = useQuery({ ...vmsListQueryOptions(), enabled: !vmId })
   const slots = (vms.data?.items || []).filter(
@@ -37,19 +33,27 @@ export function AntigravityModelSync({
   const target = vmId || selected || slots[0]?.id || ''
   const sync = useMutation({
     mutationFn: async (id: string) => {
-      const request = antigravityModelSyncRequest(id, publishGlobal)
-      return api<AntigravityModelCatalog>(request.url, {
-        method: 'POST',
-        body: JSON.stringify(request.body),
-      })
+      const request = antigravityModelSyncRequest(id)
+      return api<AntigravityModelCatalog & { published_global?: boolean }>(
+        request.url,
+        {
+          method: 'POST',
+          body: JSON.stringify(request.body),
+        }
+      )
     },
     onSuccess: (data, id) => {
-      toast.success(`已同步 ${data.models.length} 个账号可用模型`)
+      toast.success(
+        data.published_global
+          ? `已同步 ${data.models.length} 个账号模型，并加入全局目录`
+          : `已同步 ${data.models.length} 个账号可用模型`
+      )
       void qc.invalidateQueries({ queryKey: ['panel', 'vm', id] })
       void qc.invalidateQueries({ queryKey: ['panel', 'vms'] })
-      if (publishGlobal) {
+      if (data.published_global) {
         void qc.invalidateQueries({ queryKey: ['panel', 'routing'] })
         void qc.invalidateQueries({ queryKey: ['panel', 'models'] })
+        void qc.invalidateQueries({ queryKey: ['panel', 'vm'] })
       }
     },
     onError: (error: Error) => toast.error(error.message),
@@ -82,13 +86,13 @@ export function AntigravityModelSync({
         disabled={!target || sync.isPending}
         onClick={() => sync.mutate(target)}
       >
-        {publishGlobal ? '同步账号模型并加入全局目录' : '同步账号模型'}
+        同步账号模型
       </Button>
       <p className='text-xs text-muted-foreground'>
         读取槽内官方客户端的模型目录，不发送推理请求。
-        {publishGlobal
-          ? '保留全局已有模型的启停与显示设置。'
-          : '仅更新当前槽位的可用模型。'}
+        {perms.admin
+          ? '新模型自动加入全局目录并启用；已有模型保留启停与显示设置。'
+          : '仅更新当前槽位的可用模型；加入全局目录需管理员同步。'}
       </p>
     </div>
   )

@@ -255,8 +255,8 @@ function AntigravityPanelContent({
               </select>
               {selected && !enabledIds.has(selected) ? (
                 <p className='text-xs text-muted-foreground'>
-                  该模型尚未加入全局目录或未启用，发送会被拒绝。请管理员在“设置
-                  → Antigravity”同步并启用。
+                  该模型尚未在全局目录启用，发送会被拒绝。请管理员在模型页
+                  Antigravity 分区启用。
                 </p>
               ) : null}
             </div>
@@ -454,7 +454,7 @@ export function AntigravitySettings() {
             onCheckedChange={setEnabled}
           />
         </div>
-        <AntigravityModelSync publishGlobal />
+        <AntigravityModelSync />
         <div className='space-y-1'>
           <Label htmlFor='agy-cli'>槽内客户端路径</Label>
           <Input

@@ -9,8 +9,8 @@ Antigravity 使用独立槽位、Google OAuth 和账号模型目录。控制面�
 1. 创建本机 Docker Antigravity 槽位并绑定独立出口。暂不支持远程节点与 KVM。
 2. 点击“绑定凭证 → 生成授权链接”，在本机浏览器完成 Google 授权，再将页面给出的单行授权码粘贴回面板。认证可以在平台接入关闭时执行；不会自动打开 API 调度。
 3. 镜像包含经 SHA-512 校验并固定为 1.4.4 的官方 Linux amd64 CLI；首次授权将其放入槽位 `/home/kincli/.local/bin/agy`。默认 `cli_bin: "agy"` 即可。
-4. 在槽位测试页点击“同步账号模型”，读取同一槽位中的官方 `agy models`。管理员也可在“设置 → Antigravity”选择已授权槽位，“同步账号模型并加入全局目录”。同步不发送推理请求。
-5. 在平台设置中启用 Antigravity API 接入，再开启所需槽位的调度开关。创建空槽时默认调度关闭。上游按推理强度拆分的变体（`-minimal` / `-low` / `-medium` / `-high`）会自动折叠为基础模型并汇总可用 `levels`；全局模型目录保留已有模型的禁用、可用 `levels`、显示名称及供应商设置，新增模型不会覆盖这些选择。
+4. 在槽位测试页、模型页 Antigravity 分区或“设置 → Antigravity”点击“同步账号模型”，读取同一槽位中的官方 `agy models`。管理员同步时新模型自动加入全局目录并启用；全局目录首次写入模型时自动开启 Antigravity API 接入。同步不发送推理请求。
+5. 开启所需槽位的调度开关（创建空槽时默认调度关闭）。模型页 Antigravity 分区可逐个启停模型或关闭 API 接入。上游按推理强度拆分的变体（`-minimal` / `-low` / `-medium` / `-high`）会自动折叠为基础模型并汇总可用 `levels`；全局模型目录保留已有模型的禁用、可用 `levels`、显示名称及供应商设置，新增模型不会覆盖这些选择，之后关闭的平台开关也不会被同步重新打开。
 6. 直接使用官方基础模型 ID（如 `gemini-4-argon`）调用 API，旧的 `antigravity/` 前缀已废弃并返回 `model_not_supported`。`gemini-*` 默认路由到 Antigravity；同名 Claude / GPT 模型（如 `claude-sonnet-5-5`、`gpt-oss-120b`）在使用 `antigravity` 分组密钥时路由到 Antigravity 槽位，其他密钥分组仍走原平台。
 7. 先验收首条生成，再验收历史、工具往返、流式取消、续聊，以及槽位重启后的授权持久化。
 
@@ -22,7 +22,7 @@ OAuth 会话按操作者、槽位和所属用户隔离，有效期 30 分钟。�
 
 账号目录来自该槽位的 `agy models`，保存在控制面私有目录 `data/antigravity-models/<slot-id>.json`（目录 700、文件 600）。该文件只含模型 ID、显示名称、供应商、更新时间、所属用户和认证版本标记，不含 token。目录不位于 guest 可写的 `run/`，读取拒绝符号链接；账号或所属用户变更后需要重新同步。
 
-普通用户只能同步自己的槽位目录。`publish_global: true` 仅管理员可用，普通用户不能借此修改全局配置。同步失败保留上次有效目录，但不会发布无效输出。尚未同步的槽位不会被假定支持任意模型。
+普通用户只能同步自己的槽位目录，不会修改全局配置；只有管理员同步会写入全局目录。同步失败保留上次有效目录，但不会发布无效输出。尚未同步的槽位不会被假定支持任意模型。
 
 ## API 与调度
 
@@ -69,7 +69,7 @@ Gemini 3 及以上模型要求回传的工具调用携带 `thoughtSignature`，�
 | `GET /api/panel/vms/:id/antigravity/oauth/session?session_id=...` | 读取本人的 OAuth 会话状态 |
 | `POST /api/panel/vms/:id/antigravity/oauth/complete` | 提交 `{session_id,code}` 给官方客户端 |
 | `POST /api/panel/vms/:id/antigravity/oauth/cancel` | 清理登录进程，保留已有凭证 |
-| `POST /api/panel/vms/:id/antigravity/models/sync` | `{publish_global?:boolean}`，同步当前账号模型 |
+| `POST /api/panel/vms/:id/antigravity/models/sync` | 请求体 `{}`，同步当前账号模型；管理员同步同时写入全局目录 |
 | `POST /api/panel/vms/:id/schedulable` | `{schedulable:boolean}`，开启前需已确认登录 |
 | `POST /api/panel/vms/:id/antigravity/chat` | 面板文本诊断：`{model,prompt,session_id}` |
 | `POST /api/panel/vms/:id/antigravity/close` | 显式关闭面板文本会话 |

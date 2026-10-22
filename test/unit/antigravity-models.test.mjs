@@ -169,37 +169,43 @@ function panel(root, role, owner, body, extra = {}) {
   }
 }
 
-test('only owners and admins sync; only admins publish global catalog', async (t) => {
+test('owners sync their slot; admin syncs publish the global catalog', async (t) => {
   const root = fixture(t)
   let calls = 0
   const syncAntigravityModels = async () => {
     calls++
     return { ok: true, models: parseAntigravityModels(stdout), updated_at: new Date().toISOString() }
   }
-  for (const [role, owner, body] of [
-    ['user', 'other', {}],
-    ['super', 'owner', {}],
-    ['user', 'owner', { publish_global: true }],
+  for (const [role, owner, body, status] of [
+    ['user', 'other', {}, [403, 404]],
+    ['super', 'owner', {}, [403, 404]],
+    ['user', 'owner', { publish_global: true }, [400]],
   ]) {
     const res = await panel(root, role, owner, body, { syncAntigravityModels })()
-    assert.ok([403, 404].includes(res.status), JSON.stringify(res.body))
+    assert.ok(status.includes(res.status), JSON.stringify(res.body))
   }
   assert.equal(calls, 0)
-  const own = await panel(root, 'user', 'owner', {}, { syncAntigravityModels })()
+  let patch
+  const persistRoutingPatch = (value) => {
+    patch = value
+  }
+  const own = await panel(root, 'user', 'owner', {}, { syncAntigravityModels, persistRoutingPatch })()
   assert.equal(own.status, 200)
   assert.equal(own.body.data.published_global, false)
-  let patch
+  assert.equal(patch, undefined)
+  const fresh = await panel(root, 'admin', 'admin', {}, { syncAntigravityModels, persistRoutingPatch })()
+  assert.equal(fresh.body.data.published_global, true)
+  assert.equal(patch.antigravity.enabled, true)
+  assert.ok(patch.antigravity.models.length > 0 && patch.antigravity.models.every((model) => model.enabled))
   const admin = await panel(
     root,
     'admin',
     'admin',
-    { publish_global: true },
+    {},
     {
       syncAntigravityModels,
       routingConfig: { antigravity: { enabled: false, models: [{ id: 'gemini-example', enabled: false }] } },
-      persistRoutingPatch(value) {
-        patch = value
-      },
+      persistRoutingPatch,
     },
   )()
   assert.equal(admin.status, 200, JSON.stringify(admin.body))

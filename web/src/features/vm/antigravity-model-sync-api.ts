@@ -1,9 +1,6 @@
-export function antigravityModelSyncRequest(
-  vmId: string,
-  publishGlobal = false
-) {
+export function antigravityModelSyncRequest(vmId: string) {
   return {
     url: `/api/panel/vms/${encodeURIComponent(vmId)}/antigravity/models/sync`,
-    body: { publish_global: publishGlobal },
+    body: {},
   }
 }
