@@ -153,7 +153,7 @@ import {
   listAntigravityPublicModels,
   normalizeAntigravityRouting,
 } from '../protocol/antigravity-route.mjs'
-import { prepareAntigravityChat, antigravityStatusView, scopeAntigravitySession } from './antigravity-panel.mjs'
+import { antigravityStatusView } from './antigravity-panel.mjs'
 import {
   readAntigravityModelCatalog,
   foldAntigravityModelCatalog,
@@ -161,8 +161,7 @@ import {
   mergeAntigravityCatalogModels,
 } from '../oauth/antigravity-models.mjs'
 import { readAntigravityQuota, refreshAntigravityQuota } from '../oauth/antigravity-quota.mjs'
-import { closeAntigravityTextSession } from '../transport/antigravity-bridge-client.mjs'
-import { antigravityBridgeStatus, runAntigravityText } from '../transport/antigravity-bridge-supervisor.mjs'
+import { antigravityBridgeStatus } from '../transport/antigravity-bridge-supervisor.mjs'
 import {
   startAntigravityAuthLogin,
   readAntigravityAuthLogin,
@@ -1417,7 +1416,7 @@ export function createPanelHandler(ctx) {
         const candidate = getVm(cfg.paths.project, agPath[1])
         if (
           isAntigravityVm(candidate) &&
-          /^(oauth(?:\/|$)|credential(?:\/|$)|activate$|claude-reset(?:\/|$)|openai-quota(?:\/|$)|count-tokens$|probe$|test-chat$|diagnose$|official-cc-bootstrap(?:\/|$)|wrap-cli(?:\/|$)|seed-settings$|recreate$|package$|recover$|reset-fingerprint$)/.test(
+          /^(oauth(?:\/|$)|credential(?:\/|$)|activate$|claude-reset(?:\/|$)|openai-quota(?:\/|$)|count-tokens$|probe$|diagnose$|official-cc-bootstrap(?:\/|$)|wrap-cli(?:\/|$)|seed-settings$|recreate$|package$|recover$|reset-fingerprint$)/.test(
             agPath[2],
           )
         ) {
@@ -1581,12 +1580,9 @@ export function createPanelHandler(ctx) {
         const { ok: _ok, ...quota } = result
         return json(res, 200, panel.ok(quota))
       }
-      const agRoute = p.match(/^\/api\/panel\/vms\/([^/]+)\/antigravity\/(status|chat|close)$/)
-      if (
-        agRoute &&
-        ((req.method === 'GET' && agRoute[2] === 'status') || (req.method === 'POST' && agRoute[2] !== 'status'))
-      ) {
-        const vm = isValidVmId(agRoute[1]) ? getVm(cfg.paths.project, agRoute[1]) : null
+      const agStatusRoute = p.match(/^\/api\/panel\/vms\/([^/]+)\/antigravity\/status$/)
+      if (req.method === 'GET' && agStatusRoute) {
+        const vm = isValidVmId(agStatusRoute[1]) ? getVm(cfg.paths.project, agStatusRoute[1]) : null
         if (!vm) return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: '槽位不存在' } })
         if (!isAntigravityVm(vm))
           return json(res, 400, {
@@ -1595,92 +1591,23 @@ export function createPanelHandler(ctx) {
           })
         const routing = getRouting()
         const projectRoot = cfg.paths.project
-        if (agRoute[2] === 'status') {
-          const runtime = await (ctx.antigravityBridgeStatus || antigravityBridgeStatus)({ projectRoot, vm, routing })
-          const auth = summarizeAntigravitySlot(projectRoot, vm)
-          return json(
-            res,
-            200,
-            panel.ok({
-              ...antigravityStatusView({
-                routing,
-                runtime: {
-                  ...runtime,
-                  authenticated:
-                    typeof runtime.authenticated === 'boolean' ? runtime.authenticated : auth.authenticated,
-                },
-              }),
-              model_catalog: foldAntigravityModelCatalog(readAntigravityModelCatalog(projectRoot, vm)),
-              quota: readAntigravityQuota(projectRoot, vm),
-            }),
-          )
-        }
-        const actor = req.panelUserId ? `id:${req.panelUserId}` : `login:${panelIdentity(req).user || 'master'}`
-        const body = await readBody(req, 128 * 1024)
-        if (agRoute[2] === 'close') {
-          const sessionId = scopeAntigravitySession(body?.session_id, actor)
-          if (!sessionId || Object.keys(body).some((key) => key !== 'session_id')) {
-            return json(res, 400, {
-              ok: false,
-              error: { code: 'invalid_session_id', message: '需要有效的 session_id' },
-            })
-          }
-          const result = await (ctx.closeAntigravityTextSession || closeAntigravityTextSession)({
-            projectRoot,
-            vm,
-            routing,
-            sessionId,
-          })
-          if (!result.ok)
-            return json(res, 503, {
-              ok: false,
-              error: { code: result.code || 'antigravity_close_failed', message: result.message || '会话关闭失败' },
-            })
-          return json(res, 200, panel.ok({ closed: true }))
-        }
-        const prepared = prepareAntigravityChat({ vm, routing, body, actor })
-        if (!prepared.ok) return json(res, prepared.status, { ok: false, error: prepared.error })
-        const controller = new AbortController()
-        const abort = () => controller.abort()
-        req.once?.('aborted', abort)
-        res.once?.('close', abort)
-        try {
-          const result = await (ctx.runAntigravityText || runAntigravityText)({
-            projectRoot,
-            vm,
-            routing,
-            model: prepared.model,
-            prompt: prepared.prompt,
-            sessionId: prepared.bridgeSessionId,
-            signal: controller.signal,
-          })
-          if (!result.ok) {
-            const status =
-              Number.isInteger(result.status) && result.status >= 400 && result.status <= 599 ? result.status : 502
-            return json(res, status, {
-              ok: false,
-              error: {
-                code: result.code || 'antigravity_session_failed',
-                message: result.message || 'Antigravity 会话失败',
+        const runtime = await (ctx.antigravityBridgeStatus || antigravityBridgeStatus)({ projectRoot, vm, routing })
+        const auth = summarizeAntigravitySlot(projectRoot, vm)
+        return json(
+          res,
+          200,
+          panel.ok({
+            ...antigravityStatusView({
+              routing,
+              runtime: {
+                ...runtime,
+                authenticated: typeof runtime.authenticated === 'boolean' ? runtime.authenticated : auth.authenticated,
               },
-            })
-          }
-          return json(
-            res,
-            200,
-            panel.ok({
-              ok: true,
-              text: result.response || '',
-              session_id: prepared.sessionId,
-              usage: result.usage || null,
-              usage_cumulative: result.usage_cumulative || null,
-              terminalState: result.terminalState,
             }),
-          )
-        } finally {
-          req.removeListener?.('aborted', abort)
-          res.removeListener?.('close', abort)
-        }
+            model_catalog: foldAntigravityModelCatalog(readAntigravityModelCatalog(projectRoot, vm)),
+            quota: readAntigravityQuota(projectRoot, vm),
+          }),
+        )
       }
       if ((req.method === 'GET' || req.method === 'PUT') && p === '/api/panel/onboarding') {
         if (req.method === 'PUT') {

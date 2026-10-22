@@ -404,7 +404,7 @@ export function ModelRow({
   )
 }
 
-function Panel({
+export function Panel({
   title,
   icon,
   compact,
@@ -426,7 +426,7 @@ function Panel({
   )
 }
 
-function EditorRow({
+export function EditorRow({
   label,
   children,
 }: {
@@ -443,7 +443,7 @@ function EditorRow({
   )
 }
 
-function Metric({
+export function Metric({
   label,
   value,
   strong,
@@ -464,7 +464,7 @@ function Metric({
   )
 }
 
-function Fact({
+export function Fact({
   label,
   value,
   mono,

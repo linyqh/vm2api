@@ -15,7 +15,7 @@ export function useVmTestChat(vm: Vm) {
   const canTest = useVmPerms().testModels
   const testModels = useQuery({
     ...testModelsQueryOptions(id),
-    enabled: canTest && !!id && !isAntigravityVm(vm),
+    enabled: canTest && !!id,
   })
   const [prompt, setPrompt] = useState('hello')
   const [model, setModel] = useState('')
@@ -87,7 +87,9 @@ export function useVmTestChat(vm: Vm) {
             prompt,
             ...(isCodexVm(vm)
               ? { reasoning_effort: reasoningEffort }
-              : { max_tokens: maxTokens }),
+              : isAntigravityVm(vm)
+                ? { max_tokens: maxTokens, reasoning_effort: reasoningEffort }
+                : { max_tokens: maxTokens }),
           }),
         }
       ),

@@ -727,10 +727,18 @@ export type OfficialCcBootstrapPayload = {
   status?: OfficialCcStatus
 }
 
+export type TestModelOption = {
+  id: string
+  label?: string
+  display_name?: string
+  family?: string
+  reasoning_levels?: string[]
+}
+
 export type TestModelsPayload = {
-  items?: { id: string; label?: string; family?: string }[]
-  models?: { id: string; label?: string; family?: string }[]
-  platform?: 'openai' | 'anthropic' | 'all'
+  items?: TestModelOption[]
+  models?: TestModelOption[]
+  platform?: 'openai' | 'anthropic' | 'antigravity' | 'all'
   protocol?: 'openai.responses' | 'anthropic.messages' | null
   inbound_path?: '/v1/responses' | '/v1/messages' | null
   source?: string

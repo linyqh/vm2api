@@ -71,8 +71,7 @@ Gemini 3 及以上模型要求回传的工具调用携带 `thoughtSignature`，�
 | `POST /api/panel/vms/:id/antigravity/oauth/cancel` | 清理登录进程，保留已有凭证 |
 | `POST /api/panel/vms/:id/antigravity/models/sync` | 请求体 `{}`，同步当前账号模型；管理员同步同时写入全局目录 |
 | `POST /api/panel/vms/:id/schedulable` | `{schedulable:boolean}`，开启前需已确认登录 |
-| `POST /api/panel/vms/:id/antigravity/chat` | 面板文本诊断：`{model,prompt,session_id}` |
-| `POST /api/panel/vms/:id/antigravity/close` | 显式关闭面板文本会话 |
+| `POST /api/panel/vms/:id/test-chat` | 测试链接：`{model,prompt,max_tokens?,reasoning_effort?}`，经 `/v1/messages` 固定到该槽位，与 Claude / GPT 槽位相同 |
 
 响应使用 `{ok:true,data:{...}}` 或 `{ok:false,error:{code,message}}`。`authenticated: null` 表示尚未确认登录；`ready` 只表示运行时健康，不能证明真实推理已经成功。
 

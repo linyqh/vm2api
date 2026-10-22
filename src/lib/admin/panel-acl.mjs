@@ -187,8 +187,6 @@ function userVmPathAllowed(method, path) {
     if (head === 'official-cc-bootstrap' || head === 'wrap-cli' || head === 'reset-fingerprint') return false
     if (head === 'owner') return false
     return (
-      rest === 'antigravity/chat' ||
-      rest === 'antigravity/close' ||
       rest === 'antigravity/models/sync' ||
       rest === 'antigravity/quota/refresh' ||
       ['antigravity/oauth/start', 'antigravity/oauth/complete', 'antigravity/oauth/cancel'].includes(rest) ||

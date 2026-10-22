@@ -1,4 +1,4 @@
-import type { Vm } from '@/types/panel-vm'
+import type { TestModelOption, Vm } from '@/types/panel-vm'
 import { type CredType, credTypeLabel } from '@/lib/cred-type'
 import { isAntigravityVm } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
@@ -14,7 +14,6 @@ import {
 } from '@/components/ui/select'
 import { TabsContent } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
-import { AntigravityPanel } from '@/features/vm/antigravity-panel'
 import {
   DATAPLANE_HINT,
   HOP_TRANSPORT_LABEL,
@@ -25,7 +24,7 @@ import type { TestChatResult } from '@/features/vm/test-chat-types'
 
 type VmTestTabProps = {
   vm: Vm
-  models: { id: string; label?: string; display_name?: string }[]
+  models: TestModelOption[]
   model: string
   prompt: string
   maxTokens: number
@@ -65,10 +64,6 @@ export function VmTestTab(props: VmTestTabProps) {
 
 /** 不依赖 Tabs 上下文的测试面板，详情页 Tab 与弹窗共用。 */
 export function VmTestPanel(props: VmTestTabProps & { className?: string }) {
-  if (isAntigravityVm(props.vm))
-    return (
-      <AntigravityPanel key={props.vm.id} vm={props.vm} showSettings={false} />
-    )
   const {
     vm,
     models,
@@ -91,6 +86,9 @@ export function VmTestPanel(props: VmTestTabProps & { className?: string }) {
     canRefreshModels = true,
     schedule,
   } = props
+  const antigravity = isAntigravityVm(vm)
+  const selectedModel = models.find((m) => m.id === model) || models[0]
+  const agEfforts = ['default', ...(selectedModel?.reasoning_levels || [])]
 
   return (
     <>
@@ -124,57 +122,87 @@ export function VmTestPanel(props: VmTestTabProps & { className?: string }) {
               onChange={(event) => onPromptChange(event.target.value)}
             />
           </div>
-          <div className='space-y-1.5'>
-            <Label>{isCodex ? '思考档位' : '思考预算'}</Label>
-            {isCodex ? (
-              <Select
-                value={reasoningEffort}
-                onValueChange={onReasoningEffortChange}
-              >
-                <SelectTrigger className='w-40'>
-                  <SelectValue placeholder='medium' />
-                </SelectTrigger>
-                <SelectContent>
-                  {CODEX_EFFORTS.map((item) => (
-                    <SelectItem key={item.id} value={item.id}>
-                      {item.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            ) : (
-              <Input
-                type='number'
-                min={1}
-                max={128000}
-                className='w-32'
-                value={maxTokens}
-                onChange={(event) => {
-                  const value = Number(event.target.value)
-                  onMaxTokensChange(
-                    !Number.isFinite(value) || value <= 0
-                      ? 8192
-                      : Math.min(128000, Math.max(1, Math.floor(value)))
-                  )
-                }}
-              />
-            )}
+          <div className='flex flex-wrap gap-3'>
+            {antigravity ? (
+              <div className='space-y-1.5'>
+                <Label>推理强度</Label>
+                <Select
+                  value={
+                    agEfforts.includes(reasoningEffort)
+                      ? reasoningEffort
+                      : 'default'
+                  }
+                  onValueChange={onReasoningEffortChange}
+                >
+                  <SelectTrigger className='w-40'>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {agEfforts.map((level) => (
+                      <SelectItem key={level} value={level}>
+                        {level === 'default' ? '默认' : level}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            ) : null}
+            <div className='space-y-1.5'>
+              <Label>
+                {isCodex ? '思考档位' : antigravity ? '最大输出' : '思考预算'}
+              </Label>
+              {isCodex ? (
+                <Select
+                  value={reasoningEffort}
+                  onValueChange={onReasoningEffortChange}
+                >
+                  <SelectTrigger className='w-40'>
+                    <SelectValue placeholder='medium' />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {CODEX_EFFORTS.map((item) => (
+                      <SelectItem key={item.id} value={item.id}>
+                        {item.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              ) : (
+                <Input
+                  type='number'
+                  min={1}
+                  max={128000}
+                  className='w-32'
+                  value={maxTokens}
+                  onChange={(event) => {
+                    const value = Number(event.target.value)
+                    onMaxTokensChange(
+                      !Number.isFinite(value) || value <= 0
+                        ? 8192
+                        : Math.min(128000, Math.max(1, Math.floor(value)))
+                    )
+                  }}
+                />
+              )}
+            </div>
           </div>
           <div className='space-y-1'>
             <Label>凭证</Label>
             <p className='text-xs text-muted-foreground'>
-              {isCodex
-                ? 'GPT OAuth · Codex kernel / OpenAI Responses'
-                : credType === 'none'
-                  ? '无凭证 · 测试会被拒绝，请先导入凭证'
-                  : `${credTypeLabel(credType)}${
-                      credType === 'setup-token' || credType === 'apikey'
-                        ? ' · 按 inference 入站，不走官方 Claude Code 四门'
-                        : ' · 官方 Claude Code 入站'
-                    }`}
+              {antigravity
+                ? 'Antigravity OAuth · 槽内官方客户端 · Messages 入站'
+                : isCodex
+                  ? 'GPT OAuth · Codex kernel / OpenAI Responses'
+                  : credType === 'none'
+                    ? '无凭证 · 测试会被拒绝，请先导入凭证'
+                    : `${credTypeLabel(credType)}${
+                        credType === 'setup-token' || credType === 'apikey'
+                          ? ' · 按 inference 入站，不走官方 Claude Code 四门'
+                          : ' · 官方 Claude Code 入站'
+                      }`}
             </p>
           </div>
-          {isCodex ? null : (
+          {isCodex || antigravity ? null : (
             <div className='space-y-1'>
               <Label>内核</Label>
               <p className='text-xs text-muted-foreground'>

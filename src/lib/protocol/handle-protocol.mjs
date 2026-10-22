@@ -154,6 +154,7 @@ import {
   thinkingOwners as defaultThinkingOwners,
 } from '../pool/thinking-owner.mjs'
 import { getVm } from '../vm/vm-registry.mjs'
+import { isAntigravityVm } from '../vm/vm-kind.mjs'
 import { credentialModeFromOauth, isApiKeyMode } from '../oauth/credential-mode.mjs'
 import {
   prepareAnthropicRequest,
@@ -566,8 +567,13 @@ export function createHandleProtocol(deps) {
     // model are third-party by construction. Master-key pinned calls are the panel's own
     // test chat and health monitor, not inbound clients.
     const routingNow = getRouting()
-    const groupType = keyScopeFromRequest(req).group_type
-    const panelDiagnostics = req.apiKeyKind === 'master' && isValidVmId(String(req.headers['x-kin-vm'] || '').trim())
+    const pinnedVmId = String(req.headers['x-kin-vm'] || '').trim()
+    const panelDiagnostics = req.apiKeyKind === 'master' && isValidVmId(pinnedVmId)
+    // A panel test pinned to an Antigravity slot reaches that slot even for same-name Claude/GPT IDs.
+    const groupType =
+      panelDiagnostics && cfg.paths?.project && isAntigravityVm(getVm(cfg.paths.project, pinnedVmId))
+        ? 'antigravity'
+        : keyScopeFromRequest(req).group_type
     if (
       claudeCodeOnlyFromRouting(routingNow) &&
       !panelDiagnostics &&

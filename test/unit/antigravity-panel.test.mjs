@@ -7,7 +7,6 @@ import path from 'node:path'
 import { EventEmitter } from 'node:events'
 import { createPanelHandler } from '../../src/lib/admin/panel-routes.mjs'
 import { createRoutingRuntime } from '../../src/lib/admin/routing-runtime.mjs'
-import { prepareAntigravityChat, scopeAntigravitySession } from '../../src/lib/admin/antigravity-panel.mjs'
 import { buildVmDetail, buildVmList } from '../../src/lib/admin/panel-api.mjs'
 import { antigravityPoolRuntime } from '../../src/lib/pool/antigravity-slot-pool.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
@@ -158,88 +157,44 @@ test('routing PUT persists Antigravity settings and GET returns them for the set
   assert.doesNotMatch(JSON.stringify(h.response.body), /private-cli-token/)
 })
 
-test('experimental input rejects history, tools, disallowed models and invalid session ids', () => {
-  const good = { model: 'gemini-example', prompt: 'hello' }
-  assert.equal(prepareAntigravityChat({ vm, routing, body: good }).model, 'gemini-example-medium')
-  assert.equal(
-    prepareAntigravityChat({ vm, routing, body: { ...good, model: 'antigravity/gemini-example' } }).ok,
-    false,
-  )
-  for (const body of [
-    { ...good, messages: [] },
-    { ...good, tools: [] },
-    { ...good, system: 'x' },
-    { ...good, model: 'gpt-5' },
-    { ...good, prompt: '' },
-    { ...good, session_id: '../x' },
-  ])
-    assert.equal(prepareAntigravityChat({ vm, routing, body }).ok, false)
-  assert.equal(prepareAntigravityChat({ vm, routing: {}, body: good }).status, 503)
-  assert.equal(
-    prepareAntigravityChat({ vm: { ...vm, policy: { allowed_models: ['other'] } }, routing, body: good }).status,
-    403,
-  )
-  assert.notEqual(scopeAntigravitySession('session', 'alice'), scopeAntigravitySession('session', 'bob'))
-})
-
-test('tenant chat uses a scoped session, returns verified text, and close reuses that scope', async (t) => {
+test('a pinned panel test on an Antigravity slot routes same-name Claude IDs to Antigravity', async (t) => {
   const project = fixture(t)
-  let bridgeId
-  const h = harness(
-    project,
-    tenant,
-    { model: 'gemini-example', prompt: 'hello', session_id: 'session-1' },
-    {
-      runAntigravityText: async (input) => {
-        bridgeId = input.sessionId
-        assert.equal(input.model, 'gemini-example-medium')
-        assert.equal(input.prompt, 'hello')
-        assert.equal(input.signal.aborted, false)
-        return { ok: true, response: 'world', terminalState: 'verified', usage: { input_tokens: 2 } }
+  const res = Object.assign(new EventEmitter(), { headersSent: false })
+  const body = { model: 'claude-example', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }
+  let pickedFrom = null
+  const handler = createHandleProtocol({
+    cfg: {
+      rewrite: { enabled: false },
+      intercept: { rules: [] },
+      limits: { max_body_bytes: 1024 },
+      paths: { project },
+    },
+    requireAuth: () => true,
+    readBody: async () => body,
+    json(_res, status, payload) {
+      Object.assign(res, { status, body: payload })
+    },
+    requestLog: { start: () => ({ request_id: 'ag-pinned' }), finish() {} },
+    stats: { errors: 0 },
+    groupsRepo: { rateMultiplier: () => 1 },
+    getRoutingConfig: () => ({ antigravity: { enabled: true, models: ['claude-example'] } }),
+    antigravityOps: {
+      listVms: (root) => {
+        pickedFrom = root
+        return []
       },
     },
-  )
-  await h.call('POST', 'vms/vm-ag/antigravity/chat')
-  assert.equal(h.response.status, 200, JSON.stringify(h.response.body))
-  assert.deepEqual(h.response.body.data.text, 'world')
-  assert.equal(h.response.body.data.session_id, 'session-1')
-  assert.notEqual(bridgeId, 'session-1')
-  const close = harness(
-    project,
-    tenant,
-    { session_id: 'session-1' },
-    {
-      routingConfig: {}, // Disabling new calls must still allow cleanup.
-      closeAntigravityTextSession: async (input) => {
-        assert.equal(input.sessionId, bridgeId)
-        return { ok: true }
-      },
+    getFailoverRunner() {
+      throw new Error('must not schedule Claude')
     },
+  })
+  await handler.handleProtocol(
+    Object.assign(new EventEmitter(), { headers: { 'x-kin-vm': vm.id }, apiKeyKind: 'master' }),
+    res,
+    'anthropic.messages',
+    '/v1/messages',
   )
-  await close.call('POST', 'vms/vm-ag/antigravity/close')
-  assert.equal(close.response.status, 200)
-  assert.equal(close.response.body.data.closed, true)
-})
-
-test('foreign tenants and read-only operators cannot start text sessions', async (t) => {
-  const project = fixture(t)
-  for (const who of [
-    { ...tenant, panelUserId: 'u-2' },
-    { panelUser: 'operator', panelRole: 'super' },
-  ]) {
-    const h = harness(
-      project,
-      who,
-      { model: 'gemini-example', prompt: 'hello' },
-      {
-        runAntigravityText() {
-          throw new Error('must not run')
-        },
-      },
-    )
-    await h.call('POST', 'vms/vm-ag/antigravity/chat')
-    assert.ok([403, 404].includes(h.response.status), JSON.stringify(h.response.body))
-  }
+  assert.equal(pickedFrom, project, JSON.stringify(res.body))
 })
 
 test('Antigravity OAuth routes bind the caller and return public session fields only', async (t) => {

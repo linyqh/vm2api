@@ -180,7 +180,8 @@ export function VmStatusBoard(props: Props) {
       <section className='space-y-3 rounded-lg border bg-card p-4'>
         <h2 className='text-lg font-semibold'>Antigravity · 官方客户端接入</h2>
         <p className='text-sm text-muted-foreground'>
-          在账号页检查官方客户端登录和独立运行时状态；在测试页使用显式会话进行纯文本测试。
+          在账号页检查官方客户端登录和独立运行时状态；在测试页发一条真实对话验证凭证、代理与槽位
+          bridge 整条链路。
         </p>
         <p className='text-xs text-muted-foreground'>
           支持 Messages、Chat Completions 与 Responses
