@@ -2935,11 +2935,48 @@ export function createPanelHandler(ctx) {
         const body = await readBody(req, 8192).catch(() => ({}))
         const currentVm = getVm(cfg.paths.project, id)
         if (!currentVm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        if (isAntigravityVm(currentVm))
-          return json(res, 400, {
-            ok: false,
-            error: { code: 'antigravity_operation_unsupported', message: 'Antigravity 实验槽请使用专用配置面板' },
+        if (isAntigravityVm(currentVm)) {
+          const keys = Object.keys(body || {})
+          if (keys.length !== 1 || keys[0] !== 'max_concurrency')
+            return json(res, 400, {
+              ok: false,
+              error: {
+                code: 'antigravity_operation_unsupported',
+                message: 'Antigravity 槽位仅支持修改 max_concurrency，其他配置请使用专用面板',
+              },
+            })
+          const { max_sessions: ceiling } = normalizeAntigravityRouting(ctx.routingConfig?.antigravity)
+          const value = body.max_concurrency
+          if (value !== null && (!Number.isInteger(value) || value < 1 || value > ceiling))
+            return json(res, 400, {
+              ok: false,
+              error: {
+                code: 'invalid_scheduling_value',
+                message: `max_concurrency 必须是 1 到 ${ceiling}（antigravity.max_sessions）的整数，或 null 跟随全局`,
+              },
+            })
+          patchVmRecord(cfg.paths.project, id, (vm) => {
+            const policy = { ...(vm.policy || {}) }
+            if (value === null) delete policy.maxConcurrency
+            else policy.maxConcurrency = value
+            policy.concurrencyOverride = value !== null
+            vm.policy = policy
+            return vm
           })
+          const detail = await panel.buildVmDetail({
+            cfg,
+            accountQuota,
+            id,
+            routingConfig: ctx.routingConfig,
+            poolScheduler: ctx.poolScheduler,
+            requestLog,
+            proxyPool,
+            kernelHealth: panelKernelHealth,
+            clusterNodes: clusterNodesOf(ctx),
+            role: panelIdentity(req).role,
+          })
+          return json(res, 200, detail)
+        }
         const strictInteger = (value, min, max, label, { nullable = false } = {}) => {
           if (nullable && value === null) return null
           if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value)) {

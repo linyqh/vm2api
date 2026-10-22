@@ -65,6 +65,7 @@ test('routing GET exposes Antigravity defaults and only normalized public config
     max_sessions: 1,
     idle_ttl_seconds: 600,
     timeout_ms: 180000,
+    queue_timeout_ms: 120000,
   }
   const h = harness(
     project,
@@ -134,6 +135,7 @@ test('routing PUT persists Antigravity settings and GET returns them for the set
     max_sessions: 3,
     idle_ttl_seconds: 900,
     timeout_ms: 240000,
+    queue_timeout_ms: 90000,
   }
   const h = harness(
     project,
@@ -520,6 +522,37 @@ test('AG rejects unrelated generic credential mutations', async (t) => {
     await h.call(method, suffix)
     assert.equal(h.response.status, 400, `${suffix}: ${JSON.stringify(h.response.body)}`)
   }
+})
+
+test('AG slot concurrency follows max_sessions unless PATCH pins it within that ceiling', async (t) => {
+  const project = fixture(t)
+  const vmPath = path.join(project, 'vms', `${vm.id}.json`)
+  // Records created by earlier releases carry maxConcurrency 1 without an override flag.
+  fs.writeFileSync(vmPath, JSON.stringify({ ...vm, policy: { maxConcurrency: 1, maxRpm: 0, maxSessions: 1 } }))
+  const routingConfig = { antigravity: { ...routing.antigravity, max_sessions: 4 } }
+  const concurrencyOf = async () =>
+    (await buildVmList({ cfg: { paths: { project } }, routingConfig })).data.items[0].max_concurrency
+  assert.equal(await concurrencyOf(), 4)
+
+  const pin = harness(project, admin, { max_concurrency: 2 }, { routingConfig })
+  await pin.call('PATCH', 'vms/vm-ag')
+  assert.equal(pin.response.status, 200, JSON.stringify(pin.response.body))
+  assert.equal(pin.response.body.data.vm.max_concurrency, 2)
+  assert.equal(pin.response.body.data.vm.concurrency_override, true)
+  assert.equal(await concurrencyOf(), 2)
+
+  for (const body of [{ max_concurrency: 5 }, { max_concurrency: 0 }, { max_concurrency: 1, max_rpm: 3 }]) {
+    const rejected = harness(project, admin, body, { routingConfig })
+    await rejected.call('PATCH', 'vms/vm-ag')
+    assert.equal(rejected.response.status, 400, JSON.stringify(body))
+  }
+  assert.equal(await concurrencyOf(), 2)
+
+  const follow = harness(project, admin, { max_concurrency: null }, { routingConfig })
+  await follow.call('PATCH', 'vms/vm-ag')
+  assert.equal(follow.response.status, 200, JSON.stringify(follow.response.body))
+  assert.equal(await concurrencyOf(), 4)
+  assert.equal(JSON.parse(fs.readFileSync(vmPath, 'utf8')).policy.concurrencyOverride, false)
 })
 
 test('generic AG requests use independent admission and never use the Claude scheduler', async () => {

@@ -177,10 +177,8 @@ export function pickAntigravityCandidates(
       continue
     }
     const state = runtime.snapshot(vm.id)
-    const concurrency = Math.max(
-      1,
-      Math.min(config.max_sessions, Number(vm.max_concurrency ?? vm.policy?.maxConcurrency) || config.max_sessions),
-    )
+    // listVms summaries already resolve the slot pin against the global `max_sessions`.
+    const concurrency = Math.max(1, Math.min(config.max_sessions, Number(vm.max_concurrency) || config.max_sessions))
     const maxRpm = Math.max(0, Number(vm.max_rpm ?? vm.policy?.maxRpm) || 0)
     if (state.holdUntil > now) {
       retryAt = Math.min(retryAt || Infinity, state.holdUntil)

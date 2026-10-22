@@ -419,8 +419,9 @@ function controlsOf(body, request) {
   }
   if (body.n != null && body.n !== 1) unsupported('Only one completion is supported', 'n')
   if (body.background === true) unsupported('Background Responses are not supported', 'background')
-  if (Array.isArray(body.include) && body.include.length)
-    unsupported('Additional Responses include fields are not supported', 'include')
+  // Reasoning items already carry summary + signature; no encrypted_content is ever emitted.
+  const include = Array.isArray(body.include) ? body.include.filter((v) => v !== 'reasoning.encrypted_content') : []
+  if (include.length) unsupported(`Responses include ${include.join(', ')} is not supported`, 'include')
   if (body.truncation && body.truncation !== 'disabled')
     unsupported('Automatic input truncation is not supported', 'truncation')
   if (body.parallel_tool_calls != null && typeof body.parallel_tool_calls !== 'boolean')

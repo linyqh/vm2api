@@ -24,6 +24,8 @@ export function AntigravitySettings() {
   const routing = useQuery(routingQueryOptions())
   const [enabled, setEnabled] = useState(false)
   const [cli, setCli] = useState('agy')
+  const [maxSessions, setMaxSessions] = useState('1')
+  const [queueSec, setQueueSec] = useState('120')
   const [models, setModels] = useState('')
   const [levels, setLevels] = useState<
     Record<string, AntigravityReasoningLevel[]>
@@ -33,6 +35,8 @@ export function AntigravitySettings() {
     const value = (routing.data.antigravity || {}) as Record<string, unknown>
     setEnabled(value.enabled === true)
     setCli(typeof value.cli_bin === 'string' ? value.cli_bin : 'agy')
+    setMaxSessions(String(value.max_sessions ?? 1))
+    setQueueSec(String(Number(value.queue_timeout_ms ?? 120000) / 1000))
     setModels(
       Array.isArray(value.models)
         ? value.models
@@ -96,6 +100,8 @@ export function AntigravitySettings() {
             ...((routing.data?.antigravity || {}) as Record<string, unknown>),
             enabled,
             cli_bin: cli.trim() || 'agy',
+            max_sessions: Number(maxSessions),
+            queue_timeout_ms: Math.round(Number(queueSec) * 1000),
             models: antigravityModelsFromIds(
               (routing.data?.antigravity as Record<string, unknown> | undefined)
                 ?.models,
@@ -144,6 +150,37 @@ export function AntigravitySettings() {
             value={cli}
             onChange={(e) => setCli(e.target.value)}
           />
+        </div>
+        <div className='grid gap-3 sm:grid-cols-2'>
+          <div className='space-y-1'>
+            <Label htmlFor='agy-max-sessions'>单槽并发（1–20）</Label>
+            <Input
+              id='agy-max-sessions'
+              type='number'
+              min={1}
+              max={20}
+              value={maxSessions}
+              onChange={(e) => setMaxSessions(e.target.value)}
+            />
+            <p className='text-xs text-muted-foreground'>
+              每个槽位同时在飞的请求数，也是槽位单独覆盖的上限。修改后需在各槽位运维页「重载
+              Antigravity bridge」。
+            </p>
+          </div>
+          <div className='space-y-1'>
+            <Label htmlFor='agy-queue-timeout'>排队等待（秒，1–300）</Label>
+            <Input
+              id='agy-queue-timeout'
+              type='number'
+              min={1}
+              max={300}
+              value={queueSec}
+              onChange={(e) => setQueueSec(e.target.value)}
+            />
+            <p className='text-xs text-muted-foreground'>
+              槽位全满时请求最多等待多久，超时返回 429。
+            </p>
+          </div>
         </div>
         <div className='space-y-1'>
           <Label htmlFor='agy-models'>模型 ID，每行一个</Label>

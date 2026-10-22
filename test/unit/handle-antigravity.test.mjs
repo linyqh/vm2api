@@ -34,6 +34,7 @@ async function invoke({
   runtime = createAntigravityPoolRuntime(),
   store = createAntigravityResponseStore(),
   keyStore = null,
+  routing = null,
 } = {}) {
   const req = Object.assign(
     new EventEmitter(),
@@ -82,9 +83,8 @@ async function invoke({
       response.headersSent = true
       response.status = 200
     },
-    routing: {
+    routing: routing || {
       antigravity: { enabled: true, models: ['model-one-low', 'model-one-medium', 'model-one-high'] },
-      pool: { fallback_wait_timeout_ms: 1 },
     },
     projectRoot: '/unused',
     apiKeyStore: keyStore,
@@ -323,4 +323,52 @@ test('Tenant ownership and live pool membership cannot be widened by an ordinary
   })
   assert.equal(empty.res.status, 403)
   assert.equal(empty.runs, 0)
+})
+
+test('A full slot queues for antigravity.queue_timeout_ms, independent of the Claude pool wait', async () => {
+  const runtime = createAntigravityPoolRuntime()
+  const held = runtime.acquire(slot.id, { concurrency: 1 })
+  setTimeout(() => held.release(), 50)
+  const routing = {
+    antigravity: { enabled: true, models: ['model-one-medium'], queue_timeout_ms: 2000 },
+    pool: { fallback_wait_timeout_ms: 1 },
+  }
+  const queued = await invoke({ runtime, routing })
+  assert.equal(queued.res.status, 200)
+  assert.equal(queued.runs, 1)
+
+  const busy = createAntigravityPoolRuntime()
+  busy.acquire(slot.id, { concurrency: 1 })
+  const started = Date.now()
+  const timedOut = await invoke({
+    runtime: busy,
+    routing: { ...routing, antigravity: { ...routing.antigravity, queue_timeout_ms: 1000 } },
+  })
+  assert.equal(timedOut.res.status, 429)
+  assert.equal(timedOut.res.body.error.code, 'antigravity_capacity_unavailable')
+  assert.ok(Date.now() - started >= 900)
+  assert.equal(timedOut.runs, 0)
+})
+
+test('A slot runs as many concurrent requests as its resolved max_concurrency allows', async () => {
+  const runtime = createAntigravityPoolRuntime()
+  const routing = {
+    antigravity: { enabled: true, models: ['model-one-medium'], max_sessions: 3, queue_timeout_ms: 1000 },
+  }
+  let active = 0,
+    peak = 0
+  const inference = async () => {
+    peak = Math.max(peak, ++active)
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    active--
+    return success
+  }
+  const results = await Promise.all(
+    Array.from({ length: 3 }, () => invoke({ runtime, routing, slots: [{ ...slot, max_concurrency: 3 }], inference })),
+  )
+  assert.deepEqual(
+    results.map((h) => h.res.status),
+    [200, 200, 200],
+  )
+  assert.equal(peak, 3)
 })

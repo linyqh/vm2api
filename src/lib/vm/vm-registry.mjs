@@ -6,6 +6,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { atomicWriteJson, invalidateReadCache, listVmRecordFiles, readJsonCached } from './vm-file.mjs'
+import { antigravitySlotConcurrency, normalizeAntigravityRouting } from '../protocol/antigravity-route.mjs'
 import {
   hasAccessPresence,
   hasCredentialPresence,
@@ -72,6 +73,7 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
   const globalOpenAI = normalizeOpenAIQuotaPolicy(routing?.codex?.quota)
   const openAIPolicy = kind.kind === 'codex' ? effectiveOpenAIPolicy(vm, globalOpenAI) : null
   const quotaGate = kind.kind === 'codex' ? evaluateCodexQuotaSchedule(vm, Date.now(), globalOpenAI) : null
+  const antigravityConfig = antigravity ? normalizeAntigravityRouting(routing?.antigravity) : null
   return {
     id: vm.id,
     name: vm.name,
@@ -185,14 +187,9 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
           session_slots: null,
           quota_override: null,
           can_claude_reset: false,
-          max_concurrency: Math.max(
-            1,
-            Math.min(
-              Number(routing?.antigravity?.max_sessions) || 1,
-              Number(vm.policy?.maxConcurrency) || Number(routing?.antigravity?.max_sessions) || 1,
-            ),
-          ),
-          max_sessions: Number(routing?.antigravity?.max_sessions) || 1,
+          max_concurrency: antigravitySlotConcurrency(vm, antigravityConfig),
+          max_concurrency_override: vm.policy?.concurrencyOverride === true,
+          max_sessions: antigravityConfig.max_sessions,
           inference_engine: 'antigravity',
           schedulable: vm.schedulable !== false && antigravity.authenticated === true,
           schedule_disabled_reason:

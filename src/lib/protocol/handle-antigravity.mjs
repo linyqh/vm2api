@@ -147,7 +147,7 @@ export async function handleAntigravityProtocol({
   const rawSticky = stickyRouter?.extractPoolKey?.(req, ctx.body, { platform: 'antigravity' }) || null
   const stickyKey = rawSticky && responseScope ? `antigravity:${responseScope}:${rawSticky}` : null
   const preferred = previous?.vmId || (stickyKey ? stickyRouter?.resolve?.(stickyKey)?.vmId : null)
-  const deadline = Date.now() + Math.max(0, Math.min(300_000, Number(routing.pool?.fallback_wait_timeout_ms) || 30_000))
+  const deadline = Date.now() + config.queue_timeout_ms
   const budget = Math.min(16, Math.max(1, Number(routing.failover?.max_total_attempts) || 4))
   const controller = new AbortController()
   const abort = () => {

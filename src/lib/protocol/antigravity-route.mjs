@@ -143,7 +143,18 @@ export function normalizeAntigravityRouting(raw = {}) {
     max_sessions: boundedInteger(src.max_sessions, 1, 1, 20),
     idle_ttl_seconds: boundedInteger(src.idle_ttl_seconds, 600, 1, 86400),
     timeout_ms: boundedInteger(src.timeout_ms, 180000, 1000, 3600000),
+    queue_timeout_ms: boundedInteger(src.queue_timeout_ms, 120000, 1000, 300000),
   }
+}
+
+/** Per-slot in-flight cap: the global `max_sessions` unless an operator pinned this slot (never above it). */
+export function antigravitySlotConcurrency(vm, config) {
+  const policy = vm?.policy || {}
+  const pinned = policy.concurrencyOverride === true ? Number(policy.maxConcurrency) : 0
+  return Math.max(
+    1,
+    Math.min(config.max_sessions, Number.isInteger(pinned) && pinned > 0 ? pinned : config.max_sessions),
+  )
 }
 
 /** Strict write validation; reads remain defensive for older config files. */
@@ -165,6 +176,7 @@ export function validateAntigravityRoutingPatch(body = {}) {
     ['max_sessions', 1, 20],
     ['idle_ttl_seconds', 1, 86400],
     ['timeout_ms', 1000, 3600000],
+    ['queue_timeout_ms', 1000, 300000],
   ]) {
     if (field in raw && (!Number.isInteger(raw[field]) || raw[field] < min || raw[field] > max)) {
       throw Object.assign(new TypeError(`antigravity.${field} 必须是 ${min} 到 ${max} 的整数`), {

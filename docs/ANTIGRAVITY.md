@@ -38,7 +38,7 @@ OAuth 会话按操作者、槽位和所属用户隔离，有效期 30 分钟。�
 
 Gemini 3 及以上模型要求回传的工具调用携带 `thoughtSignature`，否则返回 HTTP 400。适配器在响应中通过 `tool_use.thought_signature`（Chat 为 `tool_calls[].thought_signature`）暴露签名，但标准 Anthropic / OpenAI SDK 会丢弃该字段。因此槽位运行时按工具调用 ID、名称与参数缓存签名 30 分钟（进程内，有条目上限），后续请求缺失签名时自动补回；未命中（过期、换槽位或运行时重启）时，对该轮首个工具调用填入 Google 规定的 `skip_thought_signature_validator`，保证请求可继续，代价是该轮推理上下文连续性减弱。
 
-图片支持 inline base64 与 data URL，远程 URL 图片会明确拒绝。工具与结构化输出的 `strict: true`、`parallel_tool_calls: false` / `disable_parallel_tool_use: true` 暂不支持，会在访问上游前拒绝；不会静默忽略这些约束。
+图片支持 inline base64 与 data URL，远程 URL 图片会明确拒绝。工具与结构化输出的 `strict: true`、`parallel_tool_calls: false` / `disable_parallel_tool_use: true` 暂不支持，会在访问上游前拒绝；不会静默忽略这些约束。Responses `include` 仅接受 `reasoning.encrypted_content`（忽略，推理条目本身已带 summary 与 signature），其他取值返回 400。
 
 暂不支持生成前的 `count_tokens`；生成响应与日志返回上游提供的实际用量。
 
@@ -48,6 +48,15 @@ Gemini 3 及以上模型要求回传的工具调用携带 `thoughtSignature`，�
 - 槽位已授权、运行中、支持本机 Docker 并绑定可用出口。
 - 管理员全局启用模型、槽位模型策略允许模型，以及该账号已同步的实际可用目录。
 - 调度开关、活动时段、独立并发/RPM 限制、等待队列和上游失败冷却。
+
+并发与排队（`routing.antigravity`，设置 → Antigravity）：
+
+| 字段 | 默认 | 范围 | 作用 |
+| --- | --- | --- | --- |
+| `max_sessions` | 1 | 1–20 | 每个槽位同时在飞的请求数，也是槽内 bridge 的并发上限。修改后需在各槽位运维页「重载 Antigravity bridge」，否则推理返回 409 `antigravity_runtime_reload_required` |
+| `queue_timeout_ms` | 120000 | 1000–300000 | 全部候选槽位满载时的排队上限，超时返回 429 `antigravity_capacity_unavailable`；与 Claude 池的 `pool.fallback_wait_timeout_ms` 无关 |
+
+槽位默认跟随 `max_sessions`。`PATCH /api/panel/vms/:id` 传 `{"max_concurrency": n}` 可把单槽钉到 1–`max_sessions`，传 `null` 恢复跟随；Antigravity 槽位的该接口只接受这一个字段。
 
 错误切换只在尚未向调用方提交输出时进行，避免重复输出。请求取消会中止槽位执行并释放席位。调用日志与 usage 沿用现有日志链路；没有可靠单价的模型保持未计价状态，不伪造费用或 Claude/GPT 配额窗口。
 

@@ -143,6 +143,18 @@ test('Responses continuation accepts only explicitly resolved history and does n
   assert.equal('previous_response_id' in out.request, false)
 })
 
+test('Responses include tolerates reasoning.encrypted_content and rejects anything else', () => {
+  const body = (include) => ({ model, input: 'hi', include })
+  assert.equal(normalizeAntigravityRequest('openai.responses', body(['reasoning.encrypted_content'])).ok, true)
+  const rejected = normalizeAntigravityRequest(
+    'openai.responses',
+    body(['reasoning.encrypted_content', 'message.output_text.logprobs']),
+  )
+  assert.equal(rejected.code, 'antigravity_feature_not_supported')
+  assert.match(rejected.message, /message\.output_text\.logprobs/)
+  assert.doesNotMatch(rejected.message, /encrypted_content/)
+})
+
 test('orphan, duplicate and malformed tool calls fail instead of fabricating a request', () => {
   assert.equal(
     normalizeAntigravityRequest('anthropic.messages', { model, messages: [{ role: 'user', content: [toolResult] }] })
