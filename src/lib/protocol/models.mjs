@@ -15,7 +15,7 @@ import {
 } from './model-policy.mjs'
 import { hasClaudeCode1mSuffix, stripClaudeCode1mSuffix } from './context-1m.mjs'
 import { isGptSeriesId } from './gpt-ids.mjs'
-import { listGptPolicyModels } from './gpt-model-policy.mjs'
+import { listGptPolicyModels, listImageToolModels } from './gpt-model-policy.mjs'
 import { listAntigravityPublicModels } from './antigravity-route.mjs'
 import { detectInboundPlatform } from './platform-detect.mjs'
 
@@ -61,6 +61,26 @@ function listGptPublicModels() {
   }
 }
 
+/** Enabled GPT image models, listed like OpenAI's own /v1/models so clients can find them. */
+function listImagePublicModels() {
+  try {
+    return listImageToolModels()
+      .filter((m) => m.enabled)
+      .map((m) => ({
+        id: m.id,
+        object: 'model',
+        type: 'model',
+        display_name: m.display_name,
+        owned_by: 'openai',
+        family: 'gpt-image',
+        enabled: true,
+        source: 'gpt-model-policy',
+      }))
+  } catch {
+    return []
+  }
+}
+
 /**
  * Local catalog for GET /v1/models and boot. Does not touch workers.
  * groupType is the key's account platform. Antigravity uses the current local routing snapshot.
@@ -70,7 +90,8 @@ export function gatewayModelCatalog({ groupType = 'all', antigravityRouting = {}
   try {
     loadModelPolicy()
   } catch {}
-  const gpt = groupType === 'all' || groupType === 'openai' ? listGptPublicModels() : []
+  const gpt =
+    groupType === 'all' || groupType === 'openai' ? [...listGptPublicModels(), ...listImagePublicModels()] : []
   const claude = groupType === 'all' || groupType === 'anthropic' ? listOfficialModels() : []
   // Same-name Claude/GPT models reach Antigravity only with an Antigravity-group key; list
   // each ID once, under the platform this key actually reaches.

@@ -3,7 +3,6 @@
  * Tests compare envelopes from this module so admin paths cannot drift.
  */
 import { officialMessagesBody } from './anthropic-messages.mjs'
-import { moveToolResultImagesToTail } from './tool-result-image-tail.mjs'
 import {
   prepareAnthropicRequest,
   rewriteToolNames,
@@ -40,7 +39,6 @@ import {
   CRS_OFFICIAL_SYSTEM,
   CRS_OFFICIAL_CLI_SYSTEM,
   CRS_COMPACT_IDENTITY,
-  ensureBillingAttribution,
 } from '../identity/crs-persona.mjs'
 import { sealClaudeCodeCch } from '../identity/cch.mjs'
 import {
@@ -169,8 +167,36 @@ function stabilizeMessageBudgets(body) {
   })
   return changed ? { ...body, messages } : body
 }
+const OFFICIAL_CACHE = Object.freeze({ type: 'ephemeral' })
 
-/** One marker on the current user tail, using the configured TTL. */
+function textOf(block) {
+  if (typeof block === 'string') return block
+  return typeof block?.text === 'string' ? block.text : ''
+}
+
+/**
+ * Every cli-hop request leaves as the captured Claude Code shape: the identity
+ * sentence, then the caller's own prompt. Both markers omit ttl. A request that
+ * already has that identity keeps its second block; anything else is joined
+ * behind a fresh identity.
+ */
+export function officialSystemTemplate(system, ttl = DEFAULT_CACHE_TTL) {
+  const blocks = Array.isArray(system) ? system : system == null || system === '' ? [] : [system]
+  const texts = blocks.map(textOf).filter((text) => text.trim())
+  const identityAt = texts.findIndex((text) => text.trim() === CRS_OFFICIAL_CLI_SYSTEM)
+  const body = identityAt >= 0 ? texts.slice(identityAt + 1).join('\n\n') : texts.join('\n\n')
+  const marker = { type: 'ephemeral', ttl: normalizeCacheTtl(ttl) }
+  const out = [{ type: 'text', text: CRS_OFFICIAL_CLI_SYSTEM, cache_control: { ...marker } }]
+  if (body.trim()) out.push({ type: 'text', text: body, cache_control: { ...marker } })
+  return out
+}
+
+/**
+ * Two markers, stamped with the session TTL: the last text of the current tail
+ * and of the user turn before it (4+ messages). The second one sits on the
+ * previous request's write, so a turn that grows past the 20-block lookback
+ * still reads it instead of falling back to the system prefix.
+ */
 function officialMessageMarker(messages, ttl = DEFAULT_CACHE_TTL) {
   if (!Array.isArray(messages) || messages.length === 0) return messages
   const next = messages.map((message) => {
@@ -192,34 +218,36 @@ function officialMessageMarker(messages, ttl = DEFAULT_CACHE_TTL) {
     })
     return changed ? { ...message, content } : message
   })
-  let tail = -1
-  for (let i = next.length - 1; i >= 0; i--) {
+  const users = []
+  for (let i = next.length - 1; i >= 0 && users.length < 2; i--) {
     if (next[i]?.role !== 'user') continue
     const content = next[i].content
-    if (typeof content === 'string' ? content : Array.isArray(content) && content.length) {
-      tail = i
-      break
-    }
+    if (typeof content === 'string' ? content : Array.isArray(content) && content.length) users.push(i)
   }
-  if (tail < 0) return next
-  const message = next[tail]
+  if (users.length === 0) return next
+  stampMessageTail(next, users[0], ttl)
+  if (users.length > 1 && next.length >= 4) stampMessageTail(next, users[1], ttl)
+  return next
+}
+
+function stampMessageTail(messages, index, ttl) {
+  const message = messages[index]
   if (typeof message.content === 'string') {
-    next[tail] = {
+    messages[index] = {
       ...message,
       content: [
         { type: 'text', text: message.content, cache_control: { type: 'ephemeral', ttl: normalizeCacheTtl(ttl) } },
       ],
     }
-    return next
+    return
   }
   const content = message.content.slice()
   for (let i = content.length - 1; i >= 0; i--) {
     if (content[i]?.type === 'thinking' || content[i]?.type === 'redacted_thinking') continue
     content[i] = { ...content[i], cache_control: { type: 'ephemeral', ttl: normalizeCacheTtl(ttl) } }
-    next[tail] = { ...message, content }
-    return next
+    messages[index] = { ...message, content }
+    return
   }
-  return next
 }
 /** Official Claude Code omits eager streaming and tool cache markers. A caller TTL here makes CLI fill the omitted system and message markers. */
 function stripEagerInputStreaming(tools) {
@@ -268,29 +296,26 @@ export function prepareCliHopBody(
     preserveThinkingBlocks = false,
     preserveCallerEnvironment = false,
     autoCompactWindow = null,
-    toolResultImageTail = false,
     routing = null,
   } = {},
 ) {
   if (requestContext?.purpose === 'auto_mode_classifier') return prepareClassifierBody(canonicalBody, { stream })
-  let body = removeCacheControlFields(officialMessagesBody(canonicalBody, { stream, preserveContentShape: true }))
+  if (preserveSystem) validateCacheBreakpoints(canonicalBody)
+  let body = officialMessagesBody(canonicalBody, { stream, preserveContentShape: true })
   const windowTokens = Number(autoCompactWindow)
   if (Number.isInteger(windowTokens) && windowTokens >= 100_000 && windowTokens <= 1_000_000) {
     body.auto_compact_window = windowTokens
   }
   delete body.metadata
-  // Preserve selected prompt text, never caller-owned attribution or markers.
+  // Official family keeps the inbound system and its markers. Rewriting them
+  // into the persona template (billing / reporting / 1h) is what diverges from
+  // the captured Claude Code body: two ephemeral blocks, TTL omitted.
   if (!preserveSystem) {
     const leftover = stripCliOwnedSystem(body.system, { preserveCallerEnvironment })
     if (leftover == null) delete body.system
     else body.system = leftover
     body = stabilizeSystemBudget(body)
     body = stabilizeMessageBudgets(body)
-  }
-  if (preserveSystem && Array.isArray(body.system)) {
-    body.system = body.system.filter((block) => !/^\s*x-anthropic-billing-header:/i.test(systemBlockText(block)))
-  } else if (preserveSystem && typeof body.system === 'string') {
-    body.system = body.system.replace(/^\s*x-anthropic-billing-header:[^\r\n]*(?:\r?\n)?/gim, '')
   }
   // cli-node sends mid-conversation-system. Only models that reject the role need the lift.
   if (!modelSupportsMidConversationSystem(body.model)) body = liftMidConversationSystemMessages(body)
@@ -311,8 +336,8 @@ export function prepareCliHopBody(
   if (Object.prototype.hasOwnProperty.call(body, 'context_management')) delete body.context_management
   if (Object.prototype.hasOwnProperty.call(body, 'cache_control')) delete body.cache_control
   if (!requestContext) {
+    body = { ...body, system: officialSystemTemplate(body.system, cacheTtl) }
     body.messages = officialMessageMarker(body.messages, cacheTtl)
-    if (toolResultImageTail) body = moveToolResultImagesToTail(body)
     if (Array.isArray(body.tools)) body = { ...body, tools: stripEagerInputStreaming(body.tools) }
   }
   return body
@@ -527,11 +552,7 @@ export function prepareOutboundEnvelope({
     String(headers['anthropic-beta'] || '').split(','),
     displayed,
   ).join(',')
-  const attributed = ensureBillingAttribution(
-    sanitizeAnthropicBodyForBetaTokens(displayed, headers?.['anthropic-beta'] || ''),
-    { sessionId: sessionIdFromOutboundBody(displayed) || identity?.callerSessionId || '' },
-  )
-  const body = sealClaudeCodeCch(attributed, {
+  const body = sealClaudeCodeCch(sanitizeAnthropicBodyForBetaTokens(displayed, headers?.['anthropic-beta'] || ''), {
     enabled: routing?.compatibility?.cch_enabled !== false,
   })
   return { body, headers, toolNames: prepared.toolNames }

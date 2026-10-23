@@ -54,7 +54,8 @@ export function readLocalVersion(root = projectRoot()) {
 }
 
 const ARCH_ALIASES = Object.freeze({ amd64: 'amd64', x86_64: 'amd64', x64: 'amd64', arm64: 'arm64', aarch64: 'arm64' })
-const RELEASE_TAG_RE = /^v?(\d+\.\d+\.\d+)(?:-(amd64|x86_64|arm64|aarch64))?$/i
+// Upstream releases are X.Y.Z; this fork appends its own counter: X.Y.Z.N.
+const RELEASE_TAG_RE = /^v?(\d+\.\d+\.\d+(?:\.\d+)?)(?:-(amd64|x86_64|arm64|aarch64))?$/i
 
 /** Docker architecture name for uname / Node / Docker spellings; '' when unsupported. */
 export function normalizeArch(value) {
@@ -67,7 +68,7 @@ export function normalizeArch(value) {
   )
 }
 
-/** `v1.2.3`, `1.2.3-arm64`, `v1.2.3-aarch64` → { version, tag, arch }; arch is '' without a suffix. */
+/** `v1.2.3`, `1.2.3.1`, `1.2.3-arm64`, `v1.2.3-aarch64` → { version, tag, arch }; arch is '' without a suffix. */
 export function parseReleaseTag(value) {
   const m = String(value || '')
     .trim()
@@ -85,7 +86,7 @@ export function normalizeTag(value) {
 }
 
 export function isReleaseTag(value) {
-  return /^v\d+\.\d+\.\d+$/.test(String(value || '').trim())
+  return /^v\d+\.\d+\.\d+(?:\.\d+)?$/.test(String(value || '').trim())
 }
 
 /**
@@ -103,7 +104,7 @@ export function imageTagFor(tag, arch = process.arch) {
 export function compareSemver(a, b) {
   const pa = parseSemver(a)
   const pb = parseSemver(b)
-  for (let i = 0; i < 3; i++) {
+  for (let i = 0; i < 4; i++) {
     if (pa[i] > pb[i]) return 1
     if (pa[i] < pb[i]) return -1
   }
@@ -113,7 +114,7 @@ export function compareSemver(a, b) {
 function parseSemver(value) {
   const n = normalizeVersion(value)
   const parts = n.split('.').map((x) => Number.parseInt(x, 10))
-  return [parts[0] || 0, parts[1] || 0, parts[2] || 0]
+  return [parts[0] || 0, parts[1] || 0, parts[2] || 0, parts[3] || 0]
 }
 
 function bulletsOf(body) {
@@ -158,7 +159,7 @@ export function parseChangelog(markdown) {
       })
       continue
     }
-    const m = heading.match(/^v?(\d+\.\d+\.\d+)\s*[—–-]\s*(\d{4}-\d{2}-\d{2})?/)
+    const m = heading.match(/^v?(\d+\.\d+\.\d+(?:\.\d+)?)\s*[—–-]\s*(\d{4}-\d{2}-\d{2})?/)
     if (!m) continue
     entries.push({
       version: m[1],

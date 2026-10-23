@@ -235,11 +235,12 @@ path, current, target = sys.argv[1], sys.argv[2].lstrip("v"), sys.argv[3].lstrip
 text = open(path, encoding="utf-8").read()
 chunks = re.split(r"^## ", text, flags=re.M)[1:]
 def ver(h):
-    m = re.match(r"v?(\d+\.\d+\.\d+)", h)
+    m = re.match(r"v?(\d+\.\d+\.\d+(?:\.\d+)?)", h)
     return m.group(1) if m else None
 def tup(v):
-    if not v: return (0,0,0)
-    return tuple(int(x) for x in v.split(".")[:3])
+    if not v: return (0,0,0,0)
+    parts = [int(x) for x in v.split(".")[:4]]
+    return tuple(parts + [0] * (4 - len(parts)))
 cur, tgt = tup(current), tup(target)
 shown = 0
 for chunk in chunks:
@@ -878,8 +879,8 @@ while [ $# -gt 0 ]; do
       fi
       REQUESTED_ARCH="$(suffix_arch "$2")"
       TARGET_VERSION="$(normalize_tag "$2")"
-      if ! [[ "$TARGET_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        err "无效版本 $2：格式 vX.Y.Z，可带 -amd64 / -arm64 后缀"
+      if ! [[ "$TARGET_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+        err "无效版本 $2：格式 vX.Y.Z 或 vX.Y.Z.N，可带 -amd64 / -arm64 后缀"
         exit 1
       fi
       shift 2

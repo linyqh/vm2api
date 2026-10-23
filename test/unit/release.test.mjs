@@ -119,6 +119,29 @@ test('compareSemver orders dotted triples', () => {
   assert.equal(normalizeTag('1.2.6'), 'v1.2.6')
 })
 
+test('fork versions X.Y.Z.N sort after their upstream base and before the next upstream release', () => {
+  assert.deepEqual(parseReleaseTag('v1.3.218.1-arm64'), { version: '1.3.218.1', tag: 'v1.3.218.1', arch: 'arm64' })
+  assert.equal(compareSemver('1.3.218.1', '1.3.218'), 1)
+  assert.equal(compareSemver('1.3.218.2', '1.3.218.1'), 1)
+  assert.equal(compareSemver('1.3.219', '1.3.218.1'), 1)
+  const entries = parseChangelog('## 1.3.219 — 2026-10-24\n\n- up\n\n## 1.3.218.1 — 2026-10-23\n\n- fork\n\n## 1.3.218 — 2026-10-23\n\n- base\n')
+  assert.deepEqual(
+    entries.map((e) => e.version),
+    ['1.3.219', '1.3.218.1', '1.3.218'],
+  )
+  assert.deepEqual(
+    changelogSince(entries, '1.3.218.1').map((e) => e.version),
+    ['1.3.219'],
+  )
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vm2api-release-'))
+  try {
+    fs.writeFileSync(path.join(tmp, 'VERSION'), '1.3.218.1\n')
+    assert.equal(readLocalVersion(tmp), '1.3.218.1')
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
 test('readLocalVersion prefers VERSION file over package.json', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vm2api-release-'))
   try {
@@ -280,7 +303,7 @@ test('VERSION is the only application release version source', () => {
   const compose = fs.readFileSync(path.join(root, 'docker-compose.yml'), 'utf8')
   const vite = fs.readFileSync(path.join(root, 'web', 'vite.config.ts'), 'utf8')
 
-  assert.match(version, /^\d+\.\d+\.\d+$/)
+  assert.match(version, /^\d+\.\d+\.\d+(?:\.\d+)?$/)
   assert.equal(Object.hasOwn(pkg, 'version'), false)
   assert.equal(Object.hasOwn(lock, 'version'), false)
   assert.equal(Object.hasOwn(lock.packages[''], 'version'), false)

@@ -35,7 +35,8 @@ import {
   AntigravityModelSync,
   type AntigravityModelCatalog,
 } from '@/features/vm/antigravity-model-sync'
-import { EditorRow, Fact, Metric, Panel, formatK } from './model-row'
+import { EditorRow, Fact, Metric, Panel } from './model-parts'
+import { formatK } from './model-row'
 
 type CatalogModel = AntigravityModelCatalog['models'][number] & {
   context_window?: number
