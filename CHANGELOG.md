@@ -2,10 +2,10 @@
 
 ## 未发布
 
-## 1.3.218.1 — 2026-10-23
+## 1.3.219.1 — 2026-10-23
 
-- 版本号改为「上游版本.本仓库序号」：`1.3.218.1` 表示基于上游 dofastted/vm2api `1.3.218`、本仓库第 1 个版本。面板版本显示、更新检查、CHANGELOG 解析、`install.sh` 均按四段比较，上游发布新版本（如 `1.3.219`）时仍提示有更新。
-- 同步上游 dofastted/vm2api 至 1.3.218（见下方 1.3.209–1.3.218 各条）。
+- 版本号改为「上游版本.本仓库序号」：`1.3.219.1` 表示基于上游 dofastted/vm2api `1.3.219`、本仓库第 1 个版本。面板版本显示、更新检查、CHANGELOG 解析、`install.sh` 均按四段比较，上游发布新版本（如 `1.3.220`）时仍提示有更新。
+- 同步上游 dofastted/vm2api 至 1.3.219（见下方 1.3.209–1.3.219 各条）。
 - 修复 Antigravity 长输出在 3 分钟左右被切断，客户端看到「Antigravity did not return a complete valid response」并反复重试。`antigravity.timeout_ms`（默认 180 秒）原来是整次请求的总时长上限；Gemini 的工具调用参数要整段生成完才一次下发，让模型写一整份文件时，上游一直在生成却会被强行中断。现在改为空闲超时：只要上游还在发数据就不中断，连续 `timeout_ms` 没有新数据才中断。超时的错误码原先被中断异常自带的数字 code（20）盖掉，日志里记成 `20.0`、提示文字也是通用的；现在返回 504 `antigravity_timeout`，提示里写明是超时。
 - 提升 Antigravity 提示缓存命中率。线上日志显示命中为 0 的会话，每一轮都落在不同账号：opencode 等客户端会和主对话同时发一个同会话 ID 的标题生成请求，单槽并发为 1 时它占住了会话绑定的槽，主对话被挤到别的号，而上游缓存按账号隔离；会话绑定又锁在第一次成功的槽，下一轮回到没有该前缀缓存的号。现在粘性键加入前缀指纹（模型变体、system、tools、首条消息），旁路请求单独绑定；绑定槽正忙时先等 `antigravity.affinity_wait_ms`（默认 15 秒，0–120 秒，设置 → Antigravity 可改）再换槽；换槽成功后绑定移到实际服务的槽。旧的 Antigravity 粘性记录不再使用，各会话下一轮重新绑定。
 - 修复宿主机防火墙重载（如 `firewall-cmd --reload`）后 SOCKS 出口槽位断网：重载会清掉 kin-egress 的 iptables 转发规则，而进程仍在监听，watchdog 只看进程就判定正常，槽内 DNS 与出站全部超时。watchdog 现每分钟核对该出口的 NAT / INPUT / FORWARD 规则，缺失即重新下发；槽位诊断的出口检查也会报出「转发规则丢失」。Antigravity 槽位因此表现为授权约 1 小时后「过期」，实际是 access token 无法续期。
@@ -25,6 +25,12 @@
 - Antigravity 槽位显示账号额度。数据来自官方 CLI `/usage` 所用的 `retrieveUserQuotaSummary`，按模型组列出 5 小时与周窗口的剩余比例和重置倒计时，显示在机架卡片、列表和槽位详情中。平台启用后每 10 分钟刷新一次，也可手动刷新（`POST /api/panel/vms/:id/antigravity/quota/refresh`）；失败时保留上次有效额度并标出原因。
 
 已部署机升级：更新 Node 控制面与 `web/dist`，重启一次 Node，并重启各 Antigravity 槽位以加载新的 bridge 脚本。快照写入 `data/antigravity-quota/`；无迁移、无新依赖。
+## 1.3.219 — 2026-10-23
+
+- `kin-guest-exec`：修正 `if ! run_ssh` 在 POSIX 下吞掉真实退出码的问题；来宾非零退出、ssh 255、timeout 124 不再误报为 0，控制面不再把来宾崩溃误判为 `worker_output_invalid`。（#680）
+- **KVM 运行器**：需同步重建/部署 `docker/kin-kvm` 镜像（或等价方式更新 runner 内 `kin-guest-exec` 脚本）后，线上槽位才会生效。
+
+已部署机升级：须重建并同步部署 **kin-kvm** 镜像（或等价更新 runner 内 `kin-guest-exec`）；**仅更新 Node 控制面与 `web/dist` 不够**。更新后重启相关服务。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
 
 ## 1.3.218 — 2026-10-23
 
