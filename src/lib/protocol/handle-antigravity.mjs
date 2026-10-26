@@ -3,6 +3,7 @@ import { listVms, getVm } from '../vm/vm-registry.mjs'
 import { isValidVmId } from '../vm/vm-file.mjs'
 import { isAntigravityVm } from '../vm/vm-kind.mjs'
 import { isClientStream } from './convert.mjs'
+import { ErrorCode } from '../core/errors.mjs'
 import { keyScopeFromRequest, vmPoolDenial } from '../admin/key-scope.mjs'
 import { ownerScopeFromRequest } from '../admin/resource-owner.mjs'
 import { normalizeAntigravityRouting, antigravityModelId, resolveAntigravityVariant } from './antigravity-route.mjs'
@@ -47,6 +48,14 @@ const ADMISSION_MESSAGES = {
   pool_resting: 'Antigravity 槽位当前处于休息时段。',
   pool_wait_queue_full: 'Antigravity 等待队列已满。',
   platform_mismatch: '指定槽位不属于 Antigravity 平台。',
+}
+
+const CONTENT_BLOCKED_MESSAGE = 'The request was blocked by content safety review.'
+
+// The bridge reports provider-specific wording; clients and tenant logs must only see a generic moderation block.
+function contentBlockedLogMessage(bridgeMessage) {
+  const reason = /ended with ([A-Z_]+)/.exec(String(bridgeMessage || ''))?.[1] || 'PROMPT_BLOCKED'
+  return `${CONTENT_BLOCKED_MESSAGE} (${reason})`
 }
 
 export async function handleAntigravityProtocol({
@@ -358,12 +367,14 @@ export async function handleAntigravityProtocol({
       if (!res.destroyed && !res.writableEnded) res.end()
       return
     }
-    const code = last?.code || 'antigravity_unavailable'
-    const message = last?.message || 'Antigravity is temporarily unavailable.'
+    const blocked = last?.code === 'antigravity_content_blocked'
+    const code = blocked ? ErrorCode.CONTENT_FILTER_REFUSAL : last?.code || 'antigravity_unavailable'
+    const message = blocked ? CONTENT_BLOCKED_MESSAGE : last?.message || 'Antigravity is temporarily unavailable.'
+    const logMessage = blocked ? contentBlockedLogMessage(last.message) : message
     if (res.headersSent) {
       stats.errors++
       logBag.error_code = code
-      logBag.error_message = message
+      logBag.error_message = logMessage
       logBag.final_state = last?.terminalState || 'incomplete'
       if (last?.usage) recordUsage?.(last.usage)
       write(streamState.error({ code, message }))
@@ -371,7 +382,8 @@ export async function handleAntigravityProtocol({
       return
     }
     if (last?.usage) recordUsage?.(last.usage)
-    return fail(last?.status >= 400 ? last.status : 503, code, message)
+    fail(last?.status >= 400 ? last.status : 503, code, message)
+    logBag.error_message = logMessage
   } finally {
     req.off('aborted', abort)
     res.off('close', abort)

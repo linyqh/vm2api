@@ -248,6 +248,32 @@ test('Uncommitted transient failures switch accounts, while committed streams ne
   assert.doesNotMatch(partial.res.chunks.join(''), /\[DONE\]/)
 })
 
+test('Content safety blocks reach clients and tenant logs as a generic moderation refusal', async () => {
+  const blocked = {
+    ok: false,
+    status: 400,
+    code: 'antigravity_content_blocked',
+    message: 'Antigravity generation ended with PROHIBITED_CONTENT',
+  }
+  const h = await invoke({ slots: [slot, { ...slot, id: 'vm-ag-02' }], inference: async () => blocked })
+  assert.equal(h.runs, 1)
+  assert.equal(h.res.status, 400)
+  assert.equal(h.res.body.error.code, 'content_filter_refusal')
+  assert.doesNotMatch(JSON.stringify(h.res.body), /antigravity/i)
+  assert.equal(h.logBag.error_code, 'content_filter_refusal')
+  assert.equal(h.logBag.error_message, 'The request was blocked by content safety review. (PROHIBITED_CONTENT)')
+  const streamed = await invoke({
+    body: { model: 'model-one', stream: true, messages: [{ role: 'user', content: 'hello' }] },
+    inference: async ({ onEvent }) => {
+      onEvent({ type: 'text_delta', text: 'part' })
+      return { ...blocked, message: 'Antigravity rejected this request' }
+    },
+  })
+  assert.match(streamed.res.chunks.join(''), /content_filter_refusal/)
+  assert.doesNotMatch(streamed.res.chunks.join(''), /antigravity/i)
+  assert.equal(streamed.logBag.error_message, 'The request was blocked by content safety review. (PROMPT_BLOCKED)')
+})
+
 test('Responses continuation carries canonical history only for its key and model', async () => {
   const store = createAntigravityResponseStore()
   const first = await invoke({ protocol: 'openai.responses', store })
