@@ -274,6 +274,23 @@ test('Content safety blocks reach clients and tenant logs as a generic moderatio
   assert.equal(streamed.logBag.error_message, 'The request was blocked by content safety review. (PROMPT_BLOCKED)')
 })
 
+test('Upstream errors never name Antigravity to clients or in logs', async () => {
+  const busy = await invoke({
+    inference: async () => ({
+      ok: false,
+      status: 400,
+      code: 'invalid_request',
+      message: 'Antigravity service returned HTTP 400',
+    }),
+  })
+  assert.equal(busy.res.body.error.message, 'Upstream service returned HTTP 400')
+  assert.equal(busy.logBag.error_message, 'Upstream service returned HTTP 400')
+  const denied = await invoke({ extraOps: { keyScope: () => ({ group_type: 'anthropic' }) } })
+  assert.equal(denied.res.status, 403)
+  assert.equal(denied.res.body.error.message, '此密钥不可调用上游。')
+  assert.equal(denied.logBag.error_message, '此密钥不可调用上游。')
+})
+
 test('Responses continuation carries canonical history only for its key and model', async () => {
   const store = createAntigravityResponseStore()
   const first = await invoke({ protocol: 'openai.responses', store })
@@ -462,5 +479,8 @@ test('After a spill the binding follows the slot that now holds the longest cach
   const spilled = await turn(followUp)
   assert.equal(spilled, other(home))
   await new Promise((resolve) => setTimeout(resolve, 80))
-  assert.equal(await turn([...followUp, { role: 'assistant', content: 'ok' }, { role: 'user', content: 'ship it' }]), spilled)
+  assert.equal(
+    await turn([...followUp, { role: 'assistant', content: 'ok' }, { role: 'user', content: 'ship it' }]),
+    spilled,
+  )
 })

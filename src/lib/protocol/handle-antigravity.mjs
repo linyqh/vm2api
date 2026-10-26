@@ -58,6 +58,15 @@ function contentBlockedLogMessage(bridgeMessage) {
   return `${CONTENT_BLOCKED_MESSAGE} (${reason})`
 }
 
+// Clients and tenant-visible logs must not reveal which upstream account type served the request.
+function hideUpstream(text) {
+  if (text == null) return text
+  return String(text)
+    .replace(/\s?Antigravity\s?(?=[\u4e00-\u9fff，。])/g, '上游')
+    .replace(/(^|[.!?]\s+)Antigravity/g, '$1Upstream')
+    .replace(/Antigravity/g, 'upstream')
+}
+
 export async function handleAntigravityProtocol({
   req,
   res,
@@ -78,7 +87,8 @@ export async function handleAntigravityProtocol({
   ops = {},
 }) {
   const config = normalizeAntigravityRouting(routing.antigravity)
-  const fail = (status, code, message, param) => {
+  const fail = (status, code, rawMessage, param) => {
+    const message = hideUpstream(rawMessage)
     stats.errors++
     logBag.error_code = code
     logBag.error_message = message
@@ -369,7 +379,9 @@ export async function handleAntigravityProtocol({
     }
     const blocked = last?.code === 'antigravity_content_blocked'
     const code = blocked ? ErrorCode.CONTENT_FILTER_REFUSAL : last?.code || 'antigravity_unavailable'
-    const message = blocked ? CONTENT_BLOCKED_MESSAGE : last?.message || 'Antigravity is temporarily unavailable.'
+    const message = blocked
+      ? CONTENT_BLOCKED_MESSAGE
+      : hideUpstream(last?.message) || 'Upstream is temporarily unavailable.'
     const logMessage = blocked ? contentBlockedLogMessage(last.message) : message
     if (res.headersSent) {
       stats.errors++
