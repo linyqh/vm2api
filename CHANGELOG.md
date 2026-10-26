@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.006.3 — 2026-10-27
+
+- Antigravity 请求的错误消息（含槽内 bridge 返回的消息）在返回客户端和写入请求日志前，把 Antigravity 字样替换为「上游 / Upstream」；错误码不变。
+- 槽位卡片显示 Antigravity 登录的 Google 账号邮箱：槽内 bridge 刷新额度时一并读取 Google userinfo 邮箱（读取失败不影响额度），控制面写入 `vm.antigravity.email`；重新登录会先清空旧邮箱，并在授权成功后立即刷新一次额度。
+
+已部署机升级：更新 Node 控制面后重启；**需对每个 Antigravity 槽位执行「重载 Antigravity bridge」**（`POST /api/panel/vms/:id/reload`）加载新的槽内脚本，之后点「刷新额度」或等待 10 分钟自动刷新即可看到邮箱。无 DB 迁移。
+
 ## 1.4.006.2 — 2026-10-27
 
 - Antigravity 上游内容安全拦截（`PROHIBITED_CONTENT` / `SAFETY` / 提示词拦截）对客户端改为通用的 `content_filter_refusal`（HTTP 400，消息 `The request was blocked by content safety review.`），不再透出 `antigravity_content_blocked` 与 Antigravity 字样；请求日志仅保留拦截原因，面板错误归类为拒绝。
