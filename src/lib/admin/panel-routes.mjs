@@ -1554,6 +1554,15 @@ export function createPanelHandler(ctx) {
               })
               .catch((error) => console.warn('[antigravity] post-login model sync failed', vm.id, error?.message))
           }
+          // The quota read also records the account email shown on the slot card.
+          if (session.authenticated === true && !readAntigravityQuota(cfg.paths.project, vm)) {
+            void (ctx.refreshAntigravityQuota || refreshAntigravityQuota)({
+              projectRoot: cfg.paths.project,
+              vm: getVm(cfg.paths.project, vm.id) || vm,
+              routing: getRouting(),
+              ops: { getVm: () => getVm(cfg.paths.project, vm.id) },
+            }).catch((error) => console.warn('[antigravity] post-login quota refresh failed', vm.id, error?.message))
+          }
           return json(
             res,
             200,

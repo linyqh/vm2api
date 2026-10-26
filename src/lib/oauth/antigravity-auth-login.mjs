@@ -9,6 +9,7 @@ import { normalizeAntigravityRouting } from '../protocol/antigravity-route.mjs'
 import { slotExecArgv } from '../vm/slot-exec.mjs'
 import { slotRuntimeOwner } from './oauth-credentials.mjs'
 import { isValidVmId } from '../vm/vm-file.mjs'
+import { patchVmRecord } from '../vm/vm-registry.mjs'
 
 const sessions = new Map()
 const ACTIVE = new Set(['starting', 'awaiting_code', 'verifying'])
@@ -109,6 +110,8 @@ function markAuthenticated(session) {
     flag: 'wx',
   })
   fs.renameSync(temporary, file)
+  // A new login may be another Google account; the next quota read records its email.
+  patchVmRecord(session.root, session.vm.id, (record) => ({ antigravity: { ...record.antigravity, email: null } }))
   finish(session, 'authenticated')
 }
 

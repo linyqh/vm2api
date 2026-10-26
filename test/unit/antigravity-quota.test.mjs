@@ -51,16 +51,50 @@ test('quota summary refreshes an expired token once and falls back to prod when 
         calls.push([new URL(url).host, options.headers.authorization, options.body])
         if (options.headers.authorization === 'Bearer old') return new Response('', { status: 401 })
         if (url.startsWith('https://daily-cloudcode-pa.')) return new Response('', { status: 429 })
+        if (url.startsWith('https://www.googleapis.com/')) return Response.json({ email: 'owner@example.com' })
         return Response.json(summary)
       },
     },
   )
-  assert.deepEqual(await provider.quota(), { ok: true, summary })
+  assert.deepEqual(await provider.quota(), { ok: true, summary, email: 'owner@example.com' })
   assert.deepEqual(calls, [
     ['daily-cloudcode-pa.googleapis.com', 'Bearer old', '{}'],
     ['daily-cloudcode-pa.googleapis.com', 'Bearer new', '{}'],
     ['cloudcode-pa.googleapis.com', 'Bearer new', '{}'],
+    ['www.googleapis.com', 'Bearer new', undefined],
   ])
+})
+
+test('quota summary still succeeds when the account email cannot be read', async () => {
+  const provider = createAntigravityUpstream(
+    {},
+    {
+      readToken: () => ({ access_token: 't', expiry: '2999-01-01T00:00:00Z' }),
+      fetch: async (url) =>
+        url.startsWith('https://www.googleapis.com/') ? new Response('', { status: 403 }) : Response.json(summary),
+    },
+  )
+  assert.deepEqual(await provider.quota(), { ok: true, summary, email: null })
+})
+
+test('refresh records the account email on the slot for the card to show', async (t) => {
+  const root = slotRoot(t)
+  const record = path.join(root, 'vms', `${vm.id}.json`)
+  fs.writeFileSync(record, JSON.stringify({ ...vm, antigravity: {} }))
+  const read = () => JSON.parse(fs.readFileSync(record, 'utf8'))
+  const ok = await refreshAntigravityQuota({
+    projectRoot: root,
+    vm,
+    ops: { fetchQuota: async () => ({ ok: true, summary, email: 'owner@example.com' }), getVm: read },
+  })
+  assert.equal(ok.ok, true)
+  assert.equal(read().antigravity.email, 'owner@example.com')
+  await refreshAntigravityQuota({
+    projectRoot: root,
+    vm,
+    ops: { fetchQuota: async () => ({ ok: true, summary, email: null }), getVm: read },
+  })
+  assert.equal(read().antigravity.email, 'owner@example.com')
 })
 
 test('quota summary reports rejection without leaking upstream bodies', async () => {

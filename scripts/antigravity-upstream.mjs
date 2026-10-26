@@ -12,6 +12,7 @@ import { execFile } from 'node:child_process'
 // gateway rejects other client identities (HTTP 404), so the CLI's own UA is reproduced.
 const CODE_ASSIST = 'https://daily-cloudcode-pa.googleapis.com'
 const QUOTA_ORIGINS = [CODE_ASSIST, 'https://cloudcode-pa.googleapis.com']
+const USERINFO = 'https://www.googleapis.com/oauth2/v2/userinfo'
 const USER_AGENT =
   'antigravity/cli/1.4.4 (aidev_client; os_type=linux; arch=amd64; cl=1003595037; auth_method=consumer)'
 const MIME = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp'])
@@ -269,6 +270,25 @@ function readToken() {
     return value
   } finally {
     fs.closeSync(fd)
+  }
+}
+
+// Display only: a missing email never fails the quota read.
+async function accountEmail(token, fetchImpl, signal) {
+  try {
+    const response = await fetchImpl(USERINFO, {
+      redirect: 'error',
+      headers: { authorization: `Bearer ${token}` },
+      signal,
+    })
+    if (!response.ok) {
+      await response.body?.cancel()
+      return null
+    }
+    const email = (await response.json())?.email
+    return typeof email === 'string' && email.length <= 254 && /^[^\s@]+@[^\s@]+$/.test(email) ? email : null
+  } catch {
+    return null
   }
 }
 
@@ -627,7 +647,7 @@ export function createAntigravityUpstream(config = {}, dependencies = {}) {
         if (Buffer.byteLength(text) > 1024 * 1024) throw new Error('quota response too large')
         const summary = JSON.parse(text)
         if (!summary || typeof summary !== 'object' || Array.isArray(summary)) throw new Error('invalid quota summary')
-        return { ok: true, summary }
+        return { ok: true, summary, email: await accountEmail(access, fetchImpl, controller.signal) }
       } catch (error) {
         const cancelled = signal?.aborted || closed
         return {

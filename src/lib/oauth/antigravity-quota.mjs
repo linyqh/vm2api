@@ -7,6 +7,7 @@ import { normalizeAntigravityRouting } from '../protocol/antigravity-route.mjs'
 import { isValidVmId } from '../vm/vm-file.mjs'
 import { isAntigravityVm } from '../vm/vm-kind.mjs'
 import { summarizeAntigravitySlot } from '../vm/antigravity-slot.mjs'
+import { patchVmRecord } from '../vm/vm-registry.mjs'
 
 const MAX_BYTES = 256 * 1024
 const active = new Map()
@@ -159,6 +160,10 @@ export async function refreshAntigravityQuota({ projectRoot, vm, routing = {}, o
       writeQuota(projectRoot, currentVm, { error: { code, message, at: new Date().toISOString() } })
       return failure(code, message, result.ok ? 502 : result.status || 502)
     }
+    if (result.email && result.email !== currentVm.antigravity?.email)
+      (ops.patchVm || patchVmRecord)(projectRoot, currentVm.id, (record) => ({
+        antigravity: { ...record.antigravity, email: result.email },
+      }))
     return { ok: true, ...writeQuota(projectRoot, currentVm, { ...summary, updated_at: new Date().toISOString() }) }
   })()
   active.set(key, operation)
