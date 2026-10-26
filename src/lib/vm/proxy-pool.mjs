@@ -1453,6 +1453,9 @@ export class ProxyPool extends EventEmitter {
       port: p.port,
       username: p.username || null,
       password: p.password == null ? null : p.password,
+      // startProxyEgress reads this to write kin-egress domain_forward; without
+      // it the toggle is stored but every helper keeps forwarding IP literals.
+      domain_forward: p.domain_forward === true,
     }
   }
 }

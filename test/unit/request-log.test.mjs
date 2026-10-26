@@ -493,6 +493,29 @@ test('cache breakdown without a split bills 5m unless cache_ttl is explicitly 1h
   assert.equal(hour.cache_creation_1h_tokens, 9)
 })
 
+test('cache breakdown puts the total beyond a partial split into the fallback TTL (#678)', () => {
+  const store = tmpStore('normal')
+  const sum = store.finish(
+    store.start(
+      { method: 'POST', headers: {}, socket: {} },
+      { protocol: 'anthropic.messages', pathName: '/v1/messages' },
+    ),
+    {
+      status: 200,
+      model: 'claude-opus-5-5',
+      upstream_model: 'claude-opus-5-5',
+      usage: {
+        input_tokens: 1,
+        output_tokens: 1,
+        cache_creation_input_tokens: 14890,
+        cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 119 },
+      },
+    },
+  )
+  assert.equal(sum.cache_creation_5m_tokens, 14771)
+  assert.equal(sum.cache_creation_1h_tokens, 119)
+})
+
 test('finish persists web_search_requests from server_tool_use', () => {
   const store = tmpStore('normal')
   const sum = store.finish(
@@ -582,6 +605,22 @@ test('debug mode stores full redacted body', () => {
   assert.deepEqual(dbg[0].hop_meta.params.dropped, ['max_tokens'])
 })
 
+test('debug records retain final header provenance and a separate redacted worker envelope', () => {
+  const store = tmpStore('debug')
+  const ctx = store.start({ method: 'POST', headers: {}, socket: {} }, { protocol: 'anthropic.messages' })
+  store.finish(ctx, {
+    status: 200,
+    outbound_headers_source: 'cli_final',
+    outbound_headers: { accept: 'application/json, text/event-stream', authorization: 'Bearer final-secret' },
+    worker_envelope_headers: { 'x-app': 'cli', authorization: 'Bearer envelope-secret' },
+  })
+  const [record] = store.listDebug({ limit: 1 })
+  assert.equal(record.outbound_headers_source, 'cli_final')
+  assert.equal(record.outbound_headers.accept, 'application/json, text/event-stream')
+  assert.equal(record.outbound_headers.authorization, '***REDACTED***')
+  assert.deepEqual(record.worker_envelope_headers, { 'x-app': 'cli', authorization: '***REDACTED***' })
+})
+
 test('outbound bodies are stored only when the operator configured debug, not via caller headers', () => {
   const outbound = { body: { system: 'gateway persona overlay' }, headers: { 'x-app': 'cli' } }
   const record = (store, headers) => {
@@ -591,6 +630,8 @@ test('outbound bodies are stored only when the operator configured debug, not vi
       inbound_body: { model: 'm' },
       outbound_body: outbound.body,
       outbound_headers: outbound.headers,
+      outbound_headers_source: 'cli_final',
+      worker_envelope_headers: outbound.headers,
     })
     return store.getDebug(ctx.request_id)
   }
@@ -599,6 +640,8 @@ test('outbound bodies are stored only when the operator configured debug, not vi
     assert.deepEqual(forced.inbound_body, { model: 'm' })
     assert.equal(forced.outbound_body, null)
     assert.equal(forced.outbound_headers, null)
+    assert.equal(forced.outbound_headers_source, null)
+    assert.equal(forced.worker_envelope_headers, null)
   }
   const operator = record(tmpStore('debug'), {})
   assert.deepEqual(operator.outbound_body, outbound.body)

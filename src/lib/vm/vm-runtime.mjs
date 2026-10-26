@@ -154,7 +154,8 @@ export function displayName(vmId) {
 }
 
 function parseInspectStdout(name, stdout) {
-  const [running, pid, networkMode, startedAt, image, hostname, runtime, role, restarting] = stdout.split('|')
+  const [running, pid, networkMode, startedAt, image, hostname, runtime, role, restarting, restartPolicy] =
+    stdout.split('|')
   // Docker reports Running=true during a restart-policy backoff; nothing can be exec'd there.
   const crashLooping = restarting === 'true'
   return {
@@ -169,11 +170,12 @@ function parseInspectStdout(name, stdout) {
     hostname: hostname || null,
     runtime: String(runtime || '').trim() || null,
     role: String(role || '').trim() || null,
+    restartPolicy: restartPolicy || null,
   }
 }
 
 const INSPECT_FORMAT =
-  '{{.State.Running}}|{{.State.Pid}}|{{.HostConfig.NetworkMode}}|{{.State.StartedAt}}|{{.Config.Image}}|{{.Config.Hostname}}|{{index .Config.Labels "kin.vm.runtime"}}|{{index .Config.Labels "kin.vm.role"}}|{{.State.Restarting}}'
+  '{{.State.Running}}|{{.State.Pid}}|{{.HostConfig.NetworkMode}}|{{.State.StartedAt}}|{{.Config.Image}}|{{.Config.Hostname}}|{{index .Config.Labels "kin.vm.runtime"}}|{{index .Config.Labels "kin.vm.role"}}|{{.State.Restarting}}|{{.HostConfig.RestartPolicy.Name}}'
 
 /**
  * @returns {{ status: 'found', container: object } | { status: 'missing' } | { status: 'error', error: string, code?: number }}
@@ -192,6 +194,33 @@ export function inspectContainerOutcome(name, { run = sh } = {}) {
 export function inspectContainer(name, opts) {
   const outcome = inspectContainerOutcome(name, opts)
   return outcome.status === 'found' ? outcome.container : null
+}
+
+/** Docker daemon restarts must wait for the control plane to restore transparent egress first. */
+export function slotRestartPolicy(vm) {
+  return isLocalEgressProxy(vm?.proxy) ? 'unless-stopped' : 'no'
+}
+
+function updateSlotRestartPolicy(vm, existing, run) {
+  const policy = slotRestartPolicy(vm)
+  if (!existing || existing.restartPolicy === policy) return { ok: true, changed: false }
+  const result = run(['docker', 'update', '--restart', policy, existing.name])
+  return { ...result, changed: result.ok === true }
+}
+
+/** Migrate existing local slots in place, including paused ones; never start or recreate them. */
+export function syncLocalSlotRestartPolicies(vms, { run = sh } = {}) {
+  const changed = []
+  for (const vm of vms) {
+    if (!vm?.id || vm.node_id || isLocalEgressProxy(vm.proxy)) continue
+    const inspected = inspectContainerOutcome(containerName(vm.id), { run })
+    if (inspected.status === 'missing') continue
+    if (inspected.status === 'error') throw new Error(`slot restart policy ${vm.id}: ${inspected.error}`)
+    const result = updateSlotRestartPolicy(vm, inspected.container, run)
+    if (!result.ok) throw new Error(`slot restart policy ${vm.id}: ${result.stderr || 'docker update failed'}`)
+    if (result.changed) changed.push(vm.id)
+  }
+  return changed
 }
 
 /** Label on GPT slot containers: their PID 1 idles; the Codex kernel runs on the host. */
@@ -307,13 +336,17 @@ export function runtimePatch(vm, info, extra = {}) {
     kernel_socket: rest.kernel_socket || vm.runtime?.kernel_socket || null,
     egress: rest.egress || (isLocalEgressProxy(vm.proxy) ? 'local' : 'explicit-socks5'),
     ...rest,
+    ...(rest.kernel_socket ? { kernel_socket: rest.kernel_socket } : {}),
   }
   return vm
 }
 
 function workerPaths(projectRoot, vmId) {
   const slotRoot = path.join(projectRoot, 'vms', vmId)
-  const runDir = path.join(slotRoot, 'run')
+  // Docker Desktop on WSL hides Unix sockets created on the mounted project
+  // disk. A local deploy can point the slot runtime at a persistent Linux path.
+  const root = String(process.env.KIN_SLOT_RUN_ROOT || '').trim()
+  const runDir = root ? path.join(root, vmId) : path.join(slotRoot, 'run')
   return {
     slotRoot,
     runDir,
@@ -511,11 +544,9 @@ export async function reloadSlotWorker(vm, projectRoot, { routing } = {}) {
  * running runner is enough — missing sock must not docker rm the VM.
  */
 export function slotKernelAlive(existing, paths, vm) {
-  if (!existing?.running) return true
-  if (isKvmRuntime(vm) || existing.runtime === 'kvm') return true
-  // No kernel in a GPT slot container: running is alive.
-  if (isCodexVm(vm) && existing.role === CODEX_SLOT_ROLE) return true
-  if (isAntigravityVm(vm) && existing.role === ANTIGRAVITY_SLOT_ROLE) return true
+  if (isKvmRuntime(vm) || existing?.runtime === 'kvm') return true
+  if (isCodexVm(vm) && existing?.role === CODEX_SLOT_ROLE) return true
+  if (isAntigravityVm(vm) && existing?.role === ANTIGRAVITY_SLOT_ROLE) return true
   return fs.existsSync(paths.kernelSocket)
 }
 
@@ -572,13 +603,26 @@ export function writeWorkerFiles(vm, projectRoot, { transparent, routing, forAut
   const paths = workerPaths(projectRoot, vm.id)
   const uid = runtimeUidNum(vm)
   const gid = Number(GID)
-  fs.mkdirSync(paths.runDir, { recursive: true, mode: 0o700 })
+  const root = typeof process.getuid === 'function' && process.getuid() === 0
+  const dirMode = root ? 0o700 : 0o2770
+  const fileMode = root ? 0o600 : 0o640
+  fs.mkdirSync(paths.runDir, { recursive: true, mode: dirMode })
+  fs.chmodSync(paths.runDir, dirMode)
+  try {
+    fs.chownSync(paths.runDir, root ? uid : -1, root ? gid : process.getgid())
+  } catch {}
+  const shareRuntimeFile = (file) => {
+    try {
+      fs.chmodSync(file, fileMode)
+    } catch {}
+  }
   let token = ''
   try {
     token = fs.readFileSync(paths.token, 'utf8').trim()
   } catch {}
   if (!token) token = crypto.randomBytes(32).toString('hex')
   replaceSlotOwnedFile(paths.token, token + '\n', vm)
+  shareRuntimeFile(paths.token)
   const wantNet = String(slotNetworkForVm(vm) || '')
   const liveNet = String(inspectContainer(containerName(vm.id))?.networkMode || '')
   const onEgress =
@@ -615,7 +659,14 @@ export function writeWorkerFiles(vm, projectRoot, { transparent, routing, forAut
     if (anthropicBaseUrl) workerConfig.anthropic_base_url = anthropicBaseUrl
     if (oauthTokenUrl) workerConfig.oauth_token_url = oauthTokenUrl
   }
-  replaceSlotOwnedFile(paths.config, JSON.stringify(workerConfig, null, 2) + '\n', vm)
+  const workerBody = JSON.stringify(workerConfig, null, 2) + '\n'
+  let workerSame = false
+  try {
+    workerSame = fs.readFileSync(paths.config, 'utf8') === workerBody
+  } catch {}
+  if (workerSame) chownSlotRuntimeFile(paths.config, vm)
+  else replaceSlotOwnedFile(paths.config, workerBody, vm)
+  shareRuntimeFile(paths.config)
   const allowed = assertCliHopAllowed(vm, resolvedRouting)
   if (!allowed.ok) throw new Error(allowed.error)
   const kernel = writeKernelConfig(projectRoot, vm, {
@@ -626,10 +677,13 @@ export function writeWorkerFiles(vm, projectRoot, { transparent, routing, forAut
     timezone: vm.timezone || '',
     routing: resolvedRouting,
   })
-  chownSlotRuntimeFile(paths.runDir, vm)
-  chownSlotRuntimeFile(paths.token, vm)
-  chownSlotRuntimeFile(paths.config, vm)
-  if (kernel?.configPath) chownSlotRuntimeFile(kernel.configPath, vm)
+  // Slot uid is added via --group-add. These files stay in the control-plane
+  // group; chownSlotRuntimeFile would move a successful chown back to KIN_VM_GID.
+  try {
+    fs.chmodSync(paths.token, 0o600)
+  } catch {}
+  shareRuntimeFile(paths.config)
+  if (kernel?.configPath) shareRuntimeFile(kernel.configPath)
   ensureSlotClaudeOwnership(path.join(projectRoot, 'vms', vm.id, 'cli-home'), uid, gid)
   return { ...paths, kernelSocket: kernel?.socketPath || paths.kernelSocket }
 }
@@ -900,7 +954,7 @@ export function buildKvmRunArgs({
     '--network',
     network,
     '--restart',
-    'unless-stopped',
+    slotRestartPolicy(vm),
     '--stop-timeout',
     '30',
     '--memory',
@@ -1023,6 +1077,8 @@ export async function startVmRuntime(
       code: 'antigravity_egress_mismatch',
       error: 'Antigravity 槽位出口网络不匹配，请先停止槽位后重试授权',
     }
+  const restartPolicy = updateSlotRestartPolicy(vm, existing, sh)
+  if (!restartPolicy.ok) return { ok: false, error: restartPolicy.stderr || 'slot restart policy update failed' }
   const paths = slotWorkerPaths(projectRoot, vm)
   const replace = recreate || !slotKernelAlive(existing, paths, vm) || codexContainerStale(existing, vm)
   // Node restart / 开机 must not bounce a live slot with a healthy worker.
@@ -1032,6 +1088,7 @@ export async function startVmRuntime(
       worker_socket: paths.socket,
       worker_run_dir: paths.runDir,
       worker_token_file: paths.token,
+      kernel_socket: paths.kernelSocket,
       memory: mem,
       routing: resolvedRouting,
       ...(kvm ? { accel: accelOpt || vm.runtime?.accel } : {}),
@@ -1167,12 +1224,15 @@ export async function startVmRuntime(
       '--network',
       netName,
       '--restart',
-      'unless-stopped',
+      slotRestartPolicy(vm),
       ...dockerSlotResourceArgs(vm, resolvedRouting),
       '--pids-limit',
       '256',
       '--user',
       runtimeUser(vm),
+      ...(typeof process.getuid === 'function' && process.getuid() === 0
+        ? []
+        : ['--group-add', String(process.getgid())]),
       '--read-only',
       '--tmpfs',
       '/tmp:rw,noexec,nosuid,size=32m',
