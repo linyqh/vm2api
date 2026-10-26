@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.006.2 — 2026-10-27
+
+- Antigravity 上游内容安全拦截（`PROHIBITED_CONTENT` / `SAFETY` / 提示词拦截）对客户端改为通用的 `content_filter_refusal`（HTTP 400，消息 `The request was blocked by content safety review.`），不再透出 `antigravity_content_blocked` 与 Antigravity 字样；请求日志仅保留拦截原因，面板错误归类为拒绝。
+
+已部署机升级：仅需更新 Node 控制面后重启；槽内 bridge 脚本未变，无需重载 Antigravity bridge，无 DB 迁移。
+
 ## 1.4.006.1 — 2026-10-27
 
 - 同步上游 dofastted/vm2api 至 v1.4.006，保留本仓库 Antigravity 平台扩展与四段版本号规则。
