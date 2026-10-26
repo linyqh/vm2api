@@ -552,9 +552,9 @@ function writeSchedule(projectRoot, id, mutate) {
   if (!fs.existsSync(file)) return null
   const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
   migrateScheduleRecord(vm)
-  if (mutate(vm) === false) return summarizeVm(vm)
+  if (mutate(vm) === false) return summarizeVm(vm, projectRoot)
   atomicWriteJson(file, vm, { mode: 0o600 })
-  return summarizeVm(vm)
+  return summarizeVm(vm, projectRoot)
 }
 
 /** 调度关 / 调度开 by the operator. Turning on also clears 不可调度. */

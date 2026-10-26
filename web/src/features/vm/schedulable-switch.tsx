@@ -85,8 +85,9 @@ export function SchedulableSwitch({
   })
 
   const untilText = formatRestrictionUntil(restrictionUntil)
-  const tooltip = unsupported ? '当前槽位不支持 API 调度' :
-    scheduleState === 'unschedulable' && !checked
+  const tooltip = unsupported
+    ? '当前槽位不支持 API 调度'
+    : scheduleState === 'unschedulable' && !checked
       ? `不可调度：${unschedulableText || '错误'}。处理后点击重新开启调度`
       : restricted && checked
         ? untilText

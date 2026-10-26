@@ -312,7 +312,7 @@ test('supervisor verifies container network and executes only a Docker-local bri
   assert.equal(again.code, 'antigravity_runtime_reload_required')
 })
 
-test('diagnostics use AG bridge status and power-on never enables API scheduling', async (t) => {
+test('diagnostics use AG bridge status and power-on without credentials stays unschedulable', async (t) => {
   const root = rootFor(t)
   const record = { ...vm, status: 'running' }
   fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
@@ -342,7 +342,23 @@ test('diagnostics use AG bridge status and power-on never enables API scheduling
   })
   assert.equal(started.ok, true)
   assert.equal(started.vm.schedulable, false)
-  assert.equal(started.vm.schedule_disabled_reason, 'experimental_text_only')
+  assert.equal(started.vm.schedule_disabled_reason, 'no_credential')
+  assert.equal(started.vm.unschedulable.reason, 'no_credential')
+
+  const runDir = path.join(root, 'vms', vm.id, 'run')
+  fs.mkdirSync(runDir, { recursive: true })
+  fs.writeFileSync(path.join(runDir, 'antigravity-auth.json'), JSON.stringify({ authenticated: true }))
+  const authenticated = await powerOnSlot({
+    projectRoot: root,
+    id: vm.id,
+    routing,
+    proxyPool: { ensureBoundToVm: () => vm.proxy },
+    fillTimezone: async () => {},
+    ops: { startSlotReady: async () => ({ ok: true, runtime: vm.runtime }) },
+  })
+  assert.equal(authenticated.ok, true)
+  assert.equal(authenticated.vm.schedulable, true)
+  assert.equal(authenticated.vm.unschedulable, undefined)
 })
 
 test('AG shell is plain and rejects Claude credential/login workflows before writes', async (t) => {

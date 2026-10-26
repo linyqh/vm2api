@@ -436,7 +436,7 @@ export async function powerOnSlot({
       boot,
     }
   }
-  const hasCred = !isAntigravityVm(vm) && vmHasSchedulableCredential(vm, projectRoot)
+  const hasCred = vmHasSchedulableCredential(vm, projectRoot)
   const runtime = boot.runtime || boot.docker?.runtime
   vm =
     patchVmRecord(projectRoot, id, (record) => {
