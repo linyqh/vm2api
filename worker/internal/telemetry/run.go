@@ -68,14 +68,42 @@ func WriteTouch(path string) error {
 }
 
 func lastActivity(path string, fallback time.Time) time.Time {
+	when, _ := readTouch(path)
+	if when.IsZero() {
+		return fallback
+	}
+	return when
+}
+
+func readTouch(path string) (time.Time, string) {
 	if strings.TrimSpace(path) == "" {
-		return fallback
+		return time.Time{}, ""
 	}
-	info, err := os.Stat(path)
+	raw, err := os.ReadFile(path)
 	if err != nil {
-		return fallback
+		return time.Time{}, ""
 	}
-	return info.ModTime()
+	fields := strings.Fields(string(raw))
+	if len(fields) == 0 {
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			return time.Time{}, ""
+		}
+		return info.ModTime(), ""
+	}
+	when, err := time.Parse(time.RFC3339Nano, fields[0])
+	if err != nil {
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			return time.Time{}, ""
+		}
+		when = info.ModTime()
+	}
+	model := ""
+	if len(fields) > 1 {
+		model = fields[1]
+	}
+	return when, model
 }
 
 // Run mirrors cc-bridge telemetry_loop:
@@ -189,7 +217,8 @@ func Run(ctx context.Context, cfg config.Config, deps Deps) error {
 
 		if batchOK && (lastBatch.IsZero() || now.Sub(lastBatch) >= batchInterval(tel)) {
 			uptime := now.Sub(started).Seconds()
-			ev := SuccessEvent(identity, now, uptime, "")
+			_, model := readTouch(deps.TouchPath)
+			ev := SuccessEvent(identity, now, uptime, model)
 			if err := postBatch(ctx, deps, live, token, ev); err != nil {
 				if stopOn4xx(err) {
 					batchOK = false

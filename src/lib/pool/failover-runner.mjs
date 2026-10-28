@@ -838,6 +838,8 @@ export class FailoverRunner {
         model,
         selectionReason: selected.selectionReason,
         waitMs: selected.waitMs,
+        queueWaitMs: selected.queueWaitMs,
+        schedulingMs: selected.schedulingMs,
       })
       let result
       let policy

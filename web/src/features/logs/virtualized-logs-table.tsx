@@ -8,7 +8,6 @@ import {
   formatDuration,
   formatTokenAmount,
   isNonBillingEndpoint,
-  shouldHideOutputRate,
 } from '@/lib/usage-format'
 import { cn } from '@/lib/utils'
 import { useVirtualizedInfiniteList } from '@/hooks/use-virtualized-infinite-list'
@@ -117,9 +116,8 @@ function LogRow({
     oneH: row.cacheCreation1hInputTokens,
     ttl: row.cacheTtlApplied,
   })
-  const rate = calculateOutputRate(row.outputTokens, row.durationMs, row.ttftMs)
-  const showRate =
-    rate != null && !shouldHideOutputRate(rate, row.durationMs, row.ttftMs)
+  const rate = calculateOutputRate(row.outputTokens, row.generationMs)
+  const showRate = rate != null
 
   return (
     <>
@@ -311,8 +309,16 @@ function LogRow({
             </TooltipTrigger>
             <TooltipContent align='end' className='space-y-1 text-xs'>
               <div>总耗时: {formatDuration(row.durationMs)}</div>
+              {row.firstByteMs != null ? (
+                <div>首字节时间（TTFB）: {formatDuration(row.firstByteMs)}</div>
+              ) : null}
               {row.ttftMs != null ? (
                 <div>首 Token 时间（TTFT）: {formatDuration(row.ttftMs)}</div>
+              ) : null}
+              {row.generationMs != null && row.generationMs > 0 ? (
+                <div>
+                  上游输出时间（含推理）: {formatDuration(row.generationMs)}
+                </div>
               ) : null}
               {showRate ? <div>输出速率: {rate.toFixed(1)} tok/s</div> : null}
             </TooltipContent>

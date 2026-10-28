@@ -423,7 +423,7 @@ export function buildBillingAttributionText(
   cliVersion = DEFAULT_CLI_VERSION,
   sessionId = '',
   indexes = null,
-  entrypoint = 'sdk-cli',
+  entrypoint = 'cli',
 ) {
   const ver = parseCliVersion(cliVersion)
   const fp = computeClaudeCodeFingerprint(firstUserText ?? '', ver)
@@ -433,15 +433,15 @@ export function buildBillingAttributionText(
   return `x-anthropic-billing-header: cc_version=${ver}.${fp}; cc_entrypoint=${entry}; cch=${CCH_PLACEHOLDER}; cc_prompt_id=${promptId};${tail}`
 }
 
-/** Panel switch. Only `cli` leaves the shipped `sdk-cli` default. */
+/** Panel switch. Only explicit `sdk-cli` leaves the shipped `cli` default. */
 export function ccEntrypointFromRouting(routing) {
-  return routing?.compatibility?.cc_entrypoint === 'cli' ? 'cli' : 'sdk-cli'
+  return routing?.compatibility?.cc_entrypoint === 'sdk-cli' ? 'sdk-cli' : 'cli'
 }
 
 /** Add the billing block exactly once before the cli-node hop. */
 export function ensureBillingAttribution(
   body,
-  { firstUserText = '', cliVersion = DEFAULT_CLI_VERSION, sessionId = '', indexes = null, entrypoint = 'sdk-cli' } = {},
+  { firstUserText = '', cliVersion = DEFAULT_CLI_VERSION, sessionId = '', indexes = null, entrypoint = 'cli' } = {},
 ) {
   if (!body || typeof body !== 'object') return body
   const hasBilling = (system) => {
@@ -796,11 +796,11 @@ export function buildZeroBillingText(
   firstUserText,
   cliVersion = DEFAULT_CLI_VERSION,
   sessionId = '',
-  entrypoint = 'sdk-cli',
+  entrypoint = 'cli',
 ) {
   const billing = buildBillingAttributionText(firstUserText, cliVersion, sessionId, null, entrypoint)
   const header = billing.endsWith(';') ? billing : `${billing};`
-  return `${header} prompt_version=<${CRS_OFFICIAL_SYSTEM}>`
+  return `${header} prompt_version=<${CRS_OFFICIAL_CLI_SYSTEM}>`
 }
 
 function timezoneEnvBlock(env = {}, sourceTexts = []) {
@@ -830,7 +830,7 @@ export function personaTemplateVars({
   preset = '',
   timezoneOnlyEnv = false,
   messages = null,
-  entrypoint = 'sdk-cli',
+  entrypoint = 'cli',
 } = {}) {
   const billing = buildBillingAttributionText(
     firstUserText,
@@ -843,7 +843,7 @@ export function personaTemplateVars({
   return {
     billing,
     billing_semi: billing.endsWith(';') ? billing : `${billing};`,
-    identity: entrypoint === 'cli' ? CRS_OFFICIAL_CLI_SYSTEM : CRS_OFFICIAL_SYSTEM,
+    identity: CRS_OFFICIAL_CLI_SYSTEM,
     identity_cli: CRS_OFFICIAL_CLI_SYSTEM,
     identity_compact: CRS_COMPACT_IDENTITY,
     reporting: CRS_REPORTING_OUTCOMES,
@@ -1447,6 +1447,7 @@ export function personaTemplateSettingsFromRouting(routing = {}) {
       persona_env_instructions_presets: compat.persona_env_instructions_presets,
       persona_timezone_presets: compat.persona_timezone_presets,
       persona_locale_presets: compat.persona_locale_presets,
+      persona_guidance_presets: compat.persona_guidance_presets,
     },
   }
 }
@@ -1761,6 +1762,8 @@ function rewriteOfficialSystem(
   const indexes = billingIndexesFromMessages(messages)
   const extras = park ? collectParkedStanding(routingFile) : []
   const { env, sourceTexts, facts } = personaEnvForBody(body, { identity, model, overwrite })
+  // Slot locale is opt-in for templates; rewrite keeps only the caller's own Locale line (overwrite writes the slot's).
+  if (!overwrite) env.locale = facts.locale || ''
   // Legacy rewrite keeps mid-conversation role=system in the message list.
   const harness = thirdPartyClientPrompt(body.system)
   const leftover = harness ? '' : parkableSystemTexts(body.system).join('\n\n')
@@ -1813,7 +1816,7 @@ function applyTemplatePersona(
     identity,
     model,
     callerAgent: rawCallerAgent = '',
-    entrypoint = 'sdk-cli',
+    entrypoint = 'cli',
   } = {},
 ) {
   const messages = Array.isArray(body.messages) ? body.messages : []
@@ -1879,7 +1882,10 @@ function applyTemplatePersona(
     const environment = renderPersonaTemplate(officialBlocks, vars, { role: 'system' })
       .map((block) => block.text)
       .join('\n\n')
-    if (environment) {
+    if (environment && !modelSupportsMidConversationSystem(modelId)) {
+      // Haiku 4.5 / Sonnet 5 / Claude 4.x reject mid-conversation role=system: keep it in top-level system.
+      system = [...system, { type: 'text', text: environment }]
+    } else if (environment) {
       const at = messages.findLastIndex((message) => message?.role === 'user')
       if (at >= 0)
         outMessages = [

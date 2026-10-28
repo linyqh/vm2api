@@ -19,6 +19,7 @@ import {
 } from '../../src/lib/cluster/placement.mjs'
 import {
   inspectClusterPayloadChanges,
+  refreshNodeSlotPayload,
   remoteIptablesScript,
   slotContainerBody,
   slotEgressNames,
@@ -500,6 +501,49 @@ test('cluster payload check skips a container already on the content-hashed imag
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
+})
+
+test('node payload refresh leaves a running slot already on the current image up', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cluster-refresh-'))
+  const saved = ['KIN_CLUSTER_WORKER_BIN', 'KIN_CLUSTER_EGRESS_BIN', 'KIN_CODEX_KERNEL_BIN'].map((key) => [
+    key,
+    process.env[key],
+  ])
+  t.after(() => {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  for (const file of [
+    'share/wrap-cli/cli-node',
+    'share/wrap-cli/cc-node',
+    'bin/kin-kernel',
+    'bin/kin-worker',
+    'bin/kin-egress',
+    'bin/kin-codex-kernel',
+  ])
+    fakeElf(path.join(root, file), 1)
+  process.env.KIN_CLUSTER_WORKER_BIN = path.join(root, 'bin/kin-worker')
+  process.env.KIN_CLUSTER_EGRESS_BIN = path.join(root, 'bin/kin-egress')
+  process.env.KIN_CODEX_KERNEL_BIN = path.join(root, 'bin/kin-codex-kernel')
+  const vm = { id: 'vm-03', node_id: 'node-a', kernel: 'ubuntu-24.04', status: 'running' }
+  const current = slotImageSpec(root, 'ubuntu-24.04').ref
+  const inspected = []
+  const report = await refreshNodeSlotPayload(vm, root, {
+    sessionFor: async () => ({ docker: {} }),
+    inspect: async (_docker, name) => {
+      inspected.push(name)
+      return { State: { Running: true }, Config: { Image: current } }
+    },
+    startFn: async () => assert.fail('a slot on the current image must not be recreated'),
+  })
+  assert.deepEqual(inspected, ['kin-03'])
+  assert.equal(report.ok, true)
+  assert.equal(report.kernel_changed, false)
+  assert.equal(report.restarted, false)
+  assert.deepEqual(report.kernel, { ok: true, skipped: true, reason: 'unchanged' })
 })
 
 test('amd64 node payload stays separate from native ARM control helpers', (t) => {

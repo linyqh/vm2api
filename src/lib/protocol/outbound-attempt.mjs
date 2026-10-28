@@ -245,20 +245,20 @@ function stampMessageTail(messages, index, ttl) {
   }
 }
 /** Official Claude Code omits eager streaming and tool cache markers. A caller TTL here makes CLI fill the omitted system and message markers. */
-function stripEagerInputStreaming(tools) {
+function stripEagerInputStreaming(tools, { preserveCacheControl = false } = {}) {
   if (!Array.isArray(tools)) return tools
   let changed = false
   const next = tools.map((tool) => {
     if (!tool || typeof tool !== 'object') return tool
     const hasOwn = Object.prototype.hasOwnProperty.call(tool, 'eager_input_streaming')
-    const hasCache = Object.prototype.hasOwnProperty.call(tool, 'cache_control')
+    const hasCache = !preserveCacheControl && Object.prototype.hasOwnProperty.call(tool, 'cache_control')
     const fn = tool.function
     const fnHas = fn && typeof fn === 'object' && Object.prototype.hasOwnProperty.call(fn, 'eager_input_streaming')
     if (!hasOwn && !hasCache && !fnHas) return tool
     changed = true
     const copy = { ...tool }
     delete copy.eager_input_streaming
-    delete copy.cache_control
+    if (!preserveCacheControl) delete copy.cache_control
     if (fnHas) {
       copy.function = { ...fn }
       delete copy.function.eager_input_streaming
@@ -350,7 +350,22 @@ export function prepareCliHopBody(
       body = { ...body, system: officialSystemTemplate(body.system, cacheTtl) }
       body.messages = officialMessageMarker(body.messages, cacheTtl)
     }
-    if (Array.isArray(body.tools)) body = { ...body, tools: stripEagerInputStreaming(body.tools) }
+    // Zero owns its system layout, but does not assemble message breakpoints.
+    // Only supply a fallback when the caller has no explicit cache policy:
+    // preserving existing markers also preserves their budget and TTL order.
+    const zeroFallback = preparedZero && !lean && !shaped && !preserveSystem
+    if (zeroFallback) {
+      const hasMarker = (node) => node?.cache_control != null
+      const hasCallerMarkers =
+        body.system.some(hasMarker) ||
+        (Array.isArray(body.tools) && body.tools.some(hasMarker)) ||
+        (Array.isArray(body.messages) &&
+          body.messages.some((message) => Array.isArray(message?.content) && message.content.some(hasMarker)))
+      if (!hasCallerMarkers) body.messages = officialMessageMarker(body.messages, cacheTtl)
+    }
+    if (Array.isArray(body.tools)) {
+      body = { ...body, tools: stripEagerInputStreaming(body.tools, { preserveCacheControl: zeroFallback }) }
+    }
   }
   return body
 }

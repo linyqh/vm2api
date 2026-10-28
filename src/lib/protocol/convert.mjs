@@ -16,6 +16,13 @@ import { openaiReasoningToClaudeThinking, claudeThinkingToOpenAIReasoning } from
 import { openaiContentToClaudeContent } from './images.mjs'
 import { remapCodexTools } from './codex-tools.mjs'
 import { CLAUDE_WEB_SEARCH_TOOL, isWebSearchTool } from './web-search.mjs'
+import {
+  extractOpenaiUsage,
+  isOpenaiWireUsage,
+  mergeUsage,
+  openaiChatUsageFromExtract,
+  reasoningTokensOf,
+} from './openai-usage.mjs'
 
 const DEFAULT_MODEL = 'claude-haiku-4-5-20251001'
 
@@ -445,9 +452,20 @@ export function fromClaudeToOpenAIChat(claude, requestedModel, vmId, mode = 'con
 /**
  * Claude usage → OpenAI Chat usage with cache detail
  * (sub2api apicompat ChatTokenDetails counterpart: cached_tokens / cache_creation_tokens).
- * Token totals keep the Anthropic input_tokens meaning — details are additive only.
+ * Anthropic input is uncached; details are added to form inclusive prompt_tokens.
+ * OpenAI-inclusive usage is passed through without adding cache again.
+ * reasoning_tokens is a subset of completion_tokens and is never added to it.
  */
 function chatUsage(usage) {
+  if (isOpenaiWireUsage(usage)) {
+    return (
+      openaiChatUsageFromExtract(extractOpenaiUsage(usage)) || {
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0,
+      }
+    )
+  }
   const uncached = Number(usage?.input_tokens || 0)
   const cached = cacheReadTokens(usage)
   const created = cacheCreationTokens(usage)
@@ -460,6 +478,8 @@ function chatUsage(usage) {
   }
   const details = promptTokensDetails(usage)
   if (details) out.prompt_tokens_details = details
+  const reasoning = reasoningTokensOf(usage)
+  if (reasoning != null) out.completion_tokens_details = { reasoning_tokens: reasoning }
   return out
 }
 
@@ -524,6 +544,27 @@ export function fromClaudeToResponses(claude, requestedModel, vmId, mode = 'conv
 
 /** Claude usage → OpenAI Responses usage with input_tokens_details cache breakdown. */
 function responsesUsage(usage) {
+  if (isOpenaiWireUsage(usage)) {
+    const extracted = extractOpenaiUsage(usage)
+    const input = extracted?.input_tokens || 0
+    const output = extracted?.output_tokens || 0
+    const out = {
+      input_tokens: input,
+      output_tokens: output,
+      total_tokens: extracted?.total_tokens ?? input + output,
+    }
+    if (extracted?.cached_tokens != null || extracted?.cache_write_tokens != null) {
+      out.input_tokens_details = {}
+      if (extracted.cached_tokens != null) out.input_tokens_details.cached_tokens = extracted.cached_tokens
+      if (extracted.cache_write_tokens != null) {
+        out.input_tokens_details.cache_creation_tokens = extracted.cache_write_tokens
+      }
+    }
+    if (extracted?.reasoning_tokens != null) {
+      out.output_tokens_details = { reasoning_tokens: extracted.reasoning_tokens }
+    }
+    return out
+  }
   const uncached = Number(usage?.input_tokens || 0)
   const cached = cacheReadTokens(usage)
   const created = cacheCreationTokens(usage)
@@ -536,6 +577,8 @@ function responsesUsage(usage) {
   }
   const details = promptTokensDetails(usage)
   if (details) out.input_tokens_details = details
+  const reasoning = reasoningTokensOf(usage)
+  if (reasoning != null) out.output_tokens_details = { reasoning_tokens: reasoning }
   return out
 }
 
@@ -681,7 +724,7 @@ export function applyClaudeSSELineToMessage(line, state) {
     if (evt.delta && Object.prototype.hasOwnProperty.call(evt.delta, 'diagnostics')) {
       message.diagnostics = evt.delta.diagnostics
     }
-    if (evt.usage) message.usage = { ...(message.usage || {}), ...evt.usage }
+    if (evt.usage) message.usage = mergeUsage(message.usage, evt.usage)
   }
   return message
 }

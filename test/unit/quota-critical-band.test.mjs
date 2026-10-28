@@ -197,6 +197,23 @@ function schedulerProject() {
 }
 
 class RuntimeRepo {
+  constructor(accounts = null) {
+    this.accounts = accounts
+  }
+  schedulingSnapshot(ids) {
+    return new Map(
+      ids.map((id) => [
+        id,
+        {
+          state: this.get(id),
+          account: this.accounts?.get(id) ? { status: 'active', schedulable: true, ...this.accounts.get(id) } : null,
+        },
+      ]),
+    )
+  }
+  writeHeartbeat(input) {
+    this.upsert(input)
+  }
   states = new Map()
   get(id) {
     return this.states.get(id) || null
@@ -221,7 +238,7 @@ test('scheduler switches using requestRisk on the quotaRequest body estimate', a
   accountQuota.tryAcquire = (id, opts = {}) => origAcq(id, { ...opts, requestRisk: largeColdRisk })
   const pool = new PoolScheduler({
     projectRoot: root,
-    runtimeRepo: new RuntimeRepo(),
+    runtimeRepo: new RuntimeRepo(accountQuota.repo),
     accountQuota,
     workerHealth: async () => ({ ok: true, credential: { generation: 1, has_access: true } }),
     config: { fallback_wait_timeout_ms: 5, sticky_wait_timeout_ms: 5 },
@@ -246,7 +263,7 @@ test('all in-band accounts yield quota_guard_request_too_large', async (t) => {
   accountQuota.canAccept = (id, opts = {}) => orig(id, { ...opts, requestRisk: largeColdRisk })
   const pool = new PoolScheduler({
     projectRoot: root,
-    runtimeRepo: new RuntimeRepo(),
+    runtimeRepo: new RuntimeRepo(accountQuota.repo),
     accountQuota,
     workerHealth: async () => ({ ok: true, credential: { generation: 1, has_access: true } }),
     config: { fallback_wait_timeout_ms: 5, sticky_wait_timeout_ms: 5 },

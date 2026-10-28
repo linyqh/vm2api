@@ -72,6 +72,8 @@ import { syncIpv6ProxyEgress } from './lib/vm/proxy-policy-runtime.mjs'
 import { GATEWAY_CAPABILITIES } from './lib/vm/execution-context.mjs'
 import { isTelemetryPath, telemetryInterceptResponse } from './lib/identity/telemetry-rewrite.mjs'
 import { openDatabase, closeDatabase } from './lib/db/database.mjs'
+import { JevUsageRepo } from './lib/db/repos/jev-usage-repo.mjs'
+import { installJevUsageRecorder } from './lib/protocol/jev-usage.mjs'
 import { runLegacyImport } from './lib/db/legacy-import.mjs'
 import { initVmDbSync, stopVmWatch } from './lib/vm/vm-db-sync.mjs'
 import { BackupService } from './lib/admin/backup-service.mjs'
@@ -146,6 +148,8 @@ const allowRate = createRateLimiter({
 // --- Persistent store (SQLite, sub2api-inspired) ---
 const dataDir = cfg.paths.data || path.join(cfg.paths.root, 'data')
 openDatabase({ dataDir })
+const jevUsageRepo = new JevUsageRepo()
+installJevUsageRecorder((event) => jevUsageRepo.record(event))
 try {
   loadModelPolicy()
 } catch (e) {
@@ -1249,6 +1253,7 @@ let _shuttingDown = false
 async function shutdown(signal) {
   if (_shuttingDown) return
   _shuttingDown = true
+  installJevUsageRecorder(null)
   console.log(`[shutdown] ${signal} — closing`)
   try {
     vmTestSchedule.stop()

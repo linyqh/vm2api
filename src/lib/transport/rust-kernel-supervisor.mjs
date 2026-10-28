@@ -16,6 +16,7 @@ import {
 import { maxRequestBytes, streamIdleTimeoutMs } from '../core/config.mjs'
 import { profileForPreset } from '../identity/official-profiles.mjs'
 import { cacheTtlFromRouting, normalizeCacheTtl } from '../protocol/cache-ttl.mjs'
+import { getModelPolicy } from '../protocol/model-policy.mjs'
 import { ccEntrypointFromRouting } from '../identity/crs-persona.mjs'
 import { setVmSchedulable, listVms, getVm } from '../vm/vm-registry.mjs'
 import { isClaudeVm } from '../vm/vm-kind.mjs'
@@ -42,6 +43,19 @@ import { slotHost } from '../vm/slot-host.mjs'
 function normalizeAutoCompactWindow(value) {
   const windowTokens = Number(value)
   return Number.isInteger(windowTokens) && windowTokens >= 100_000 && windowTokens <= 1_000_000 ? windowTokens : null
+}
+
+const PANEL_EFFORTS = ['off', 'low', 'medium', 'high', 'xhigh', 'max']
+
+function modelEffortTable(routing, previous) {
+  if (routing == null) return previous && typeof previous === 'object' && !Array.isArray(previous) ? previous : {}
+  const models = getModelPolicy()?.models || {}
+  const out = {}
+  for (const [id, row] of Object.entries(models)) {
+    const effort = row?.params?.default_effort
+    if (PANEL_EFFORTS.includes(effort)) out[String(id).toLowerCase()] = effort
+  }
+  return out
 }
 
 const starts = new Map()
@@ -747,6 +761,7 @@ export function writeKernelConfig(
       ? normalizeSessionIdleTtlSeconds(previous.session_idle_ttl_seconds)
       : normalizeSessionIdleTtlSeconds(routing?.inference?.session_idle_ttl_seconds)
 
+  const modelEffort = modelEffortTable(routing, previous.model_effort)
   const kind = runtimeKind(record)
   const config = {
     vm_id: vm.id,
@@ -780,9 +795,10 @@ export function writeKernelConfig(
     cli_version: profileForPreset(resolveSlotPersonaPreset(vm, routing || {})).cliVersion,
     default_cache_ttl: defaultCacheTtl,
     cc_entrypoint:
-      routing == null ? (previous.cc_entrypoint === 'cli' ? 'cli' : 'sdk-cli') : ccEntrypointFromRouting(routing),
+      routing == null ? (previous.cc_entrypoint === 'sdk-cli' ? 'sdk-cli' : 'cli') : ccEntrypointFromRouting(routing),
     cch_enabled: cchEnabled,
     auto_compact_window: autoCompactWindow,
+    model_effort: modelEffort,
   }
 
   if (tz) config.timezone = tz

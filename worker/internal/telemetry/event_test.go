@@ -1,11 +1,29 @@
 package telemetry
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 )
+
+func decodeProcess(value any) (map[string]any, error) {
+	raw, ok := value.(string)
+	if !ok {
+		return nil, fmt.Errorf("process is %T", value)
+	}
+	body, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err = json.Unmarshal(body, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
 
 func TestInitEventUsesOfficial1PEnvelope(t *testing.T) {
 	ev := InitEvent(Identity{
@@ -46,13 +64,15 @@ func TestInitEventUsesOfficial1PEnvelope(t *testing.T) {
 		`"device_id":"` + strings.Repeat("ab", 32) + `"`,
 		`"account_uuid":"acc"`,
 		`"organization_uuid":"org"`,
-		`"email":"slot@example.com"`,
 		`"session_id":"sess"`,
 		`"client_timestamp":"2026-08-23T01:00:00.000Z"`,
 		`"platform":"linux"`,
 		`"platform_raw":"linux"`,
 		`"arch":"x64"`,
 		`"shell":"bash"`,
+		`"node_version":"v26.3.0"`,
+		`"is_running_with_bun":true`,
+		`"build_time":"2026-10-18T20:20:57Z"`,
 		`"linux_distro_id":"ubuntu"`,
 		`"linux_distro_version":"24.04"`,
 		`"linux_kernel":"6.8.0-generic"`,
@@ -64,7 +84,10 @@ func TestInitEventUsesOfficial1PEnvelope(t *testing.T) {
 			t.Fatalf("missing %s in %s", must, raw)
 		}
 	}
-	for _, drop := range []string{`"node_version"`, `"is_running_with_bun"`, `"betas"`, `"additional_metadata"`, `"model"`} {
+	if strings.Contains(string(raw), `"email"`) {
+		t.Fatalf("main path must not upload email: %s", raw)
+	}
+	for _, drop := range []string{`"betas"`, `"additional_metadata"`, `"coworker_type"`, `"github_event_name"`} {
 		if strings.Contains(string(raw), drop) {
 			t.Fatalf("did not expect %s in %s", drop, raw)
 		}
@@ -96,11 +119,22 @@ func TestSuccessEventMatchesBridgeEnvelope(t *testing.T) {
 	if ContainsForbidden(raw) {
 		t.Fatalf("forbidden: %s", raw)
 	}
-	if !strings.Contains(string(raw), `"linux_kernel"`) {
-		t.Fatalf("full env missing linux_kernel: %s", raw)
+	env := ev.EventData["env"].(map[string]any)
+	if _, ok := env["linux_kernel"]; ok {
+		t.Fatalf("empty linux_kernel must be omitted: %s", raw)
 	}
-	if strings.Contains(string(raw), `"model"`) || strings.Contains(string(raw), "claude-sonnet-5") {
-		t.Fatalf("model must not be uploaded: %s", raw)
+	if env["node_version"] != "v26.3.0" || env["is_running_with_bun"] != true {
+		t.Fatalf("required env missing: %s", raw)
+	}
+	proc, err := decodeProcess(ev.EventData["process"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := proc["cpuWindowMs"]; !ok {
+		t.Fatalf("process missing cpuWindowMs: %v", proc)
+	}
+	if ev.EventData["model"] != "claude-sonnet-5" {
+		t.Fatalf("model=%v", ev.EventData["model"])
 	}
 }
 
@@ -152,12 +186,18 @@ func TestEventUsesConfiguredEnvAndOmitsBetas(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := string(raw)
-	for _, must := range []string{`"linux_kernel":"from-env"`, `"version":"2.1.278"`, `"shell":"bash"`, `"vcs":"git"`, `"runtimes":"node"`} {
+	for _, must := range []string{
+		`"linux_kernel":"from-env"`, `"version":"2.1.278"`, `"shell":"bash"`, `"runtimes":"node"`,
+		`"node_version":"v1"`, `"is_running_with_bun":true`,
+	} {
 		if !strings.Contains(body, must) {
 			t.Fatalf("missing %s in %s", must, body)
 		}
 	}
-	for _, drop := range []string{"thinking-binding-controls-2026-08-01", `"node_version"`, `"is_running_with_bun"`, "2.1.241"} {
+	if strings.Contains(body, `"vcs"`) {
+		t.Fatalf("empty vcs must be omitted: %s", body)
+	}
+	for _, drop := range []string{"thinking-binding-controls-2026-08-01", "2.1.241"} {
 		if strings.Contains(body, drop) {
 			t.Fatalf("unexpected %s in %s", drop, body)
 		}
@@ -168,11 +208,11 @@ func TestEventUsesConfiguredEnvAndOmitsBetas(t *testing.T) {
 	if strings.Contains(body, "thinking-binding-controls") || strings.Contains(body, "advanced-tool-use") {
 		t.Fatalf("fallback uploaded betas: %s", body)
 	}
-	if !strings.Contains(body, `"version":"2.1.293"`) || !strings.Contains(body, `"shell":"bash"`) {
+	if !strings.Contains(body, `"version":"2.1.303"`) || !strings.Contains(body, `"shell":"bash"`) || !strings.Contains(body, `"node_version":"v26.3.0"`) {
 		t.Fatalf("fallback=%s", body)
 	}
 	attrs := GrowthbookEval(Identity{UserID: "u"})["attributes"].(map[string]any)
-	if attrs["appVersion"] != "2.1.293" {
+	if attrs["appVersion"] != "2.1.303" {
 		t.Fatalf("appVersion=%v", attrs["appVersion"])
 	}
 }
@@ -200,10 +240,10 @@ func TestSanitizeEnvDropsGuestHardwareAndSecrets(t *testing.T) {
 		},
 	}, time.Date(2026, 8, 23, 1, 0, 0, 0, time.UTC))
 	env, _ := ev.EventData["env"].(map[string]any)
-	if env["platform"] != "linux" || env["shell"] != "zsh" {
+	if env["platform"] != "linux" || env["shell"] != "zsh" || env["node_version"] != "v1" {
 		t.Fatalf("official keys lost: %v", env)
 	}
-	for _, drop := range append([]string{"node_version", "authorization", "hostname", "machine_id"}, guestHardwareKeys...) {
+	for _, drop := range append([]string{"authorization", "hostname", "machine_id"}, guestHardwareKeys...) {
 		if _, ok := env[drop]; ok {
 			t.Fatalf("leaked %s in %v", drop, env)
 		}

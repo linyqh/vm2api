@@ -48,6 +48,23 @@ function project() {
 }
 
 class RuntimeRepo {
+  constructor(accounts = null) {
+    this.accounts = accounts
+  }
+  schedulingSnapshot(ids) {
+    return new Map(
+      ids.map((id) => [
+        id,
+        {
+          state: this.get(id),
+          account: this.accounts?.get(id) ? { status: 'active', schedulable: true, ...this.accounts.get(id) } : null,
+        },
+      ]),
+    )
+  }
+  writeHeartbeat(input) {
+    this.upsert(input)
+  }
   states = new Map()
 
   get(id) {
@@ -97,9 +114,11 @@ class RuntimeRepo {
 }
 
 function scheduler(root, extras = {}) {
+  const runtime = extras.runtimeRepo || new RuntimeRepo()
+  runtime.accounts = extras.accountQuota?.repo || null
   return new PoolScheduler({
     projectRoot: root,
-    runtimeRepo: extras.runtimeRepo || new RuntimeRepo(),
+    runtimeRepo: runtime,
     stickyRouter: extras.stickyRouter || null,
     accountQuota: extras.accountQuota || { canAccept: () => ({ ok: true }) },
     workerHealth: extras.workerHealth || (async () => ({ ok: true, credential: { generation: 1, has_access: true } })),
@@ -1418,7 +1437,7 @@ test('syncQuotaSchedule keeps Extra 5h exhausted schedulable and skips the slot'
   pool = new PoolScheduler({
     projectRoot: root,
     accountQuota: q,
-    runtimeRepo: repo,
+    runtimeRepo: Object.assign(repo, { accounts: q.repo }),
     workerHealth: async () => ({ ok: true, credential: { generation: 1, has_access: true } }),
   })
   const vmPath = path.join(root, 'vms', 'vm-01.json')
@@ -1452,7 +1471,7 @@ test('syncQuotaSchedule auto-picks Extra 5h again after the window opens', async
   pool = new PoolScheduler({
     projectRoot: root,
     accountQuota: q,
-    runtimeRepo: new RuntimeRepo(),
+    runtimeRepo: new RuntimeRepo(q.repo),
     workerHealth: async () => ({ ok: true, credential: { generation: 1, has_access: true } }),
   })
   const vmPath = path.join(root, 'vms', 'vm-01.json')
@@ -1500,7 +1519,7 @@ test('syncQuotaSchedule does not turn a manual-off slot back on', async (t) => {
   pool = new PoolScheduler({
     projectRoot: root,
     accountQuota: q,
-    runtimeRepo: new RuntimeRepo(),
+    runtimeRepo: new RuntimeRepo(q.repo),
     workerHealth: async () => ({ ok: true, credential: { generation: 1, has_access: true } }),
   })
   const out = pool.syncQuotaSchedule(JSON.parse(fs.readFileSync(vmPath, 'utf8')))
@@ -1531,7 +1550,7 @@ test('leftover quota 调度关 is restored to restricted without flipping the op
   vm.schedulable = false
   vm.schedule_disabled_reason = 'quota_5h_header'
   fs.writeFileSync(vmPath, JSON.stringify(vm))
-  pool = new PoolScheduler({ projectRoot: root, accountQuota: q, runtimeRepo: new RuntimeRepo() })
+  pool = new PoolScheduler({ projectRoot: root, accountQuota: q, runtimeRepo: new RuntimeRepo(q.repo) })
   const out = pool.syncQuotaSchedule(JSON.parse(fs.readFileSync(vmPath, 'utf8')))
   assert.equal(out.action, 'restore')
   const after = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
@@ -1659,6 +1678,7 @@ test('slot-full kernel with live CLI is waitable, not worker_unhealthy', async (
   const selected = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
   assert.equal(selected.ok, true)
   assert.equal(selected.waitReason, 'slot_busy')
+  await pool.flushHealthWrites()
   assert.notEqual(repo.get(selected.accountId)?.status, 'worker_unhealthy')
   assert.equal(repo.get(selected.accountId)?.status, 'busy')
   selected.release()

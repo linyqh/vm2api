@@ -13,7 +13,8 @@ import { ErrorCode, ErrorType, makeError } from '../core/errors.mjs'
 import { refusalUserDocument } from '../core/refusal-similarity.mjs'
 import { normalizeText } from '../core/distill-detect.mjs'
 import { hasAccessPresence } from '../oauth/oauth-credentials.mjs'
-import { prepareInterceptText } from './jev-prepare.mjs'
+import { prepareInterceptText, stripEnvironmentSection, stripReminders } from './jev-prepare.mjs'
+import { isOfficialTypeSafeUrl, jevKeyFingerprint, recordJevUsage } from './jev-usage.mjs'
 import { inferClaudeTier } from '../pool/claude-tier.mjs'
 
 export const JEV_SETTING = 'jev_intercept'
@@ -1002,28 +1003,42 @@ export function matchHardPolicy(text, extra = [], rules = null) {
   return null
 }
 
-/** Hard regex sees user-authored turns only. Tool results and official system text are not scanned. */
-export function jevDocument(inbound, body = inbound) {
-  return refusalUserDocument(inbound, body, { includeToolResults: false })
+/** Drop harness reminders and `# Environment` before a gate sees a user turn. */
+function cleanUserAsk(text) {
+  return stripEnvironmentSection(stripReminders(text))
 }
 
-/** Jev also sees the client system. Roleplay tasks put the sexual text there and leave the user turn as a character card. */
+/** Hard regex sees user-authored turns only. Tool results, system, and env are not scanned. */
+export function jevDocument(inbound, body = inbound) {
+  return refusalUserDocument(inbound, body, { includeToolResults: false, clean: cleanUserAsk })
+}
+
+/** User text only. System prompts, env blocks, and tool payloads are not the ask. */
 function jevModelContentText(content) {
-  if (typeof content === 'string') return content
+  if (typeof content === 'string') return cleanUserAsk(content)
   if (Array.isArray(content)) return content.map(jevModelContentText).filter(Boolean).join('\n')
   if (!content || typeof content !== 'object') return ''
   const type = String(content.type || '')
   if (type === 'tool_result' || type === 'function_call_output' || type.endsWith('_tool_result')) return ''
-  if (typeof content.text === 'string') return content.text
-  if (typeof content.content === 'string') return content.content
+  if (typeof content.text === 'string') return cleanUserAsk(content.text)
+  if (typeof content.content === 'string') return cleanUserAsk(content.content)
   if (Array.isArray(content.content)) return jevModelContentText(content.content)
   return ''
 }
 
+/** Last labeled user turn, without the `[user message N]` prefix. */
+export function jevCurrentAsk(document) {
+  const text = String(document || '').trim()
+  if (!text) return ''
+  const marked = text.split('\n[current ask]\n')
+  const block = marked.length > 1 ? marked[marked.length - 1] : text
+  return block.replace(/^\[user (?:message|input) \d+\]\n/, '').trim()
+}
+
 /**
- * Preserve provenance for semantic moderation. The old document flattened
- * system and user turns, so quoted attacks in history looked like the current
- * ask. Labels are context for the decision model, not an allowlist.
+ * User turns only, labeled by position. System, instructions, developer, and
+ * env blocks are harness text; scoring them blocks ordinary coding sessions.
+ * The current ask is the last user turn. Assistant and tool turns stay out.
  */
 export function jevModelDocument(inbound, body = inbound) {
   const seen = new Set()
@@ -1038,29 +1053,26 @@ export function jevModelDocument(inbound, body = inbound) {
     parts.push(`[${source}]\n${norm}`)
   }
   for (const src of [inbound, body]) {
-    for (const field of ['system', 'instructions']) {
-      const system = src?.[field]
-      const blocks = typeof system === 'string' ? [system] : Array.isArray(system) ? system : []
-      for (const block of blocks) push('system', typeof block === 'string' ? block : block?.text)
-    }
     const messages = Array.isArray(src?.messages) ? src.messages : []
     messages.forEach((message, index) => {
       const role = String(message?.role || 'unknown').toLowerCase()
-      if (role === 'tool' || role === 'function' || role === 'assistant' || role === 'system') return
-      push(`${role} message ${index + 1}`, jevModelContentText(message?.content))
+      if (role !== 'user') return
+      push(`user message ${index + 1}`, jevModelContentText(message?.content))
     })
     const input = typeof src?.input === 'string' ? [src.input] : Array.isArray(src?.input) ? src.input : []
     input.forEach((item, index) => {
       if (typeof item === 'string') {
-        push(`user input ${index + 1}`, item)
+        push(`user input ${index + 1}`, cleanUserAsk(item))
         return
       }
       const role = String(item?.role || 'user').toLowerCase()
-      if (role === 'tool' || role === 'assistant' || role === 'system') return
-      push(`${role} input ${index + 1}`, jevModelContentText(item?.content ?? item))
+      if (role !== 'user' && role !== '') return
+      push(`user input ${index + 1}`, jevModelContentText(item?.content ?? item))
     })
   }
-  return parts.join('\n')
+  if (!parts.length) return ''
+  const current = parts[parts.length - 1]
+  return parts.length === 1 ? current : `${parts.join('\n')}\n[current ask]\n${current}`
 }
 
 /** Explicit model wins. Otherwise Jev uses jev-latest, ModernBERT uses english, Laya lets the router choose. */
@@ -1308,6 +1320,17 @@ export async function classifyJev(text, cfg, fetchImpl = globalThis.fetch, now =
   for (let i = 0; i < targets.length; i++) {
     const target = targets[(start + i) % targets.length]
     if (skipUrl.has(target.url)) continue
+    // One row per real provider attempt; dedup replays return before this loop.
+    const attemptStarted = Date.now()
+    const attemptUsage = {
+      created_at: new Date(attemptStarted).toISOString(),
+      request_id: cfg?.policy_request_id,
+      provider: config.provider,
+      model,
+      key_fingerprint: jevKeyFingerprint(target.apiKey),
+      official_typesafe: isOfficialTypeSafeUrl(target.url),
+      outcome: 'network_error',
+    }
     try {
       const response = await fetchImpl(target.url, {
         method: 'POST',
@@ -1318,6 +1341,8 @@ export async function classifyJev(text, cfg, fetchImpl = globalThis.fetch, now =
         body: JSON.stringify(payload),
         signal: AbortSignal.timeout(config.timeout_ms),
       })
+      attemptUsage.http_status = Number(response?.status) || null
+      attemptUsage.outcome = response?.ok ? 'invalid_response' : 'http_error'
       if (!response?.ok) {
         const status = Number(response?.status) || 0
         if (status === 401 || status === 429 || status === 529) {
@@ -1328,21 +1353,29 @@ export async function classifyJev(text, cfg, fetchImpl = globalThis.fetch, now =
         if (!http) http = `上游 ${status || '失败'}`
         continue
       }
-      const decision = parsePolicyDecision(await response.json(), config)
-      if (!decision) return { action: 'pass', reason: 'invalid' }
+      const responsePayload = await response.json()
+      attemptUsage.usage = responsePayload?.usage
+      attemptUsage.response_model = responsePayload?.model
+      const decision = parsePolicyDecision(responsePayload, config)
+      if (!decision) return { action: 'pass', reason: 'invalid', state: document }
+      attemptUsage.outcome = 'success'
       const verdict = decision.hits.length
         ? {
             action: 'block',
             category: decision.hits[0].category,
             categories: decision.hits.map((hit) => hit.category),
+            state: document,
           }
-        : { action: 'pass', reason: 'safe' }
+        : { action: 'pass', reason: 'safe', state: document }
       if (windowMs > 0) verdictCache.set(key, { verdict, at: now })
       return verdict
     } catch {
       // Host-level. Do not retire keys, and do not walk the rest of this host.
       skipUrl.add(target.url)
       network = true
+    } finally {
+      attemptUsage.duration_ms = Date.now() - attemptStarted
+      recordJevUsage(attemptUsage)
     }
   }
   return unavailable(config, network ? '网络异常' : http || '密钥失效')

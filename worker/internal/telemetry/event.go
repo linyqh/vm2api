@@ -31,7 +31,9 @@ const (
 	defaultClientType  = "cli"
 	defaultTerminal    = "unknown"
 	defaultPlatform    = "linux"
-	officialCLIVersion = "2.1.293"
+	officialCLIVersion = "2.1.303"
+	officialBuildTime  = "2026-10-18T20:20:57Z"
+	officialNode       = "v26.3.0"
 )
 
 func InitEvent(id Identity, now time.Time) Event {
@@ -42,7 +44,7 @@ func SuccessEvent(id Identity, now time.Time, uptimeSecs float64, model string) 
 	return namedEvent(id, eventTenguSuccess, now, uptimeSecs, model)
 }
 
-func namedEvent(id Identity, name string, now time.Time, uptimeSecs float64, _ string) Event {
+func namedEvent(id Identity, name string, now time.Time, uptimeSecs float64, model string) Event {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
@@ -61,7 +63,9 @@ func namedEvent(id Identity, name string, now time.Time, uptimeSecs float64, _ s
 	}
 	put(data, "device_id", telemetryDevice(id))
 	put(data, "session_id", id.SessionID)
-	put(data, "email", id.Email)
+	if name != eventTenguInit {
+		put(data, "model", model)
+	}
 	if auth := authBlock(id); len(auth) > 0 {
 		data["auth"] = auth
 	}
@@ -105,7 +109,6 @@ func GrowthbookEval(id Identity) map[string]any {
 		"userType":   defaultUserType,
 		"entrypoint": entrypoint,
 	}
-	put(attrs, "email", id.Email)
 	put(attrs, "accountUUID", id.AccountUUID)
 	put(attrs, "organizationUUID", id.OrgUUID)
 	put(attrs, "subscriptionType", id.SubscriptionType)
@@ -148,57 +151,51 @@ func envBlock(id Identity) map[string]any {
 	if platform != "linux" {
 		deploy = "unknown-" + platform
 	}
-	vcs := strings.TrimSpace(id.VCS)
-	if vcs == "" {
-		vcs = "git"
-	}
 	runtimes := strings.TrimSpace(id.Runtimes)
 	if runtimes == "" {
 		runtimes = "node"
 	}
+	arch := strings.TrimSpace(id.Arch)
+	if arch == "" {
+		arch = "x64"
+	}
+	buildTime := strings.TrimSpace(id.BuildTime)
+	if buildTime == "" {
+		buildTime = officialBuildTime
+	}
 	out := map[string]any{
-		"platform":                          platform,
-		"platform_raw":                      raw,
-		"arch":                              strings.TrimSpace(id.Arch),
-		"terminal":                          terminal,
-		"shell":                             telemetryShell(id.Shell),
-		"package_managers":                  strings.TrimSpace(id.PackageManagers),
-		"runtimes":                          runtimes,
-		"is_ci":                             false,
-		"is_claubbit":                       false,
-		"is_claude_code_remote":             false,
-		"is_local_agent_mode":               false,
-		"is_conductor":                      false,
-		"is_github_action":                  false,
-		"is_claude_code_action":             false,
-		"is_claude_ai_auth":                 strings.TrimSpace(id.AccountUUID) != "",
-		"version":                           version,
-		"version_base":                      versionBase(version),
-		"deployment_environment":            deploy,
-		"vcs":                               vcs,
-		"github_event_name":                 "",
-		"github_actions_runner_environment": "",
-		"github_actions_runner_os":          "",
-		"github_action_ref":                 "",
-		"wsl_version":                       "",
-		"remote_environment_type":           "",
-		"claude_code_container_id":          "",
-		"claude_code_remote_session_id":     "",
-		"tags":                              []any{},
-		"coworker_type":                     "",
-		"linux_distro_id":                   strings.TrimSpace(id.LinuxDistroID),
-		"linux_distro_version":              strings.TrimSpace(id.LinuxDistroVersion),
-		"linux_kernel":                      strings.TrimSpace(id.LinuxKernel),
+		"platform":               platform,
+		"platform_raw":           raw,
+		"arch":                   arch,
+		"node_version":           officialNode,
+		"terminal":               terminal,
+		"shell":                  telemetryShell(id.Shell),
+		"package_managers":       strings.TrimSpace(id.PackageManagers),
+		"runtimes":               runtimes,
+		"is_running_with_bun":    true,
+		"is_ci":                  false,
+		"is_claubbit":            false,
+		"is_claude_code_remote":  false,
+		"is_local_agent_mode":    false,
+		"is_conductor":           false,
+		"is_github_action":       false,
+		"is_claude_code_action":  false,
+		"is_claude_ai_auth":      strings.TrimSpace(id.AccountUUID) != "",
+		"version":                version,
+		"build_time":             buildTime,
+		"deployment_environment": deploy,
 	}
-	if bt := strings.TrimSpace(id.BuildTime); bt != "" {
-		out["build_time"] = bt
-	}
+	put(out, "version_base", versionBase(version))
+	put(out, "vcs", strings.TrimSpace(id.VCS))
+	put(out, "linux_distro_id", id.LinuxDistroID)
+	put(out, "linux_distro_version", id.LinuxDistroVersion)
+	put(out, "linux_kernel", id.LinuxKernel)
 	return out
 }
 func sanitizeEnv(in map[string]any) map[string]any {
-	out := make(map[string]any, len(in)+3)
+	out := make(map[string]any, len(in)+4)
 	for key, value := range in {
-		if dropEnvKey(key) {
+		if dropEnvKey(key) || omitEmptyEnv(key, value) {
 			continue
 		}
 		out[key] = value
@@ -208,26 +205,51 @@ func sanitizeEnv(in map[string]any) map[string]any {
 	} else {
 		out["shell"] = telemetryShell(shell)
 	}
-	if vcs, _ := out["vcs"].(string); strings.TrimSpace(vcs) == "" {
-		out["vcs"] = "git"
-	}
 	if runtimes, _ := out["runtimes"].(string); strings.TrimSpace(runtimes) == "" {
 		out["runtimes"] = "node"
 	}
+	if node, _ := out["node_version"].(string); strings.TrimSpace(node) == "" {
+		out["node_version"] = officialNode
+	}
+	if _, ok := out["is_running_with_bun"].(bool); !ok {
+		out["is_running_with_bun"] = true
+	}
 	if bt, ok := out["build_time"].(string); !ok || strings.TrimSpace(bt) == "" {
-		delete(out, "build_time")
+		out["build_time"] = officialBuildTime
 	}
 	return out
 }
 
+func omitEmptyEnv(key string, value any) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "version_base", "vcs", "github_event_name", "github_actions_runner_environment",
+		"github_actions_runner_os", "github_action_ref", "wsl_version", "remote_environment_type",
+		"claude_code_container_id", "claude_code_remote_session_id", "linux_distro_id",
+		"linux_distro_version", "linux_kernel", "coworker_type":
+		text, _ := value.(string)
+		return strings.TrimSpace(text) == ""
+	case "tags":
+		switch v := value.(type) {
+		case string:
+			return strings.TrimSpace(v) == ""
+		case []any:
+			return len(v) == 0
+		default:
+			return value == nil
+		}
+	default:
+		return false
+	}
+}
+
 func dropEnvKey(key string) bool {
 	switch strings.ToLower(strings.TrimSpace(key)) {
-	case "node_version", "is_running_with_bun", "betas",
+	case "betas", "email", "coworker_type",
 		"authorization", "cookie", "x-api-key", "proxy-authorization",
 		"hostname", "machine_id", "machine-id", "kernel_release",
 		"os_pretty", "os_id", "runtime_kind",
-		// Guest hardware: not in the official CLI env (2.1.296), so older
-		// worker.json files that still carry it must not upload it.
+		// Guest hardware is not in the 2.1.303 env, so older worker.json
+		// files that still carry it must not upload it.
 		"cpu_model", "cpu_cores", "memory_bytes", "root_disk", "mac",
 		"dmi_manufacturer", "dmi_product", "dmi_version", "dmi_family",
 		"dmi_serial", "dmi_uuid":
@@ -292,6 +314,7 @@ func processJSON(proc config.TelemetryProcess, uptimeSecs float64) map[string]an
 		"constrainedMemory": proc.ConstrainedMemory,
 		"cpuUsage":          map[string]any{"user": 50_000 + rand.Int63n(450_000), "system": 15_000 + rand.Int63n(135_000)},
 		"cpuPercent":        0.5 + rand.Float64()*4.5,
+		"cpuWindowMs":       1000 + rand.Int63n(9000),
 	}
 }
 

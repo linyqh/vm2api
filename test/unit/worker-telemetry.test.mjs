@@ -10,7 +10,7 @@ import {
   validateTelemetryRoutingPatch,
 } from '../../src/lib/vm/worker-telemetry.mjs'
 import { syncWorkerTelemetry } from '../../src/lib/vm/vm-runtime.mjs'
-import { FULL_ENV_KEYS } from '../../src/lib/identity/telemetry-env.mjs'
+import { FULL_ENV_KEYS, OPTIONAL_ENV_KEYS } from '../../src/lib/identity/telemetry-env.mjs'
 import { slotRuntimeOwner } from '../../src/lib/oauth/oauth-credentials.mjs'
 
 const MACHINE = 'aa'.repeat(32)
@@ -68,9 +68,11 @@ test('sidecar enables with official ~/.claude.json IDs', () => {
   assert.equal(out.identity.env.shell, 'zsh')
   assert.equal(out.identity.env.vcs, 'git')
   assert.equal(out.identity.env.runtimes, 'bun,node')
-  assert.equal(out.identity.env.build_time, '2026-10-07T06:36:42Z')
-  assert.equal(out.identity.env.node_version, undefined)
-  assert.equal(out.identity.env.is_running_with_bun, undefined)
+  assert.equal(out.identity.env.build_time, '2026-10-18T20:20:57Z')
+  assert.equal(out.identity.build_time, '2026-10-18T20:20:57Z')
+  assert.equal(out.identity.env.node_version, 'v26.3.0')
+  assert.equal(out.identity.env.is_running_with_bun, true)
+  assert.equal(out.identity.email, undefined)
   fs.rmSync(root, { recursive: true, force: true })
 })
 
@@ -275,8 +277,9 @@ test('sidecar env uses observed shell/runtimes and never guest hardware', () => 
     assert.equal(Object.hasOwn(out.identity.env, key), false, key)
     assert.equal(Object.hasOwn(out.identity, key), false, key)
   }
+  const allowed = new Set([...FULL_ENV_KEYS, ...OPTIONAL_ENV_KEYS])
   assert.deepEqual(
-    Object.keys(out.identity.env).filter((key) => !FULL_ENV_KEYS.includes(key)),
+    Object.keys(out.identity.env).filter((key) => !allowed.has(key)),
     [],
   )
   assert.equal(out.identity.env.linux_kernel, '6.8.0-guest')

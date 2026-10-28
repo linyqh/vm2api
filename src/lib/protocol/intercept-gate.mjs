@@ -273,7 +273,7 @@ export async function evaluateProtocolIntercept({
   }
 
   if (jev?.enabled) {
-    const verdict = await classifyJev(modelDocument, jev, fetchImpl)
+    const verdict = await classifyJev(modelDocument, { ...jev, policy_request_id: requestId }, fetchImpl)
     if (verdict.action === 'block') {
       const unavailable = verdict.reason === 'unavailable'
       const error = policyBlockError(requestId)
@@ -294,7 +294,13 @@ export async function evaluateProtocolIntercept({
         final_state: 'policy_blocked',
         error,
         errorMessage: unavailable ? error.body.error.message : `${error.body?.error?.message}: ${category}`,
-        intercept: gateVerdict({ kind: 'block', by: 'jev', keyword: unavailable ? 'unavailable' : category }),
+        intercept: gateVerdict({
+          kind: 'block',
+          by: 'jev',
+          keyword: unavailable ? 'unavailable' : category,
+        }),
+        // Exact payload.state. Context the model scored, not a span it named.
+        jevState: unavailable ? '' : verdict.state || '',
         category: unavailable ? 'unavailable' : category,
         deviceId: inboundRefusalDeviceId({ inbound, body, headers }),
         fingerprint: refusalFingerprint(body, inbound),

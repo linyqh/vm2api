@@ -24,6 +24,7 @@ import {
   publicJevConfig,
   readJevConfig,
 } from '../protocol/jev-intercept.mjs'
+import { JevUsageRepo } from '../db/repos/jev-usage-repo.mjs'
 import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
@@ -66,6 +67,7 @@ import { officialCcHome, readOfficialCcStatus, scheduleOfficialCcBootstrap } fro
 import { invalidateLiveCredentialCache } from './panel-live-credentials.mjs'
 import { ensureCodexKernel, stopCodexKernel } from '../transport/codex-kernel-supervisor.mjs'
 import { listOfficialModels, seedModelCatalog } from '../protocol/models.mjs'
+import { jevUsageStorageErrors } from '../protocol/jev-usage.mjs'
 import { getModelPolicy, saveModelPolicy, resetModelPolicy, listPolicyModels } from '../protocol/model-policy.mjs'
 import {
   getGptModelPolicy,
@@ -291,7 +293,7 @@ import {
 import { inspectClusterPayloadChanges, refreshClusterSlotPayloads } from '../cluster/remote-slot.mjs'
 import { readRawBody as defaultReadRawBody } from '../http/respond.mjs'
 import { corsHeadersForRequest } from '../http/cors.mjs'
-import { restartRustKernel, writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
+import { restartRustKernel, syncClaudeKernelConfigs, writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
 
 import { countTokensViaWorker } from '../transport/go-worker-client.mjs'
 import { apiKeyBetaHeader, setupTokenBetaHeader } from '../protocol/claude-code-betas.mjs'
@@ -520,12 +522,16 @@ function mergeKernelReports(local, cluster) {
   }
 }
 
-async function syncInstalledKernels({
-  project,
-  routingConfig,
-  body = {},
-  refreshCluster = refreshClusterSlotPayloads,
-}) {
+// The entrypoint auto-sync and the panel upgrade can both ask at once; a slot must not be recreated twice concurrently.
+let kernelSyncTail = Promise.resolve()
+
+function syncInstalledKernels(args) {
+  const run = kernelSyncTail.then(() => runKernelSync(args))
+  kernelSyncTail = run.catch(() => {})
+  return run
+}
+
+async function runKernelSync({ project, routingConfig, body = {}, refreshCluster = refreshClusterSlotPayloads }) {
   const all = listVms(project).filter(isClaudeVm)
   const wanted = Array.isArray(body.ids) ? new Set(body.ids.map(String)) : null
   const selected = wanted ? all.filter((vm) => wanted.has(vm.id)) : all
@@ -5397,6 +5403,7 @@ export function createPanelHandler(ctx) {
         }
         const saved = saveModelPolicy(body.policy || body)
         seedModelCatalog()
+        syncClaudeKernelConfigs(cfg.paths.project, ctx.routingConfig)
         return json(
           res,
           200,
@@ -5436,6 +5443,7 @@ export function createPanelHandler(ctx) {
         }
         const saved = resetModelPolicy()
         seedModelCatalog()
+        syncClaudeKernelConfigs(cfg.paths.project, ctx.routingConfig)
         return json(
           res,
           200,
@@ -5748,6 +5756,26 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'GET' && p === '/api/panel/protocol-entry') {
         return json(res, 200, panel.ok(requestLog.protocolEntryStats()))
+      }
+      if (req.method === 'GET' && p === '/api/panel/jev-usage') {
+        if (panelIdentity(req).role !== 'admin')
+          return json(res, 403, { ok: false, error: { code: 'forbidden', message: '仅管理员可查看审核用量' } })
+        try {
+          const repo = new JevUsageRepo()
+          const page = repo.list(Object.fromEntries(url.searchParams))
+          return json(
+            res,
+            200,
+            panel.ok({ ...repo.overview(), ...page, storage_errors_since_start: jevUsageStorageErrors() }),
+          )
+        } catch (error) {
+          if (error instanceof TypeError)
+            return json(res, 400, {
+              ok: false,
+              error: { code: 'invalid_jev_usage_query', message: '用量查询参数不正确' },
+            })
+          throw error
+        }
       }
       if (req.method === 'GET' && p === '/api/panel/jev-intercept') {
         return json(res, 200, panel.ok(jevInterceptSnapshot()))
