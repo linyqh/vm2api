@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.022.4 — 2026-10-30
+
+- Codex 出站 `originator` 改由 `codex.user_agent` 推出（取 `/` 之前的部分），不再转发客户端自带的值，避免 codex-tui / codex_exec / codex_vscode 等入站与网关统一 UA 不一致（如 `originator: codex-tui` 配 `User-Agent: Codex Desktop/…`）。未带 `originator` 的入站也会补上同一个值。默认 UA 下出站 `originator` 为 `codex_cli_rs`。
+
+已部署机升级：只改 Node 控制面，更新镜像后重启即可；无 DB 迁移，kernel / payload 不变，不需要 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
 ## 1.4.022.3 — 2026-10-28
 
 - 同步上游 dofastted/vm2api 至 v1.4.022，保留本仓库 Antigravity 平台扩展（含 1.4.006.2 / 1.4.006.3 的改动）与四段版本号规则。
