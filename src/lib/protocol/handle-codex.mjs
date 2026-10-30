@@ -73,8 +73,8 @@ import {
 import { clientIp } from '../pool/sticky-router.mjs'
 
 // Official Codex client headers for ChatGPT Responses. Auth is attached by the kernel.
+// `originator` is not forwarded: it must name the same client as the outbound User-Agent.
 const CODEX_KERNEL_HEADER_ALLOWLIST = Object.freeze([
-  'originator',
   'openai-beta',
   'session-id',
   'thread-id',
@@ -95,8 +95,10 @@ function headerString(headers, name) {
   return typeof value === 'string' && value.trim() ? value : ''
 }
 
-function codexKernelHeaders(reqHeaders = {}, body = {}, session = null) {
+function codexKernelHeaders(reqHeaders = {}, body = {}, session = null, userAgent = '') {
   const headers = {}
+  const originator = String(userAgent).split('/')[0].trim()
+  if (originator) headers.originator = originator
   for (const name of CODEX_KERNEL_HEADER_ALLOWLIST) {
     const value = headerString(reqHeaders, name)
     if (value) headers[name] = value
@@ -788,7 +790,12 @@ export async function handleCodexProtocol({
         }
         logBag.outbound_session_id = sessionIdForLog(outboundSessionId)
         const outboundBody = applyCodexRebuildBody({ ...converted.body, stream: true }, outboundSessionId, sessionMode)
-        const outboundHeaders = codexKernelHeaders(req.headers, outboundBody, session)
+        const outboundHeaders = codexKernelHeaders(
+          req.headers,
+          outboundBody,
+          session,
+          codexKernelRequestOptions(routing).user_agent,
+        )
         if (captureOutbound) logBag.outbound_body = outboundBody
         logBag.outbound_headers = redactHeaders(outboundHeaders)
         let hopEmitted = false
