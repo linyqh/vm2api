@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.022.6 — 2026-10-31
+
+- 修复号池维护每轮报 `[pool-maintenance] isCodexVm is not defined`：`pool-scheduler` 未导入 `isCodexVm`（#795 引入），维护在探测 Claude / Antigravity 槽 worker 健康、写回心跳前就中断。
+- 修复 Claude 请求每次尝试重读 `routing.json` 失效：`handle-protocol` 未导入 `fs`，异常被兜底吞掉，人设预设、cli-hop、签名修复等设置一直用启动时的快照，改设置需重启才生效。
+
+已部署机升级：只改 Node 控制面，更新镜像后重启；无 DB 迁移，kernel / payload 不变，不需要 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
 ## 1.4.022.5 — 2026-10-31
 
 - GPT 槽对上游只呈现一个固定的 Codex 安装：推理、`alpha/search`、`images/*`、模型目录、OAuth 换票/刷新、额度查询与测试对话统一用槽位安装 UUID（`run/codex-installation-id`）、槽位 UA、`originator` 与 `version`。此前搜索/生图/目录/刷新用 `codex_cli_rs/0.160.0 (linux x86_64)`，与推理的 `Codex Desktop … (Mac OS …)` 不是同一个客户端；额度查询带 `oai-language: zh-CN` 且没有 UA。
