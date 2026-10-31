@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.4.022.5 — 2026-10-31
+
+- GPT 槽对上游只呈现一个固定的 Codex 安装：推理、`alpha/search`、`images/*`、模型目录、OAuth 换票/刷新、额度查询与测试对话统一用槽位安装 UUID（`run/codex-installation-id`）、槽位 UA、`originator` 与 `version`。此前搜索/生图/目录/刷新用 `codex_cli_rs/0.160.0 (linux x86_64)`，与推理的 `Codex Desktop … (Mac OS …)` 不是同一个客户端；额度查询带 `oai-language: zh-CN` 且没有 UA。
+- `codex.user_agent` 为 `Mac OS x.y.z` 形状时，每个槽位固定换成一个 macOS 版本（按安装 UUID 选定），不再所有槽位共用同一个系统版本。
+- 出站 `x-codex-turn-metadata` 的 `installation_id` 换成槽位 UUID，`sandbox` 与槽位系统一致；调用方 `x-codex-installation-id` 不再转发。调用方安装 ID 只写入本地 `usage_logs.inbound_device_id`。
+- 官方 Codex 客户端的会话 id（UUID v7）原样作为出站会话：`session-id`、`thread-id`、`x-client-request-id`、`x-codex-window-id`、turn 元数据与 `prompt_cache_key` 同一个值。此前出站 `session-id` 被重建成 UUID v4，而 turn 元数据、window-id 仍是客户端 id。其它客户端仍按 `sticky.outbound_session`，并把这些字段一并改到出站会话。
+- 输入里的 `<environment_context>` 改成槽位工作站：cwd / workspace root 落在槽位 home，shell、时区（槽位 `timezone`）与当地日期随槽位，不再上送调用方的用户名目录、Windows 路径与本地时区。
+- 面板测试对话用槽位安装 UUID 与 UUID v7 会话，不再发 `x-codex-installation-id: <vm id>` 与 `session-id: kin-test-<vm id>`。
+
+已部署机升级：只改 Node 控制面，更新镜像后重启；无 DB 迁移，kernel / payload 不变，不需要 `wrap-cli/sync`。要让上游每次推理都带槽位安装 UUID，需在设置里开启 `codex.client_features`（关闭时 kernel 会从 turn 元数据移除安装 ID）；`codex.analytics` 保持关闭。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
 ## 1.4.022.4 — 2026-10-30
 
 - Codex 出站 `originator` 改由 `codex.user_agent` 推出（取 `/` 之前的部分），不再转发客户端自带的值，避免 codex-tui / codex_exec / codex_vscode 等入站与网关统一 UA 不一致（如 `originator: codex-tui` 配 `User-Agent: Codex Desktop/…`）。未带 `originator` 的入站也会补上同一个值。默认 UA 下出站 `originator` 为 `codex_cli_rs`。
