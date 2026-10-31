@@ -77,6 +77,7 @@ import {
   resetGptModelPolicy,
 } from '../protocol/gpt-model-policy.mjs'
 import { refreshCodexAccessToken } from '../protocol/codex-models.mjs'
+import { codexSlotIdentity } from '../protocol/codex-identity.mjs'
 import {
   defaultSeedPolicy,
   isTelemetryEnabled,
@@ -4724,6 +4725,7 @@ export function createPanelHandler(ctx) {
               const tok = await refreshCodexAccessToken({
                 refreshToken: account.refresh_token,
                 proxyUrl: slotProxy.proxyUrl,
+                userAgent: codexSlotIdentity(cfg.paths.project, existing, ctx.routingConfig).userAgent,
               })
               if (!tok.ok) {
                 return json(res, 502, {
@@ -4873,7 +4875,7 @@ export function createPanelHandler(ctx) {
             const generated = generateCodexAuthUrl({
               vmId: id,
               proxyUrl: slotProxy.proxyUrl,
-              installationId: existing.device_id || existing.codex?.installation_id,
+              installationId: codexSlotIdentity(cfg.paths.project, existing, ctx.routingConfig).installationId,
             })
             const px = existing.proxy || {}
             return json(
@@ -4971,6 +4973,7 @@ export function createPanelHandler(ctx) {
               code: body.code || body.auth_code || body.callback || body.callback_url,
               proxyUrl: slotProxy.proxyUrl,
               vmId: id,
+              userAgent: codexSlotIdentity(cfg.paths.project, existing, ctx.routingConfig).userAgent,
             })
             const committed = await commitImportedCodexVm({
               cfg,
@@ -5236,6 +5239,7 @@ export function createPanelHandler(ctx) {
           const tok = await refreshCodexAccessToken({
             refreshToken,
             proxyUrl: hostProxyUrlForVm(vm),
+            userAgent: codexSlotIdentity(cfg.paths.project, vm, ctx.routingConfig).userAgent,
           })
           if (!tok.ok) {
             return json(res, 502, {

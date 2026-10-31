@@ -131,7 +131,7 @@ export function generateCodexAuthUrl({ vmId, proxyUrl, installationId } = {}) {
   }
 }
 
-export async function exchangeCodexAuthCode({ sessionId, code, proxyUrl, vmId, fetchImpl } = {}) {
+export async function exchangeCodexAuthCode({ sessionId, code, proxyUrl, vmId, fetchImpl, userAgent } = {}) {
   sweepExpired()
   const session = sessions.get(sessionId)
   if (!session || Date.now() - session.createdAt > CODEX_OAUTH_SESSION_TTL_MS) {
@@ -153,6 +153,7 @@ export async function exchangeCodexAuthCode({ sessionId, code, proxyUrl, vmId, f
     codeVerifier: session.codeVerifier,
     proxyUrl: px,
     fetchImpl,
+    userAgent,
   })
   if (!tok.ok) {
     throw fail(tok.error || 'exchange_failed', 'Codex OAuth 换票失败，请重新生成授权链接')

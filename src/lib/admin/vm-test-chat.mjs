@@ -35,8 +35,8 @@ import {
   fetchChatgptModelCatalog,
   refreshCodexAccessToken,
   resolveCodexCatalogVersion,
-  CODEX_USER_AGENT,
 } from '../protocol/codex-models.mjs'
+import { codexSessionUuid, codexSlotIdentity } from '../protocol/codex-identity.mjs'
 import { isGptSeriesId } from '../protocol/gpt-ids.mjs'
 import {
   resolveInferenceEngine,
@@ -209,6 +209,7 @@ export async function syncCodexCatalog({
       let access = account.access_token || target.codex?.access_token
       const accountId = account.chatgpt_account_id || target.codex?.chatgpt_account_id
       const refreshToken = account.refresh_token || target.codex?.refresh_token
+      const identity = codexSlotIdentity(projectRoot, target)
       const fetchOnce = () =>
         fetchChatgptModelCatalog({
           accessToken: access,
@@ -217,10 +218,11 @@ export async function syncCodexCatalog({
           fetchImpl,
           direct,
           catalogVersion: catalogVersion.version,
+          identity,
         })
       let live = await fetchOnce()
       if (live.error === 'upstream_auth' && rotate && refreshToken) {
-        const tok = await refreshCodexAccessToken({ refreshToken, proxyUrl, fetchImpl })
+        const tok = await refreshCodexAccessToken({ refreshToken, proxyUrl, fetchImpl, userAgent: identity.userAgent })
         if (!tok.ok) {
           lastError = {
             ok: false,
@@ -1157,10 +1159,11 @@ export async function runVmTestChat(opts = {}) {
       store: false,
     }
     if (effort) inbound.reasoning = { effort }
+    const identity = codexSlotIdentity(projectRoot, vm)
     headers = {
-      'user-agent': CODEX_USER_AGENT,
-      'x-codex-installation-id': String(vm.device_id || vm.id),
-      'session-id': `kin-test-${vmId}`,
+      'user-agent': identity.userAgent,
+      'x-codex-installation-id': identity.installationId,
+      'session-id': codexSessionUuid(),
       accept: 'text/event-stream',
     }
     identitySource = 'codex'
@@ -1223,6 +1226,7 @@ export async function runVmTestChat(opts = {}) {
           refreshToken,
           proxyUrl: hostProxyUrlForVm(vm),
           fetchImpl: opts.fetchImpl,
+          userAgent: codexSlotIdentity(projectRoot, vm).userAgent,
         })
         if (tok.ok) {
           persistRefreshedCodexAccount(projectRoot, vmId, {

@@ -1156,13 +1156,14 @@ function emptyCodexRes() {
 async function hopCodex({ root, stickyRouter, routing = {}, headers = {}, body, onHop }) {
   const envelopes = []
   const res = emptyCodexRes()
+  const logBag = {}
   const out = await handleCodexProtocol({
     req: { headers, apiKeyKind: 'user' },
     res,
     protocol: 'openai.responses',
     ctx: { body },
     inbound: { stream: false },
-    logBag: {},
+    logBag,
     stats: { errors: 0, requests: 0, by_route: {} },
     json: (_res, status, payload) => {
       res.statusCode = status
@@ -1185,7 +1186,7 @@ async function hopCodex({ root, stickyRouter, routing = {}, headers = {}, body, 
       },
     },
   })
-  return { out, envelopes, res }
+  return { out, envelopes, res, logBag }
 }
 
 test('codex rebuild outbound session is not the inbound session', async () => {
@@ -1218,47 +1219,58 @@ test('codex rebuild outbound session is not the inbound session', async () => {
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-test('codex kernel envelope preserves official routing headers without client auth', async () => {
+test('codex kernel envelope speaks as the slot install and keeps the official session consistent', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-routing-headers-'))
   const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
   writeGptVm(root, 'vm-gpt-a')
   const userAgent = 'Codex Desktop/0.166.0 (Mac OS 27.0.0; arm64) unknown (Codex Desktop; 26.1027.30824)'
-  const { envelopes } = await hopCodex({
+  const callerInstall = '33333333-3333-4333-8333-333333333333'
+  const thread = '01a192d4-5903-7c83-a8eb-63c0a072df23'
+  const turnMetadata = {
+    installation_id: callerInstall,
+    session_id: thread,
+    thread_id: thread,
+    turn_id: '01a192d4-5abc-77a0-b8d3-e6cb2ae7de6f',
+    window_id: `${thread}:0`,
+    sandbox: 'windows_sandbox',
+  }
+  const { envelopes, logBag } = await hopCodex({
     root,
     stickyRouter: sticky,
     routing: { codex: { user_agent: userAgent } },
     headers: {
       authorization: 'Bearer sub2api-key',
-      originator: 'codex-tui',
+      'user-agent': 'Codex Desktop/0.163.0 (Windows 10.0.26100; x86_64) unknown (Codex Desktop; 26.1016.62342)',
+      originator: 'Codex Desktop',
       'openai-beta': 'responses_websockets=2026-02-06',
-      'session-id': 'session:t',
-      'thread-id': 'thread:t',
-      'x-client-request-id': 'request:t',
+      'x-codex-installation-id': callerInstall,
       'x-codex-beta-features': 'remote_compaction_v2',
-      'x-codex-turn-metadata': '{"thread_id":"t"}',
-      'x-codex-window-id': 'window:2',
+      'x-codex-turn-metadata': JSON.stringify(turnMetadata),
+      'x-codex-window-id': `${thread}:0`,
       'x-openai-internal-codex-responses-lite': 'true',
     },
-    body: { model: 'gpt-6.1-sol', input: 'hi', stream: false, service_tier: 'fast' },
+    body: { model: 'gpt-6.1-sol', input: 'hi', stream: false, service_tier: 'fast', prompt_cache_key: thread },
   })
-  const session = envelopes[0].session
-  assert.deepEqual(envelopes[0].headers, {
+  const envelope = envelopes[0]
+  const slotInstall = fs.readFileSync(path.join(root, 'vms', 'vm-gpt-a', 'run', 'codex-installation-id'), 'utf8').trim()
+  assert.equal(envelope.session.session_id, thread)
+  assert.deepEqual(envelope.headers, {
     originator: 'Codex Desktop',
     'openai-beta': 'responses_websockets=2026-02-06',
-    'session-id': session.session_id,
-    'thread-id': 'thread:t',
-    'x-client-request-id': 'request:t',
+    'session-id': thread,
+    'thread-id': thread,
+    'x-client-request-id': thread,
     'x-codex-beta-features': 'remote_compaction_v2',
-    'x-codex-turn-metadata': '{"thread_id":"t"}',
-    'x-codex-window-id': 'window:2',
+    'x-codex-turn-metadata': JSON.stringify({ ...turnMetadata, installation_id: slotInstall, sandbox: 'seatbelt' }),
+    'x-codex-window-id': `${thread}:0`,
     'x-openai-internal-codex-responses-lite': 'true',
     'x-codex-routing-hint': 'model=gpt-6.1-sol;tier=priority',
   })
-  assert.notEqual(envelopes[0].headers['session-id'], 'session:t')
-  assert.equal(envelopes[0].headers['session-id'], session.session_id)
-  assert.equal(envelopes[0].headers.authorization, undefined)
-  assert.equal(envelopes[0].options.user_agent, userAgent)
-  assert.equal(envelopes[0].body.service_tier, 'priority')
+  assert.equal(envelope.body.prompt_cache_key, thread)
+  assert.equal(envelope.options.installation_id, slotInstall)
+  assert.match(envelope.options.user_agent, /^Codex Desktop\/0\.166\.0 \(Mac OS 2[67]\.\d+\.\d+; arm64\) unknown/)
+  assert.equal(JSON.stringify(envelope).includes(callerInstall), false)
+  assert.equal(logBag.inbound_device_id, callerInstall)
   sticky.db?.close?.()
   fs.rmSync(root, { recursive: true, force: true })
 })
