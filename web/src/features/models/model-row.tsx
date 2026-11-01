@@ -487,7 +487,6 @@ export function ModelRow({
   )
 }
 
-
 function NumberInput({
   value,
   onChange,
