@@ -124,7 +124,9 @@ test('fork versions X.Y.Z.N sort after their upstream base and before the next u
   assert.equal(compareSemver('1.3.218.1', '1.3.218'), 1)
   assert.equal(compareSemver('1.3.218.2', '1.3.218.1'), 1)
   assert.equal(compareSemver('1.3.219', '1.3.218.1'), 1)
-  const entries = parseChangelog('## 1.3.219 — 2026-10-24\n\n- up\n\n## 1.3.218.1 — 2026-10-23\n\n- fork\n\n## 1.3.218 — 2026-10-23\n\n- base\n')
+  const entries = parseChangelog(
+    '## 1.3.219 — 2026-10-24\n\n- up\n\n## 1.3.218.1 — 2026-10-23\n\n- fork\n\n## 1.3.218 — 2026-10-23\n\n- base\n',
+  )
   assert.deepEqual(
     entries.map((e) => e.version),
     ['1.3.219', '1.3.218.1', '1.3.218'],
