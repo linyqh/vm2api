@@ -51,9 +51,9 @@ jobs:
           name: vm2api ${{ github.ref_name }}
           body: |
             无后缀附件为 linux amd64；`-linux-arm64` 后缀为 ARM64 控制面原生 helper。槽位 kernel / CLI 只有 amd64，ARM64 主机经 QEMU 运行。
-            控制面镜像：`ghcr.io/dofastted/vm2api:${{ github.ref_name }}`（多架构），`${{ github.ref_name }}-amd64` / `${{ github.ref_name }}-arm64`（单架构）。一键脚本按宿主架构自动选择。
+            控制面镜像：`ghcr.io/${{ github.repository_owner }}/vm2api:${{ github.ref_name }}`（多架构），`${{ github.ref_name }}-amd64` / `${{ github.ref_name }}-arm64`（单架构）。一键脚本按宿主架构自动选择。
 
-            升级见 [CHANGELOG.md](https://github.com/dofastted/vm2api/blob/main/CHANGELOG.md)、[docs/DEPLOY.md](https://github.com/dofastted/vm2api/blob/main/docs/DEPLOY.md) 与 [docs/ARM64.md](https://github.com/dofastted/vm2api/blob/main/docs/ARM64.md)。
+            升级见 [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/CHANGELOG.md)、[docs/DEPLOY.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/DEPLOY.md) 与 [docs/ARM64.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/ARM64.md)。
           files: dist/*
 
   image-amd64:
