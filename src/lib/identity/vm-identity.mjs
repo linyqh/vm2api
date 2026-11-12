@@ -20,14 +20,14 @@ export function readJsonSafe(p, fallback = null) {
 }
 
 /** Official Claude Code version shared by Node identity and the slot CLI wire. */
-export const OFFICIAL_CLI_VERSION = '2.1.303'
+export const OFFICIAL_CLI_VERSION = '2.1.321'
 export const OFFICIAL_CLAUDE_CLI_UA = `claude-cli/${OFFICIAL_CLI_VERSION} (external, sdk-cli)`
 export const OFFICIAL_STAINLESS = Object.freeze({
   stainless_lang: 'js',
   stainless_os: 'Linux',
   stainless_arch: 'x64',
   stainless_runtime: 'node',
-  stainless_runtime_version: 'v26.3.0',
+  stainless_runtime_version: 'v26.12.1',
   stainless_package_version: '0.128.0',
 })
 
@@ -179,41 +179,4 @@ export function persistVmSettings(exec, identity) {
     )
   }
   return { wrote }
-}
-
-/** Persist fingerprint onto vm.json only. Never touches oauth tokens. */
-export function persistVmFingerprint(exec, identity) {
-  if (!exec?.vmPath || !identity?.fingerprint) return { wrote: false }
-  let vm
-  try {
-    vm = JSON.parse(fs.readFileSync(exec.vmPath, 'utf8'))
-  } catch {
-    return { wrote: false }
-  }
-  const prev = vm.fingerprint && typeof vm.fingerprint === 'object' ? vm.fingerprint : {}
-  const merged = {
-    ...prev,
-    ...identity.fingerprint,
-    device_id: prev.device_id || identity.fingerprint.device_id,
-    session_id: prev.session_id || identity.fingerprint.session_id,
-    reset_at: prev.reset_at || new Date().toISOString(),
-  }
-  // Write-only-on-change (T7): compare ignoring the volatile updated_at stamp so
-  // steady-state requests don't rewrite vm.json every call.
-  const { updated_at: _prevStamp, ...prevCmp } = prev
-  const versionChanged = identity.cliVersion && vm.claude_code_version !== identity.cliVersion
-  const changed = JSON.stringify(prevCmp) !== JSON.stringify(merged)
-  if (!changed && !versionChanged) {
-    if (exec.vm) exec.vm.fingerprint = prev
-    return { wrote: false }
-  }
-  merged.updated_at = new Date().toISOString()
-  vm.fingerprint = merged
-  if (identity.cliVersion) vm.claude_code_version = identity.cliVersion
-  atomicWriteJson(exec.vmPath, vm)
-  if (exec.vm) {
-    exec.vm.fingerprint = vm.fingerprint
-    if (identity.cliVersion) exec.vm.claude_code_version = identity.cliVersion
-  }
-  return { wrote: true }
 }

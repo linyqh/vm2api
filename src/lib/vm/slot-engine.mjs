@@ -20,15 +20,21 @@ export const INFERENCE_ENGINES = Object.freeze(['rust'])
 export const SLOT_PERSONA_PRESETS = Object.freeze(['official', 'official_full', 'zero', OFFICIAL_303_PRESET])
 export const OFFICIAL_CC_INFERENCES = Object.freeze(['http', 'cli-hop'])
 export const KERNEL_DATAPLANES = Object.freeze(['wrap', 'cc', 'crag'])
+export const CRAG_KERNEL_VERSIONS = Object.freeze(['v2'])
 export const CONTAINER_CLI_NODE_BIN = '/home/kincli/.kin/cli-node'
 export const CONTAINER_CC_NODE_BIN = '/home/kincli/.kin/cc-node'
-export const CONTAINER_CRAG_CLAUDE_BIN = CONTAINER_CC_NODE_BIN
-// Cluster-node slots run the self-contained image: binaries live in the image,
-// not in the bind-mounted home (see cluster/slot-image.mjs).
+// Image copies under /opt/kin stay for old containers. New commands and the
+// CLI path use the slot-bin mount, so a kernel pull updates bytes without a
+// new image. The wrapper is replaced by rename, never unlinked first.
 export const REMOTE_KIN_DIR = '/opt/kin'
-export const REMOTE_KERNEL_ENTRY = `${REMOTE_KIN_DIR}/kin-kernel`
-export const REMOTE_CLI_NODE_BIN = `${REMOTE_KIN_DIR}/cli-node`
-export const REMOTE_CC_NODE_BIN = `${REMOTE_KIN_DIR}/cc-node`
+export const REMOTE_LIVE_DIR = '/opt/kin-live'
+export const REMOTE_KERNEL_ENTRY = `${REMOTE_LIVE_DIR}/kin-kernel`
+export const REMOTE_CLI_NODE_BIN = `${REMOTE_LIVE_DIR}/cli-node`
+export const REMOTE_CC_NODE_BIN = `${REMOTE_LIVE_DIR}/cc-node`
+export const REMOTE_CRAG_ENTRY = `${REMOTE_LIVE_DIR}/crag-kernel`
+export const REMOTE_CRAG_CLAUDE = `${REMOTE_LIVE_DIR}/crag-v2/claude-code-2.1.321/claude`
+export const LOCAL_CRAG_CLAUDE = '/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude'
+export const CONTAINER_CRAG_V2_CLAUDE = LOCAL_CRAG_CLAUDE
 
 export const KERNEL_NATIVE_SLOT_COUNT = 20
 export const SESSION_SLOT_MIN = 1
@@ -128,6 +134,7 @@ export function normalizeInferenceConfig(raw = {}) {
     session_slots: normalizeSessionSlots(raw.session_slots),
     session_idle_ttl_seconds: normalizeSessionIdleTtlSeconds(raw.session_idle_ttl_seconds),
     dataplane: normalizeKernelDataplane(raw.dataplane),
+    crag_kernel_version: normalizeCragKernelVersion(raw.crag_kernel_version) || 'v2',
   }
 }
 
@@ -161,6 +168,47 @@ export function resolveKernelDataplane(vm, routing = {}) {
   const fromVm = normalizeKernelDataplane(vm?.dataplane, { inherit: true })
   if (fromVm) return fromVm
   return normalizeKernelDataplane(routing?.inference?.dataplane)
+}
+
+/** Public id is `crag-v2`. Omitted and stored legacy both run native Claude. */
+export function normalizeCragKernelVersion(value, { inherit = false } = {}) {
+  const raw = String(value ?? '')
+    .trim()
+    .toLowerCase()
+    .replaceAll('_', '-')
+  if (!raw || raw === 'inherit' || raw === 'global' || raw === 'default' || raw === 'auto') {
+    return inherit ? '' : 'v2'
+  }
+  if (raw === 'legacy' || raw === 'crag-legacy' || raw === 'elf' || raw === 'v2' || raw === 'crag-v2') return 'v2'
+  return null
+}
+
+export function resolveCragKernelVersion(vm, routing = {}) {
+  if (!isClaudeVm(vm)) return null
+  const fromVm = normalizeCragKernelVersion(vm?.crag_kernel_version, { inherit: true })
+  if (fromVm) return fromVm
+  const fromRouting = normalizeCragKernelVersion(routing?.inference?.crag_kernel_version, { inherit: true })
+  if (fromRouting) return fromRouting
+  return 'v2'
+}
+
+/** Terminal and OAuth must run the same CLI family as the selected kernel. */
+export function resolveSlotClaude(vm, routing = {}, host = {}) {
+  const dataplane = resolveKernelDataplane(vm, routing)
+  const native = dataplane === 'crag' && resolveCragKernelVersion(vm, routing) === 'v2'
+  if (native) return { bin: host.bakedKernel ? REMOTE_CRAG_CLAUDE : LOCAL_CRAG_CLAUDE, native: true }
+  return {
+    bin: dataplane === 'wrap' ? host.bins?.cli || CONTAINER_CLI_NODE_BIN : host.bins?.cc || CONTAINER_CC_NODE_BIN,
+    native: false,
+  }
+}
+
+export function parseCragKernelVersionPatch(value) {
+  if (value == null || value === '') return { ok: true, value: '' }
+  const parsed = normalizeCragKernelVersion(value, { inherit: true })
+  if (parsed == null) return { ok: false, error: 'crag_kernel_version must be v2' }
+  if (!parsed) return { ok: true, value: '' }
+  return { ok: true, value: parsed }
 }
 
 export function parseKernelDataplanePatch(value) {
@@ -276,8 +324,9 @@ export function parseSlotEnginePolicyPatch(body = {}) {
   const hasEngine = Object.prototype.hasOwnProperty.call(body, 'inference_engine')
   const hasPersona = Object.prototype.hasOwnProperty.call(body, 'persona_preset')
   const hasDataplane = Object.prototype.hasOwnProperty.call(body, 'dataplane')
-  if (!hasEngine && !hasPersona && !hasDataplane) {
-    return { ok: false, error: 'inference_engine, persona_preset or dataplane required' }
+  const hasCragVersion = Object.prototype.hasOwnProperty.call(body, 'crag_kernel_version')
+  if (!hasEngine && !hasPersona && !hasDataplane && !hasCragVersion) {
+    return { ok: false, error: 'inference_engine, persona_preset, dataplane or crag_kernel_version required' }
   }
   const patch = {}
   if (hasEngine) {
@@ -294,6 +343,11 @@ export function parseSlotEnginePolicyPatch(body = {}) {
     const parsed = parseKernelDataplanePatch(body.dataplane)
     if (!parsed.ok) return parsed
     patch.dataplane = parsed.value
+  }
+  if (hasCragVersion) {
+    const parsed = parseCragKernelVersionPatch(body.crag_kernel_version)
+    if (!parsed.ok) return parsed
+    patch.crag_kernel_version = parsed.value
   }
   return { ok: true, patch }
 }
@@ -360,6 +414,11 @@ export function validateInferenceRoutingPatch(body = {}) {
     const parsed = parseKernelDataplanePatch(body.inference.dataplane)
     if (!parsed.ok) errors.push(parsed.error)
     else if (!parsed.value) errors.push('inference.dataplane 必须是 wrap、cc 或 crag')
+  }
+  if (Object.prototype.hasOwnProperty.call(body.inference, 'crag_kernel_version')) {
+    const parsed = parseCragKernelVersionPatch(body.inference.crag_kernel_version)
+    if (!parsed.ok) errors.push(parsed.error)
+    else if (!parsed.value) errors.push('inference.crag_kernel_version 必须是 v2')
   }
   return errors
 }

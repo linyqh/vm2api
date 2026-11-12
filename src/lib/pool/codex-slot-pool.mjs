@@ -302,6 +302,8 @@ export function orderCodexSessionSlots(
     return {
       error: quotaExhausted ? 'quota_exhausted' : 'capacity_unavailable',
       retryAt,
+      // Accounts a waiter may use once a seat frees; scopes its wake-up.
+      waitIds: ids,
       ids: [],
       ready: [],
       parked: picked.parked || [],
@@ -382,7 +384,8 @@ export function isCodexFailoverError(result) {
   // refused committed hops and anything that has written to the client.
   if (status === 408) return true
   // The kernel may be busy/cooling down even while the gateway has a seat.
-  if (status === 503 && (code === 'no_capacity' || /server_error|provider_error/i.test(code))) return true
+  if (status === 503 && (code === 'no_capacity' || code === 'overloaded' || /server_error|provider_error/i.test(code)))
+    return true
   if (status === 502 && /upstream_transport|worker_transport|transport/i.test(code)) return true
   // 500/502/504 before any downstream byte are replayable on another seat.
   // A request-shaped error is not: its code names the bad body, not the seat.

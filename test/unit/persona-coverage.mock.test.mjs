@@ -50,9 +50,10 @@ function assertOfficial(body, { caller = '' } = {}) {
   assert.match(String(env?.content || ''), /^# Environment\n/)
 }
 
-function assertZero(body) {
+function assertZero(body, { caller = '' } = {}) {
   const blocks = texts(body)
-  assert.equal(blocks.length, 1)
+  assert.equal(blocks.length, caller ? 2 : 1)
+  if (caller) assert.equal(blocks[1], caller)
   assert.match(blocks[0], /x-anthropic-billing-header:/)
   assert.match(blocks[0], /prompt_version=<You are Claude Code, Anthropic's official CLI for Claude\.>/)
   assert.ok(!blocks.some((text) => text === '\u200b' || text.startsWith('# Environment')))
@@ -80,7 +81,7 @@ test('official preset appends the configured prompt on every empty-system shape'
   })
 })
 
-test('official-looking traffic still gets the configured prompt when force-configured', () => {
+test('official-looking traffic gets the configured prompt unless passthrough is on', () => {
   withRouting({ persona_preset: 'official', overlay_preset: 'off' }, (file) => {
     const headers = { 'user-agent': 'claude-cli/2.1.293 (external, cli)' }
     const body = {
@@ -91,23 +92,23 @@ test('official-looking traffic still gets the configured prompt when force-confi
       messages: [{ role: 'user', content: HI }],
       metadata: { user_id: JSON.stringify({ device_id: 'dev-1', account_uuid: 'acc-1', session_id: 'sess-1' }) },
     }
-    const skipped = applyCrsUnofficialPersona(structuredClone(body), { routingFile: file, headers })
-    assert.match(skipped.system[0].text, /cc_entrypoint=cli/)
-    const out = applyCrsUnofficialPersona(structuredClone(body), {
+    const kept = applyCrsUnofficialPersona(structuredClone(body), {
       routingFile: file,
       headers,
-      officialClient: false,
-      forceConfigured: true,
+      officialClient: true,
     })
+    assert.match(kept.system[0].text, /cch=bdff0/)
+    const out = applyCrsUnofficialPersona(structuredClone(body), { routingFile: file, headers })
     assertOfficial(out)
+    assert.ok(!JSON.stringify(out).includes('cch=bdff0'))
   })
 })
 
-test('zero preset stays zero-inject: billing only, no placeholders or official prompt', () => {
+test('zero preset adds only billing and retains caller text without an official prompt', () => {
   withRouting({ persona_preset: 'zero', overlay_preset: 'off' }, (file) => {
-    for (const [, body] of SHAPES) {
+    for (const [name, body] of SHAPES) {
       const out = applyCrsUnofficialPersona(structuredClone(body), { routingFile: file })
-      assertZero(out)
+      assertZero(out, { caller: name === 'caller leftover' ? 'keep-this-caller' : '' })
     }
   })
 })

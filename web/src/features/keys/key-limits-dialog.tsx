@@ -123,6 +123,7 @@ export function KeyLimitsDialog({
         allowed_vms:
           group === 'all' || group === 'pool' ? [] : initial.allowed_vms || [],
         ...(pools ? { vm_pool_id: initial.vm_pool_id || '' } : {}),
+        allowed_models: (initial.allowed_models || []).join(', '),
       })
       return
     }
@@ -132,9 +133,11 @@ export function KeyLimitsDialog({
 
   const quotaOpts = mode === 'edit' ? QUOTA_EDIT : QUOTA_CREATE
   const rpmOpts = mode === 'edit' ? RPM_EDIT : RPM_CREATE
+  const isApi = draft.category === 'api'
   const listed = vmsInGroup(vms || [], draft.group_type)
-  const scopeBlocked =
-    draft.group_type === 'pool'
+  const scopeBlocked = isApi
+    ? false
+    : draft.group_type === 'pool'
       ? !draft.vm_pool_id
       : draft.group_type !== 'all' && draft.allowed_vms.length === 0
 
@@ -176,6 +179,12 @@ export function KeyLimitsDialog({
                   setDraft((d) => ({
                     ...d,
                     category: v === 'api' ? 'api' : 'oauth',
+                    group_type:
+                      v === 'api' && d.group_type === 'pool'
+                        ? 'all'
+                        : d.group_type,
+                    allowed_vms: v === 'api' ? [] : d.allowed_vms,
+                    vm_pool_id: v === 'api' ? '' : d.vm_pool_id,
                   }))
                 }
               >
@@ -236,7 +245,7 @@ export function KeyLimitsDialog({
               />
             </Field>
           ) : null}
-          <Field label='分组'>
+          <Field label={isApi ? 'API 协议' : '分组'}>
             <Select
               value={draft.group_type}
               onValueChange={(v) => {
@@ -248,11 +257,14 @@ export function KeyLimitsDialog({
                   ...d,
                   group_type: group,
                   allowed_vms:
-                    group === 'all' || group === 'pool'
+                    isApi || group === 'all' || group === 'pool'
                       ? []
                       : d.allowed_vms.filter((id) => keep.has(id)),
                   ...(pools
-                    ? { vm_pool_id: group === 'pool' ? d.vm_pool_id || '' : '' }
+                    ? {
+                        vm_pool_id:
+                          !isApi && group === 'pool' ? d.vm_pool_id || '' : '',
+                      }
                     : {}),
                 }))
               }}
@@ -261,21 +273,36 @@ export function KeyLimitsDialog({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value='all'>all · 全局可调度</SelectItem>
-                {pools ? <SelectItem value='pool'>账号池</SelectItem> : null}
-                <SelectItem value='anthropic'>anthropic</SelectItem>
-                <SelectItem value='openai'>openai</SelectItem>
-                <SelectItem value='antigravity'>antigravity</SelectItem>
+                <SelectItem value='all'>
+                  {isApi ? 'all · 全部协议' : 'all · 全局可调度'}
+                </SelectItem>
+                {!isApi && pools ? (
+                  <SelectItem value='pool'>账号池</SelectItem>
+                ) : null}
+                <SelectItem value='anthropic'>
+                  {isApi ? 'anthropic · Anthropic 协议' : 'anthropic'}
+                </SelectItem>
+                <SelectItem value='openai'>
+                  {isApi ? 'openai · OpenAI 协议' : 'openai'}
+                </SelectItem>
+                {!isApi ? (
+                  <SelectItem value='antigravity'>antigravity</SelectItem>
+                ) : null}
               </SelectContent>
             </Select>
           </Field>
-          {draft.group_type === 'antigravity' ? (
+          {isApi ? (
             <p className='text-xs text-muted-foreground sm:col-span-2'>
-              Antigravity 范围独立保存，API 直接使用官方模型 ID（含同名 Claude /
-              GPT 模型）。仅调度已授权且支持所选模型的 Antigravity 槽位。
+              {draft.group_type === 'all'
+                ? 'API 直连密钥，可调度所有已启用的 API 端点。'
+                : `API 直连密钥，仅调度 ${draft.group_type} 协议的 API 端点。`}
             </p>
-          ) : null}
-          {draft.group_type === 'pool' ? (
+          ) : draft.group_type === 'antigravity' ? (
+            <p className='text-xs text-muted-foreground sm:col-span-2'>
+              Antigravity 范围独立保存，仅调度已授权且支持所选模型的 Antigravity
+              槽位。
+            </p>
+          ) : draft.group_type === 'pool' ? (
             <Field label='账号池'>
               <Select
                 value={draft.vm_pool_id || ''}
@@ -341,6 +368,21 @@ export function KeyLimitsDialog({
               </Field>
             </div>
           )}
+          <div className='sm:col-span-2'>
+            <Field label='允许的模型'>
+              <Input
+                value={draft.allowed_models}
+                placeholder='留空不限，例如 claude-sonnet-5, gpt-6-sol'
+                onChange={(e) =>
+                  setDraft((d) => ({ ...d, allowed_models: e.target.value }))
+                }
+              />
+            </Field>
+            <p className='mt-1 text-xs text-muted-foreground'>
+              按客户端请求里写的模型名匹配（不分大小写，映射前，Claude Code 的
+              [1m] 后缀自动忽略），逗号分隔；名单外的模型直接返回 400。
+            </p>
+          </div>
         </div>
         <DialogFooter>
           <Button
@@ -378,6 +420,7 @@ function blankDraft(): KeyLimitsDraft {
     expires_in_days: 30,
     group_type: 'all',
     allowed_vms: [],
+    allowed_models: '',
   }
 }
 

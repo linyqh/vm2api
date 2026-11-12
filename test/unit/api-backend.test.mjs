@@ -300,7 +300,9 @@ test('OAuth cli-hop applies the resolved Protocol custom persona template', asyn
     await handler.handleProtocol(req, response, 'anthropic.messages', '/v1/messages')
     assert.equal(response.status, 503)
     assert.ok(prepared?.body)
-    assert.equal(prepared.body.system.length, 3)
+    // The rendered custom prompt plus billing survives without a second
+    // official-system rebuild inserting an extra identity block.
+    assert.equal(prepared.body.system.length, 2)
     assert.ok(prepared.body.system.some((block) => String(block.text || '').includes('CUSTOM_PERSONA UTC')))
   } finally {
     fs.rmSync(root, { recursive: true, force: true })

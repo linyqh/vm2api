@@ -74,6 +74,51 @@ function success(text = 'ok') {
   }
 }
 
+test('failed attempt logging returns the permit without dispatch or failover', async () => {
+  let releases = 0
+  const scheduler = new Scheduler([])
+  scheduler.selectAndReserve = async () => ({ ...candidate(1), ok: true, release: () => releases++ })
+  const attemptsRepo = {
+    begin: () => {
+      throw new Error('attempt log unavailable')
+    },
+  }
+  const runner = new FailoverRunner({ scheduler, attemptsRepo })
+  await assert.rejects(
+    runner.run({
+      requestId: 'logging-failed',
+      model: 'claude-sonnet-test',
+      canonicalBody: { model: 'claude-sonnet-test' },
+      callAttempt: () => assert.fail('must not dispatch'),
+    }),
+    /attempt log unavailable/,
+  )
+  assert.equal(releases, 1)
+  assert.deepEqual(scheduler.cooldowns, [])
+})
+
+test('abort during request preparation never dispatches and returns the permit', async () => {
+  let releases = 0
+  const controller = new AbortController()
+  const scheduler = new Scheduler([])
+  scheduler.selectAndReserve = async () => ({ ...candidate(1), ok: true, release: () => releases++ })
+  const runner = new FailoverRunner({ scheduler })
+  const result = await runner.run({
+    requestId: 'prepare-aborted',
+    model: 'claude-sonnet-test',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    signal: controller.signal,
+    applyAttempt: async (body) => {
+      controller.abort()
+      return body
+    },
+    callAttempt: () => assert.fail('must not dispatch'),
+  })
+  assert.equal(result.status, 499)
+  assert.equal(result.attemptCount, 0)
+  assert.equal(releases, 1)
+})
+
 test('unsupported classifier runtime stops without counting execution or cooling accounts', async () => {
   const scheduler = new Scheduler([candidate(1), candidate(2)])
   const runner = new FailoverRunner({ scheduler })
@@ -124,6 +169,30 @@ test('invalid panel cache layout stops before execution without rotating or cool
   })
   assert.equal(result.status, 400)
   assert.equal(result.body.error.code, 'invalid_cache_control')
+  assert.equal(result.attemptCount, 0)
+  assert.equal(scheduler.selectCalls, 1)
+  assert.deepEqual(scheduler.cooldowns, [])
+  assert.equal(attempts.items[0].errorScope, 'request')
+})
+
+test('oversized CRAG zero replace stops before execution without cooling accounts', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const attempts = new Attempts()
+  const runner = new FailoverRunner({ scheduler, attemptsRepo: attempts })
+  const result = await runner.run({
+    requestId: 'crag-replace-too-large',
+    model: 'claude-opus-5-5',
+    canonicalBody: { model: 'claude-opus-5-5' },
+    applyAttempt: () => {
+      const error = new Error('prompt too large for original CLI replace mode')
+      error.status = 400
+      error.body = { error: { type: 'invalid_request_error', code: 'crag_prompt_too_large', message: error.message } }
+      throw error
+    },
+    callAttempt: () => assert.fail('oversized replace must not execute'),
+  })
+  assert.equal(result.status, 400)
+  assert.equal(result.body.error.code, 'crag_prompt_too_large')
   assert.equal(result.attemptCount, 0)
   assert.equal(scheduler.selectCalls, 1)
   assert.deepEqual(scheduler.cooldowns, [])
@@ -198,7 +267,13 @@ test('slot_busy spill serves the turn elsewhere but keeps the session pinned', a
   const callerSession = 'slot-busy-caller'
   const stickyKey = sticky.canonicalSessionKey(callerSession)
   sticky.bind(stickyKey, { accountId: 'account-1', vmId: 'vm-01', sessionId: 'stored-home' }, { countHit: false })
-  const selections = [1, 2].map((n) => ({ ok: true, accountId: `account-${n}`, vmId: `vm-0${n}`, release() {} }))
+  const selections = [1, 2].map((n) => ({
+    ok: true,
+    accountId: `account-${n}`,
+    vmId: `vm-0${n}`,
+    seatKey: `seat:sess:${callerSession}`,
+    release() {},
+  }))
   let index = 0
   const scheduler = {
     async selectAndReserve() {
@@ -217,6 +292,7 @@ test('slot_busy spill serves the turn elsewhere but keeps the session pinned', a
     canonicalBody: { model: 'claude-opus-test' },
     model: 'claude-opus-test',
     stickyKey,
+    seatKey: `seat:sess:${callerSession}`,
     applyAttempt: (body, selected, extra) => ({
       body,
       meta: {
@@ -245,6 +321,43 @@ test('slot_busy spill serves the turn elsewhere but keeps the session pinned', a
     vmId: 'vm-01',
     sessionId: 'stored-home',
   })
+})
+
+test('a late device-affinity hop does not overwrite a newer cross-account session pin', async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-device-move-race-'))
+  const sticky = new StickyRouter({ dataDir, config: { sticky: { enabled: true } } })
+  t.after(() => {
+    sticky.db.close()
+    fs.rmSync(dataDir, { recursive: true, force: true })
+  })
+  const callerSession = 'device-move-race'
+  const stickyKey = sticky.canonicalSessionKey(callerSession)
+  sticky.bind(stickyKey, { accountId: 'account-1', vmId: 'vm-01', sessionId: 'old-outbound' }, { countHit: false })
+  const scheduler = new Scheduler([
+    { ...candidate(2), selectionReason: 'device-affinity', seatKey: `seat:sess:${callerSession}` },
+  ])
+  const runner = new FailoverRunner({ scheduler, stickyRouter: sticky })
+  const result = await runner.run({
+    requestId: 'req-device-move-race',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey,
+    seatKey: `seat:sess:${callerSession}`,
+    applyAttempt: (body) => ({ body, meta: { sessionId: 'moved-outbound' } }),
+    callAttempt: () => {
+      sticky.bind(
+        stickyKey,
+        { accountId: 'account-3', vmId: 'vm-03', sessionId: 'newer-outbound' },
+        { allowMove: true, replaceSession: true },
+      )
+      return success()
+    },
+  })
+  assert.equal(result.ok, true)
+  const bound = sticky.resolve(stickyKey)
+  assert.equal(bound.accountId, 'account-3')
+  assert.equal(bound.vmId, 'vm-03')
+  assert.equal(bound.sessionId, 'newer-outbound')
 })
 
 test('#A20: a late completion never writes back a pin another request released', async () => {
@@ -1975,4 +2088,37 @@ test('org OAuth refusal pauses that slot and the family request hops to another'
   assert.equal(pauses[0].selected.vmId, 'vm-01')
   assert.equal(pauses[0].policy.reason, 'organization_disabled')
   assert.equal(pauses[0].policy.detail.status, 403)
+})
+
+test('a slot that cannot refresh its credential hops and cools down', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const seen = []
+  const runner = new FailoverRunner({ scheduler })
+  const result = await runner.run({
+    requestId: 'req-credential-ensure',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.accountId)
+      if (selected.accountId === 'account-1') {
+        return {
+          ok: false,
+          status: 400,
+          credential_ensure_failed: true,
+          terminalState: 'rejected',
+          body: {
+            type: 'error',
+            error: { type: 'worker_error', code: 'refresh_failed', message: 'OAuth refresh failed' },
+          },
+        }
+      }
+      return success()
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.accountId, 'account-2')
+  assert.deepEqual(seen, ['account-1', 'account-2'])
+  assert.equal(scheduler.cooldowns.length, 1)
+  assert.equal(scheduler.cooldowns[0].update.reason, 'credential_refresh_failed')
+  assert.equal(scheduler.cooldowns[0].update.status, 'cooldown')
 })

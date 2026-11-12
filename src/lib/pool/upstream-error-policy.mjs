@@ -6,7 +6,7 @@ import {
   isCompleteAssistantMessage,
   isClientCancelledResult,
   isIncompleteAssistantMessage,
-  isUsagePolicyErrorMessage,
+  isUnanswerablePromptMessage,
   isWrapConnectionError,
   ErrorCode,
 } from '../core/errors.mjs'
@@ -175,6 +175,22 @@ function resultErrorCode(result) {
   return String(result?.body?.error?.code || result?.body?.error?.type || '')
 }
 
+function cacheRefusal(reason) {
+  return {
+    scope: 'request',
+    action: 'stop',
+    reason,
+    cooldownUntil: null,
+    retrySameAccount: false,
+    rememberRefusal: true,
+    refusalTtlMs: 0,
+  }
+}
+
+function refusalCodes(result, code, workerCode) {
+  return [code, workerCode, result?.body?.error?.upstream_code, result?.code, result?.error_code]
+}
+
 /**
  * First wrap hop after idle often streams a local/stale 401
  * (`request_id:null` or `upstream_stream_incomplete`) because the CLI
@@ -239,6 +255,13 @@ export function isSilentClaudeRefusal(result = {}) {
 
 export const DEFAULT_OAUTH_401_COOLDOWN_MS = 120_000
 export const MAX_OAUTH_401_COOLDOWN_MS = 600_000
+/**
+ * A slot whose own credential refresh failed stops taking traffic for a while.
+ * Bounded rather than permanent: the worker only forwards the token endpoint's
+ * status, so a slot that is merely temporarily unable to refresh gets another
+ * chance instead of being parked until an operator re-imports it by hand.
+ */
+export const CREDENTIAL_ENSURE_COOLDOWN_MS = 10 * 60_000
 /** Upstream 5xx: stop the account and the same prompt. Do not open another slot. */
 export const PROVIDER_PAUSE_MS = 60 * 60 * 1000
 
@@ -313,7 +336,7 @@ function classifyUpstreamResultRaw(
     }
   }
   if (isContentFilterRefusal(result) && !result.committed) {
-    return { scope: 'request', action: 'stop', reason: 'content_filter_refusal', cooldownUntil: null }
+    return cacheRefusal('content_filter_refusal')
   }
   const completeAssistant = isCompleteAssistantMessage(result)
   const malformedSuccess =
@@ -338,28 +361,27 @@ function classifyUpstreamResultRaw(
   const reset = resetFromHeaders(result.headers, now)
 
   const hay = `${code} ${message} ${workerCode}`
+  if (
+    [code, workerCode].some((value) =>
+      /^license_(required|expired|not_yet_valid|invalid|binding_mismatch|unconfigured)$/.test(value),
+    )
+  ) {
+    return {
+      scope: 'request',
+      action: 'stop',
+      reason: code || workerCode,
+      cooldownUntil: null,
+      retrySameAccount: false,
+    }
+  }
   // Claude Code wraps an AUP refusal as "API Error" and the kernel often
   // surfaces it as HTTP 400. That is the prompt, not a repairable request
   // and not an account failure: stop, do not hop again, cache forever.
-  if (isUsagePolicyErrorMessage(message) || isUsagePolicyErrorMessage(hay)) {
-    return {
-      scope: 'request',
-      action: 'stop',
-      reason: 'usage_policy_refusal',
-      cooldownUntil: null,
-      retrySameAccount: false,
-      rememberRefusal: true,
-      refusalTtlMs: 0,
-    }
+  if (isUnanswerablePromptMessage(message) || isUnanswerablePromptMessage(hay)) {
+    return cacheRefusal('usage_policy_refusal')
   }
-  if (isContentPolicyErrorCode(code) || isContentPolicyErrorCode(workerCode)) {
-    return {
-      scope: 'request',
-      action: 'stop',
-      reason: 'content_policy_refusal',
-      cooldownUntil: null,
-      retrySameAccount: false,
-    }
+  if (refusalCodes(result, code, workerCode).some(isContentPolicyErrorCode)) {
+    return cacheRefusal('content_policy_refusal')
   }
   // The org refuses this seat. Not a token death and not a timed cooldown:
   // pause the slot until an operator resumes it, and give the request to
@@ -396,6 +418,17 @@ function classifyUpstreamResultRaw(
       action: 'stop',
       reason: 'downstream_committed_or_incomplete',
       cooldownUntil: null,
+    }
+  }
+  // Non-fatal ensure failures keep the token endpoint's 400. Fatal grants are
+  // escalated to 401 above and must keep the permanent oauth_revoked path.
+  if (result.credential_ensure_failed === true && status === 400) {
+    return {
+      scope: 'account',
+      action: 'continue-and-cooldown',
+      reason: 'credential_refresh_failed',
+      cooldownUntil: now + CREDENTIAL_ENSURE_COOLDOWN_MS,
+      retrySameAccount: false,
     }
   }
   // Plan limit arrives as 429, as a kernel 502 provider_error, or (pre-restore)

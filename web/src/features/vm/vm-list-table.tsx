@@ -5,6 +5,7 @@ import type { StatusTone } from '@/types/status'
 import { GripVertical, RotateCcw } from 'lucide-react'
 import { expiresAtToMs, fmtResetClock } from '@/lib/fable-status'
 import { fmtNum } from '@/lib/format'
+import { subscriptionListLabel } from '@/lib/subscription-expiry'
 import { tierVisual } from '@/lib/tier-visual'
 import { cn } from '@/lib/utils'
 import {
@@ -352,12 +353,27 @@ function TierBadge({ vm }: { vm: Vm }) {
   )
 }
 
-function SlotCell({ vm }: { vm: Vm }) {
+function SlotCell({ vm, now }: { vm: Vm; now: number }) {
   const name = slotNameLabel(vm)
   const email = String(vm.email || '').trim()
+  const sub = subscriptionListLabel(vm, now)
+  const crag = (vm.resolved_dataplane ?? vm.dataplane) === 'crag'
   return (
     <div className='min-w-0 space-y-0.5 overflow-hidden'>
-      <SlotIdentity vm={vm} compact className='text-sm font-medium' />
+      <div className='flex min-w-0 items-center gap-1.5'>
+        <SlotIdentity vm={vm} compact className='flex-1 text-sm font-medium' />
+        <span
+          className={cn(
+            'inline-flex shrink-0 items-center rounded px-1.5 py-0.5 text-[10px] leading-none font-semibold',
+            crag
+              ? 'bg-orange-200 text-orange-900 dark:bg-orange-400/20 dark:text-orange-300'
+              : 'bg-zinc-200 text-zinc-700 dark:bg-zinc-300/20 dark:text-zinc-300'
+          )}
+          title='当前内核'
+        >
+          {crag ? 'crag' : '标准内核'}
+        </span>
+      </div>
       <div className='flex min-w-0 items-center gap-1.5'>
         <ActiveVmBadge vm={vm} />
         <TierBadge vm={vm} />
@@ -369,6 +385,17 @@ function SlotCell({ vm }: { vm: Vm }) {
         >
           {name}
         </span>
+      </div>
+      <div
+        className={cn(
+          'truncate font-mono text-[11px] tabular-nums',
+          sub.tone === 'bad' && 'text-[color:var(--status-bad)]',
+          sub.tone === 'warn' && 'text-[color:var(--status-warn)]',
+          sub.tone === 'muted' && 'text-muted-foreground'
+        )}
+        title={sub.title}
+      >
+        {sub.text}
       </div>
       <VmOwnerLine
         vm={vm}
@@ -390,7 +417,7 @@ const COLUMNS: Record<
   VmColumnKey,
   { label: string; cell: (ctx: CellCtx) => ReactNode }
 > = {
-  vm: { label: '账号', cell: ({ vm }) => <SlotCell vm={vm} /> },
+  vm: { label: '账号', cell: ({ vm, now }) => <SlotCell vm={vm} now={now} /> },
   sched: {
     label: '调度',
     cell: ({ vm }) => (

@@ -38,7 +38,7 @@ import { StatusMark } from '@/components/status-mark'
 import { AntigravityQuotaWindows } from '@/features/vm/antigravity-quota'
 import { ClaudeResetActions } from '@/features/vm/claude-reset-actions'
 import { CodexKernelHealthFields } from '@/features/vm/codex-kernel-health-card'
-import { dataplaneLabel } from '@/features/vm/dataplane-contract'
+import { kernelRouteLabel } from '@/features/vm/dataplane-contract'
 import { CircuitField } from '@/features/vm/detail-circuit-field'
 import {
   Field,
@@ -54,7 +54,7 @@ import { proxyHealthOf } from '@/features/vm/proxy-health'
 import { RuntimeChip } from '@/features/vm/runtime-chip'
 import { VmMemoryBlock } from '@/features/vm/vm-memory-block'
 import { VmSchedulingBlock } from '@/features/vm/vm-scheduling'
-import { telemetryView } from './telemetry-policy'
+import { telemetryEnabled } from './telemetry-policy'
 import { telemetryStatusLabel } from './telemetry-status'
 
 type Props = {
@@ -169,7 +169,7 @@ function slotVerdict(
 
 function workerLabel(value: unknown) {
   const raw = String(value || '').trim()
-  if (raw === 'go' || raw === 'rust') return 'Rust · cli-hop'
+  if (raw === 'go' || raw === 'rust') return 'Rust'
   return raw || '—'
 }
 
@@ -249,9 +249,16 @@ export function VmStatusBoard(props: Props) {
       : live5
   const spend7 = formatWindowSpend(cost7, vm.estimate_7d)
   const spendFable = formatWindowSpend(fableCost, vm.estimate_fable)
-  const telemetry = telemetryView(vm.seed_policy, kernel?.telemetry)
+  const telemetry = kernel?.telemetry
   const topology = kernel?.process_topology
-  const rust = wrapHealthLabel(kernel?.rust_health)
+  const route = kernelRouteLabel(
+    vm.resolved_dataplane,
+    vm.resolved_crag_kernel_version
+  )
+  const rust = wrapHealthLabel(
+    kernel?.rust_health,
+    vm.resolved_dataplane === 'crag' ? route : 'cli-hop'
+  )
 
   return (
     <section className='rounded-lg border bg-card'>
@@ -464,18 +471,27 @@ export function VmStatusBoard(props: Props) {
               <CodexKernelHealthFields health={kernel?.codex_health} />
             ) : (
               <>
-                <Field label='cli-hop' compact>
+                <Field
+                  label={vm.resolved_dataplane === 'crag' ? route : 'cli-hop'}
+                  compact
+                >
                   {rust}
                 </Field>
                 <Field label='内核' compact>
-                  {isCodexVm(vm) ? '—' : dataplaneLabel(vm.resolved_dataplane)}
+                  {kernelRouteLabel(
+                    vm.resolved_dataplane,
+                    vm.resolved_crag_kernel_version
+                  )}
                 </Field>
                 <Field label='拓扑' compact>
                   {topologyLabel(topology)}
                   {topology?.go_telemetry ? ' · Go telemetry' : ''}
                 </Field>
                 <Field label='遥测' compact>
-                  {telemetryStatusLabel(telemetry)}
+                  {telemetryStatusLabel(
+                    telemetry,
+                    telemetryEnabled(vm.seed_policy)
+                  )}
                 </Field>
               </>
             )}

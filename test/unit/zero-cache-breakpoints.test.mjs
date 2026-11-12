@@ -86,6 +86,61 @@ test('zero does not place a breakpoint on thinking blocks', () => {
   validateCacheBreakpoints(out)
 })
 
+test('zero automatic caching skips a trailing thinking block and keeps the original implicit TTL', () => {
+  const input = fixture(1, 'claude-opus-5-5')
+  input.cache_control = { type: 'ephemeral' }
+  input.messages.push({
+    role: 'assistant',
+    content: [
+      { type: 'text', text: 'Answer' },
+      { type: 'thinking', thinking: 'private', signature: 'signed-fixture-01234567890123456789' },
+    ],
+  })
+  const before = structuredClone(input)
+  const out = prepareCliHopBody(input, { personaPreset: 'zero', preserveThinkingBlocks: true, cacheTtl: '1h' })
+  assert.deepEqual(out.messages[1].content[0].cache_control, input.cache_control)
+  assert.equal(out.messages[1].content[1].type, 'thinking')
+  assert.equal(out.messages[1].content[1].cache_control, undefined)
+  assert.equal(out.cache_control, undefined)
+  assert.deepEqual(input, before)
+  validateCacheBreakpoints(out)
+})
+
+for (const marked of [false, true]) {
+  test(`zero automatic caching accounts for trailing system content, marked=${marked}`, () => {
+    const input = fixture(1, 'claude-opus-5-5')
+    input.cache_control = { type: 'ephemeral', ttl: '5m' }
+    const block = {
+      type: 'text',
+      text: 'Trailing caller rule',
+      ...(marked ? { cache_control: { type: 'ephemeral', ttl: '1h' } } : {}),
+    }
+    input.messages.push({ role: 'system', content: [block] })
+    const out = prepareCliHopBody(input, { personaPreset: 'zero' })
+    assert.deepEqual(out.messages.at(-1).content[0], marked ? block : { ...block, cache_control: input.cache_control })
+    assert.equal(markers(out).length, 1)
+    validateCacheBreakpoints(out)
+  })
+}
+
+test('zero automatic caching reaches the final tool result without changing earlier markers', () => {
+  const input = fixture(1)
+  input.cache_control = { type: 'ephemeral', ttl: '5m' }
+  input.system.push({ type: 'text', text: 'Caller prefix', cache_control: { type: 'ephemeral', ttl: '1h' } })
+  input.messages.push(
+    { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Read', input: {} }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'Result' }] },
+  )
+  const out = prepareCliHopBody(input, { personaPreset: 'zero', cacheTtl: '1h' })
+  assert.deepEqual(out.system, input.system)
+  assert.deepEqual(out.messages.at(-1).content[0], {
+    ...input.messages.at(-1).content[0],
+    cache_control: input.cache_control,
+  })
+  assert.deepEqual(prepareCliHopBody(out, { personaPreset: 'zero', cacheTtl: '1h' }), out)
+  validateCacheBreakpoints(out)
+})
+
 for (const options of [
   { outboundShape: 'lean' },
   { preserveSystem: true },
@@ -96,10 +151,12 @@ for (const options of [
   })
 }
 
-test('shaped template continues to own its breakpoints', () => {
+test('shaped template receives message fallback while keeping its system layout', () => {
   const input = fixture()
   input.system.push({ type: 'text', text: '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__' })
-  assert.equal(markers(prepareCliHopBody(input)).length, 0)
+  const out = prepareCliHopBody(input)
+  assert.deepEqual(out.system, input.system)
+  assert.equal(markers(out).length, 2)
 })
 
 test('configured zero persona reaches cli-hop with cacheable messages for streaming and JSON requests', () => {
@@ -118,6 +175,7 @@ test('configured zero persona reaches cli-hop with cacheable messages for stream
       })
       const out = prepareCliHopBody(rendered, { stream, cacheTtl: '1h' })
       assert.deepEqual(out.system, rendered.system)
+      assert.deepEqual(out.system.slice(1), input.system)
       assert.equal(out.stream, stream)
       assert.equal(markers(out).length, 2)
       validateCacheBreakpoints(out)

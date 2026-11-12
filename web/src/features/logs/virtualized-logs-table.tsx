@@ -491,7 +491,7 @@ export function VirtualizedLogsTable({
               {isHidden('reasoningEffort') ? null : (
                 <HeadCell
                   className='min-w-[64px] flex-[0.6]'
-                  title='该模型请求的思考强度'
+                  title='发往槽位的思考强度，含模型缺省'
                 >
                   思考强度
                 </HeadCell>

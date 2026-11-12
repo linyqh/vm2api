@@ -611,11 +611,11 @@ test('handleProtocol intercepts before credential hop', () => {
   const codex = src.indexOf('handleCodexProtocol({')
   assert.ok(early > 0 && early < codex)
   const before = src.indexOf("applyIntercept(cfg.intercept.rules, 'before_upstream'")
-  const late = src.indexOf('await applyProtocolIntercept(', before)
-  const api = src.indexOf("inferenceBackend === 'api'")
+  const late = src.indexOf('await applyProtocolIntercept(', early + 1)
+  const apiHop = src.indexOf('picked: apiPicked')
   assert.ok(before > 0)
   assert.ok(late > before)
-  assert.ok(api > late)
+  assert.ok(apiHop > late)
   const guard = src.slice(
     src.indexOf('async function applyProtocolIntercept'),
     src.indexOf('function isZeroInjectMode'),

@@ -21,6 +21,7 @@ hypervisor/*.env
 /web/dist/
 /share/crag/
 /share/wrap-cli/*
+/share/wrap-cli-releases/
 !/share/wrap-cli/kin-kernel
 !/share/wrap-cli/SAMPLE.json
 .workflow/
@@ -69,7 +70,7 @@ patches/
 /src/lib/oauth/auth.js
 /docs/auto-mode
 /docs/jev.md
-
+/docs/AFO_INTEGRATION.md
 .omp
 /dist/
 share/wrap-cli/dist/

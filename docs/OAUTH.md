@@ -6,9 +6,10 @@
 sessionKey（默认 Setup Token）或授权码
    │ 必须先有 VM + 槽位出口：SOCKS5，或本地出口 px-local（宿主机默认路由直连）；未绑定一律拒绝
    ▼
-bin/kin-oauth-auth（控制面 spawn；OAuth 源码只在本地构建）
-   │ sessionKey → /api/organizations → 完整 scope authorize → token
-   │ bootstrap（entrypoint=claude-code&model=claude-opus-5-5）读取 oauth_account；不再 PATCH Grove
+目标 VM 内的 `bin/kin-oauth-auth`（控制面只负责 `docker exec`，OAuth 源码只在本地构建）
+   │ sessionKey / 授权码 → authorize → token
+   │ bootstrap（entrypoint=claude-code&model=claude-opus-5-5）仍经同一 VM 出口读取 oauth_account
+   │ 控制面接收完整凭证，不在 helper 返回后再次 bootstrap 或套一层代理
    ▼
 槽 ~/.claude/credentials.json   ← 活票只在这里（含 email / account_uuid / org_uuid）
    │ host RefreshIfNeeded（推理临期 或 面板显式 refresh）
@@ -54,7 +55,7 @@ SSH 扩展槽同样由控制面经绑定出口换票。拿到授权后，提交�
 8. `invalid_grant` 先重读 generation，识别其他路径已完成的竞争刷新。
 9. 上游 401 **不** force-refresh（端点拒票 ≠ 过期；硬刷会把还能用的 grant 烧成 `invalid_grant`）。
 10. 目录 / 模型列表 **不** hop worker `/v1/models`。
-11. 槽内 cli-node（kernel 拉起的 native 槽、面板运维终端里的 `claude`、初装 hello / `/usage` / 常驻、`setup-token`）带 `CLAUDE_CODE_HOST_REFRESH=1` 和 `CLAUDE_CODE_VERSION`：临期或 401 时只重读 `credentials.json`，不请求 token 端点，不写回凭证。否则它与 host 同用一个轮换 RT，后到的一方拿 `invalid_grant`，且其写回会丢掉 `kinGeneration`。
+11. 槽内 cli-node（kernel 拉起的 native 槽、面板运维终端里的 `claude`、初装 hello / `/usage` / 常驻、`setup-token`）带 `CLAUDE_CODE_HOST_REFRESH=1` 和 `CLAUDE_CODE_VERSION`：临期或 401 时只重读 `credentials.json`，不请求 token 端点，不写回凭证。否则它与 host 同用一个轮换 RT，后到的一方拿 `invalid_grant`，且其写回会丢掉 `kinGeneration`。官方 Claude 2.1.321 不读这个变量。CRAG v2 拉起的那个进程会在连上 `platform.claude.com:443` / `console.anthropic.com:443` 后先写 `KIN-BLOCK\n`；kin-egress 看到标记就关掉连接，不向 SOCKS 拨号。登录、`kin-oauth-auth` 和 `kin-worker oauth refresh` 不写这个标记，换票仍走原来的出口。
 
 过期且无 refresh 的槽不入调度池。面板「网页可用」与调度选槽同一套资格。
 
@@ -68,6 +69,16 @@ SSH 扩展槽同样由控制面经绑定出口换票。拿到授权后，提交�
 - 遥测 sidecar 的 event_logging / eval（若开启）
 
 代理缺失或连接失败时槽位 fail closed，不允许 VPS 直连 Anthropic。
+
+## 原生 Claude Code 登录终端
+
+面板选择「OAuth → Claude Code」后，认证调用方默认使用 CRAG 包携带的官方原生 CC，**不跟随槽位推理内核**，也不回落 `cli-node` 或 PATH 上的 `claude`。本地 Docker / KVM 槽使用 `/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude`，集群 Docker 槽使用 `/opt/kin-live/crag-v2/claude-code-2.1.321/claude`。
+
+- 本地槽缺少该程序时，仅从已校验的 CRAG 发布包暂存官方 Claude 可执行文件；不安装或启动 CRAG worker，不切换推理内核，也不要求为官方登录激活 CRAG 授权。缺少包或程序不可执行会明确报错。
+- 选择「指定原生 CC 路径」可使用槽内另一个已安装的原生程序。必须填写**槽内 / guest 内的绝对可执行文件路径**，不是浏览器或控制面的文件路径；空格和单引号可正常使用。
+- 登录票据绑定最终程序路径，WebSocket 建立前再次检查同一路径。窗口显示本次实际调用的程序；运行中修改选择不会替换已打开会话。
+- 终端占据近全屏主区域，底部提供授权链接复制 / 打开，以及完整 `code#state` 回填。可用 `Ctrl / ⌘ + Enter` 提交；断连时不会清空尚未发送的授权码。
+- 原生 CC 只负责授权交互与换票。凭证沿用面板的槽位导入、远端同步和 worker 刷新链路；`.credentials.json` 与面板管理的 `credentials.json` 保持关联，不另建凭证库。重新授权前已存在的凭证不算本次登录成功。
 
 ## 官方 Claude Code 初装
 

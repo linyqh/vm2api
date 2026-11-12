@@ -132,7 +132,7 @@ test('guidance is off by default and explicit enable keeps cwd memory behavior',
     false,
   )
   assert.equal(
-    omitted.some((block) => String(block.text).includes('Write code that reads like the surrounding code')),
+    omitted.some((block) => String(block.text).includes('When you use a pronoun for someone')),
     true,
   )
 })
@@ -826,9 +826,9 @@ test('agent standing: default off, explicit per-preset on, and custom text repla
     { persona_preset: 'zero', agent_standing: 'Stay terse.', agent_standing_presets: { zero: true } },
     (file) => {
       const out = applyCrsUnofficialPersona(body(), { routingFile: file })
-      assert.equal(out.system.length, 1)
+      assert.equal(out.system.length, 2)
       assert.equal(out.system[0].text.includes('Stay terse.'), false)
-      assert.equal(out.system.at(-1).text.includes(caller), false)
+      assert.deepEqual(out.system.at(-1), { type: 'text', text: caller })
     },
   )
   withRoutingFile({ persona_preset: 'zero' }, (file) => {
@@ -1012,7 +1012,7 @@ test('official full can drop the env block while the opt-in timezone switch stil
         { routingFile: file, identity: { timezone: 'Asia/Tokyo' } },
       )
       assert.equal(
-        out.system.some((block) => block.text.startsWith('Write code that reads like the surrounding code')),
+        out.system.some((block) => block.text.startsWith('When you use a pronoun for someone')),
         true,
       )
       assert.deepEqual(envMessages(out), [' - Timezone: Asia/Tokyo'])
@@ -1062,7 +1062,8 @@ test('official preset preserves caller system verbatim in a reminder at the fron
 })
 
 test('routing persona_guidance_presets turns the 303 guidance block on; default leaves it off', () => {
-  const guidance = (out) => out.system.filter((block) => String(block.text).startsWith('Write code that reads like'))
+  const guidance = (out) =>
+    out.system.filter((block) => String(block.text).startsWith('When you use a pronoun for someone'))
   withRoutingFile({ persona_preset: 'official_full', overlay_preset: 'off' }, (file) => {
     const out = applyCrsUnofficialPersona({ messages: [{ role: 'user', content: 'hi' }] }, { routingFile: file })
     assert.equal(guidance(out).length, 0)
@@ -1073,7 +1074,7 @@ test('routing persona_guidance_presets turns the 303 guidance block on; default 
       const out = applyCrsUnofficialPersona({ messages: [{ role: 'user', content: 'hi' }] }, { routingFile: file })
       const [block] = guidance(out)
       assert.equal(block?.text, renderOfficial303Guidance())
-      assert.deepEqual(block.cache_control, { type: 'ephemeral' })
+      assert.deepEqual(block.cache_control, { type: 'ephemeral', ttl: '5m' })
       assert.equal(
         out.system.indexOf(block),
         out.system.findIndex((b) => b.text === '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__') + 1,
@@ -1111,10 +1112,10 @@ test('Environment is a role=system message only for models that accept mid-conve
       )
       assert.deepEqual(
         out.messages.map((message) => message.role),
-        ['user', 'assistant', 'user', 'system'],
+        ['user', 'system', 'assistant', 'user'],
         model,
       )
-      assert.match(out.messages.at(-1).content, /^# Environment/, model)
+      assert.match(out.messages[1].content, /^# Environment/, model)
       assert.equal(
         out.system.some((block) => String(block.text).includes('# Environment')),
         false,

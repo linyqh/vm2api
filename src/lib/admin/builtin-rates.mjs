@@ -63,6 +63,7 @@ function openaiFrom(std, extra = {}) {
 const ANTHROPIC = {
   'claude-fable-5': claude(10, 50, 1, 12.5, 20),
   'claude-fable-5-1': claude(10, 50, 0.25, 12.5, 20),
+  'claude-fable-5-2': claude(8, 40, 0.2, 10, 16),
   'claude-mythos-5': claude(10, 50, 1, 12.5, 20),
   'claude-mythos-5-1': claude(10, 50, 0.25, 12.5, 20),
   'claude-opus-5-5': claude(4, 20, 0.2, 5, 8, {
@@ -277,8 +278,11 @@ const OPENAI = {
   'gpt-5.1-chat-latest': openaiFrom({ input: 1.25, output: 10, cache_read: 0.125, cache_write: 0 }),
   'gpt-5.2-codex': openaiFrom({ input: 1.75, output: 14, cache_read: 0.175, cache_write: 0 }),
   'gpt-5.2-chat-latest': openaiFrom({ input: 1.75, output: 14, cache_read: 0.175, cache_write: 0 }),
+  'gpt-image-2.6-flare': gptImage(),
+  'gpt-image-2.6-sunburst': gptImage(),
   'gpt-image-2.5-flare': gptImage(),
   'gpt-image-2.5-sunburst': gptImage(),
+  'gpt-image-2': gptImage(),
 }
 
 /** Dated / legacy / family ids → canonical priced id. OpenAI: verified snapshot aliases only. */
@@ -289,6 +293,7 @@ export const BUILTIN_ALIASES = {
   sonnet: 'claude-sonnet-5-5',
   haiku: 'claude-haiku-4-5-20251001',
   'claude-fable-5.1': 'claude-fable-5-1',
+  'claude-fable-5.2': 'claude-fable-5-2',
   'claude-mythos-5.1': 'claude-mythos-5-1',
   'claude-opus-5.5': 'claude-opus-5-5',
   'claude-sonnet-5.5': 'claude-sonnet-5-5',
@@ -319,6 +324,7 @@ export const BUILTIN_ALIASES = {
   'gpt-5.5-pro-2026-04-23': 'gpt-5.5-pro',
   'gpt-image-2.5-flare-2026-09-08': 'gpt-image-2.5-flare',
   'gpt-image-2.5-sunburst-2026-09-08': 'gpt-image-2.5-sunburst',
+  'gpt-image-2-2026-04-21': 'gpt-image-2',
   'gpt-daybreak-blue-latest': 'gpt-5.6-sol',
   'gpt-daybreak-red-latest': 'gpt-5.6-cyber',
   'o1-2024-12-17': 'o1',

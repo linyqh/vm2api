@@ -10,6 +10,8 @@ import {
 } from './model-mapping'
 
 const IMAGE_IDS = [
+  'gpt-image-2.6-flare',
+  'gpt-image-2.6-sunburst',
   'gpt-image-2.5-flare',
   'gpt-image-2.5-flare-2026-09-08',
   'gpt-image-2.5-sunburst',
@@ -65,6 +67,19 @@ describe('targets and problems', () => {
     expect(mappingProblem('gpt-6-luna', ['gpt-6-luna'])).toBeNull()
   })
 
+  it('adds available Fast aliases without hijacking actual ids', () => {
+    expect(
+      mappingTargets([
+        {
+          id: 'gpt-6-luna',
+          expose_fast: true,
+          catalog: { service_tiers: [{ id: 'priority' }] },
+        },
+        { id: 'gpt-6-luna-fast', enabled: true },
+      ])
+    ).toEqual(['gpt-6-luna', 'gpt-6-luna-fast'])
+  })
+
   it('aliasProblem mirrors the server rules', () => {
     const rows = mappingRows({ 'my-fast': 'gpt-6-luna' })
     const check = (alias: string, index = 5) =>
@@ -78,6 +93,7 @@ describe('targets and problems', () => {
     expect(check('sonnet-5')).toBe('anthropic')
     expect(check('gpt-image-2.5-flare-2026-09-08')).toBe('image_tool')
     expect(check('openai/gpt-image-2.5-sunburst')).toBe('image_tool')
+    expect(check('gpt-image-2.6-flare')).toBe('image_tool')
     expect(check('gpt-5')).toBeNull()
   })
 })

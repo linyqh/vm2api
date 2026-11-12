@@ -11,9 +11,9 @@
  *             Agent is not injected.
  *             If the caller already sent an agent prompt, that text occupies
  *             the official agent slot. Console label: 官方提示词.
- *   zero    — 与 official_full 同 3 槽：billing（prompt_version 藏交互 CLI 身份句）+ 零宽 identity 槽
- *             + 零宽 agent 槽（5m cache）。无 agent 长文、无 Environment。Caller leftover 仍追加。
- *             客户端 usage 遮罩前三块。槽位 persona_preset 会覆盖全局，测 zero 必须槽上也是 zero。
+ *   zero    — billing（prompt_version 藏交互 CLI 身份句）+ 调用方原始 system 块。
+ *             默认不添加 agent 长文或 Environment，保留调用方块顺序和缓存标记。
+ *             槽位 persona_preset 会覆盖全局，测 zero 必须槽上也是 zero。
  *   append  — attach the official identity line to the caller system
  *   none    — leave system / messages untouched
  * routing.compatibility.persona_park (rewrite only):
@@ -32,12 +32,14 @@
 import { createHash } from 'node:crypto'
 import { resolveWorkstationProfile } from './workstation-profile.mjs'
 import fs from 'node:fs'
+import { readJsonParsedCached } from '../vm/vm-file.mjs'
 import { uuidFromSeed } from './identity-rewrite.mjs'
 import { OFFICIAL_CLI_VERSION } from './vm-identity.mjs'
 import { CCH_PLACEHOLDER } from './cch.mjs'
 import { CLAUDE_CLI_UA_RE, isOfficialClaudeUa } from './official-claude-ua.mjs'
 import { modelSupportsMidConversationSystem } from '../protocol/anthropic-policy.mjs'
 import { validTimezone } from '../core/timezone.mjs'
+import { normalizeCacheTtl, validateCacheBreakpoints } from '../protocol/cache-ttl.mjs'
 import {
   AGENT_EXPANSION_CACHE_CONTROL,
   CRS_AGENT_EXPANSION,
@@ -75,6 +77,7 @@ import {
   OFFICIAL_303_PRESET,
 } from './persona-template.mjs'
 import {
+  OFFICIAL_303_AGENT_IDENTITY,
   OFFICIAL_303_HARNESS,
   OFFICIAL_303_ENV_INSTRUCTIONS,
   buildOfficial303Environment,
@@ -333,12 +336,13 @@ function boundedBillingIndex(value, min) {
   return n
 }
 
-/** 2.1.293 appends both indexes, or neither. */
-export function billingTurnSuffix(promptIndex, turnIndex) {
-  const prompt = boundedBillingIndex(promptIndex, 0)
+/** First-turn indexes stay frozen. `cli` is the TUI capture; `sdk-cli` is `--print`. */
+export function billingTurnSuffix(promptIndex, turnIndex, entrypoint = 'sdk-cli') {
+  const prompt = entrypoint === 'cli' ? 1 : boundedBillingIndex(promptIndex, 0)
   const turn = boundedBillingIndex(turnIndex, 1)
   if (prompt == null || turn == null) return ''
-  return ` cc_turn_origin=sdk; cc_prompt_index=${prompt}; cc_turn_index=${turn};`
+  const origin = entrypoint === 'cli' ? 'human' : 'sdk'
+  return ` cc_turn_origin=${origin}; cc_prompt_index=${prompt}; cc_turn_index=${turn};`
 }
 
 function toolResultOnlyMessage(message) {
@@ -348,14 +352,14 @@ function toolResultOnlyMessage(message) {
 }
 
 /** First-turn indexes only. A moving cc_turn_index rewrites system[0] and invalidates every breakpoint after tools. */
-export function billingIndexesFromMessages(messages) {
+export function billingIndexesFromMessages(messages, entrypoint = 'sdk-cli') {
   if (!Array.isArray(messages)) return null
   let prompts = 0
   for (const message of messages) {
     if (message?.role === 'user' && !toolResultOnlyMessage(message)) prompts += 1
   }
   if (prompts < 1) return null
-  return { promptIndex: 0, turnIndex: 1 }
+  return { promptIndex: entrypoint === 'cli' ? 1 : 0, turnIndex: 1 }
 }
 
 const BILLING_PROMPT_ID_RE = /cc_prompt_id=[^;\s]*/g
@@ -428,8 +432,8 @@ export function buildBillingAttributionText(
   const ver = parseCliVersion(cliVersion)
   const fp = computeClaudeCodeFingerprint(firstUserText ?? '', ver)
   const promptId = billingPromptId(sessionId, firstUserText, ver)
-  const tail = billingTurnSuffix(indexes?.promptIndex, indexes?.turnIndex)
   const entry = entrypoint === 'cli' ? 'cli' : 'sdk-cli'
+  const tail = billingTurnSuffix(indexes?.promptIndex, indexes?.turnIndex, entry)
   return `x-anthropic-billing-header: cc_version=${ver}.${fp}; cc_entrypoint=${entry}; cch=${CCH_PLACEHOLDER}; cc_prompt_id=${promptId};${tail}`
 }
 
@@ -438,10 +442,17 @@ export function ccEntrypointFromRouting(routing) {
   return routing?.compatibility?.cc_entrypoint === 'sdk-cli' ? 'sdk-cli' : 'cli'
 }
 
-/** Add the billing block exactly once before the cli-node hop. */
+/** Add the project billing block when none is present. Do not replace one the template already wrote. */
 export function ensureBillingAttribution(
   body,
-  { firstUserText = '', cliVersion = DEFAULT_CLI_VERSION, sessionId = '', indexes = null, entrypoint = 'cli' } = {},
+  {
+    firstUserText = '',
+    cliVersion = DEFAULT_CLI_VERSION,
+    sessionId = '',
+    indexes = null,
+    entrypoint = 'cli',
+    passthrough = false,
+  } = {},
 ) {
   if (!body || typeof body !== 'object') return body
   const hasBilling = (system) => {
@@ -449,7 +460,7 @@ export function ensureBillingAttribution(
     if (!Array.isArray(system)) return false
     return system.some((block) => /x-anthropic-billing-header:/i.test(String(block?.text || block || '')))
   }
-  if (hasBilling(body.system)) return body
+  if (passthrough || hasBilling(body.system)) return body
   const block = {
     type: 'text',
     text: buildBillingAttributionText(firstUserText, cliVersion, sessionId, indexes, entrypoint),
@@ -478,29 +489,48 @@ function isStandaloneOfficialLine(text) {
   return trimmed === CRS_OFFICIAL_SYSTEM || trimmed === CRS_OFFICIAL_CLI_SYSTEM
 }
 
-/** Official 2.1.241 blocks already present on inbound — do not re-append as leftover. */
+const REPLACED_CLIENT_IDENTITIES = new Set(
+  [
+    CRS_OFFICIAL_SYSTEM,
+    CRS_OFFICIAL_CLI_SYSTEM,
+    CRS_COMPACT_IDENTITY,
+    'You are Claude Agent SDK.',
+    'You are Claude Agent SDK running inside claude-desktop.',
+  ].map((text) => text.replace(/\.$/, '').toLowerCase()),
+)
+
+function isStandaloneClientIdentity(text) {
+  return REPLACED_CLIENT_IDENTITIES.has(String(text).trim().replace(/\.$/, '').toLowerCase())
+}
+
+const KNOWN_OFFICIAL_SYSTEM_TEXTS = new Set(
+  [
+    CRS_OFFICIAL_AGENT_PROMPT,
+    CRS_OFFICIAL_AGENT_PROMPT_303,
+    CRS_AGENT_EXPANSION,
+    CRS_OFFICIAL_CONTINUATION,
+    OFFICIAL_303_HARNESS,
+  ].map((text) => text.trim()),
+)
+
+/** Only complete known blocks are replaceable; headings alone do not identify boilerplate. */
 export function isKnownOfficialSystemText(text) {
-  const t = String(text || '')
-  if (!t.trim()) return true
-  if (isBillingLine(t) || /x-anthropic-billing-header:/i.test(t)) return true
-  if (isStandaloneOfficialLine(t)) return true
-  if (t === CRS_OFFICIAL_AGENT_PROMPT || t === CRS_AGENT_EXPANSION || t === CRS_OFFICIAL_CONTINUATION) return true
-  if (t.includes('# Doing tasks') && t.includes('# Tone and style')) return true
-  if (t.includes('# Environment') && t.includes('# Text output (does not apply to tool calls)')) return true
-  return false
+  const t = String(text || '').trim()
+  if (!t || t.split(/\r?\n/).every((line) => !line.trim() || isBillingLine(line))) return true
+  return isStandaloneClientIdentity(t) || KNOWN_OFFICIAL_SYSTEM_TEXTS.has(t)
 }
 export function hasEnvironmentSection(text) {
   return /^[ \t]*# Environment\b/m.test(String(text ?? ''))
 }
 
 function dropRewriteSourceText(text, { preserveEnvironment = false } = {}) {
-  if (preserveEnvironment && hasEnvironmentSection(text)) return String(text)
   const next = stripLeakyClientText(text)
+  if (preserveEnvironment && hasEnvironmentSection(next)) return next
   if (!next || isKnownOfficialSystemText(next)) return ''
   return next
 }
 
-/** Inbound Desktop / Agent SDK / billing spoof — do not park or forward. */
+/** Fingerprint detection is broader than the exact matches used to remove persona text. */
 const LEAKY_CLIENT_FINGERPRINT_RE = /claude-desktop|agent-sdk|claude agent sdk|claude-vscode|cc_entrypoint\s*=/i
 
 export function isLeakyClientFingerprint(text) {
@@ -512,17 +542,17 @@ export function isLeakyClientFingerprint(text) {
 
 export function stripLeakyClientText(text) {
   if (text == null) return ''
-  const paragraphs = String(text)
-    .split(/\n\n+/)
-    .map((p) =>
-      p
-        .split('\n')
-        .filter((line) => !isBillingLine(line))
-        .join('\n')
-        .trim(),
-    )
-    .filter((p) => p && !isStandaloneOfficialLine(p) && !isLeakyClientFingerprint(p))
-  return paragraphs.join('\n\n')
+  // Client names and protocol literals are also legitimate documentation.
+  // Remove only billing/identity lines, retaining their adjacent instructions.
+  return stripBillingLines(String(text))
+    .split('\n')
+    .filter((line) => !isStandaloneClientIdentity(line))
+    .join('\n')
+    .trim()
+}
+
+function stripBillingLines(text) {
+  return text.replace(/^[\t ]*x-anthropic-billing-header:[^\r\n]*(?:\r?\n|$)/gim, '')
 }
 
 function stripLeakySystem(system, options = {}) {
@@ -554,6 +584,18 @@ function stripLeakySystem(system, options = {}) {
     return text === system.text ? system : { ...system, text }
   }
   return system
+}
+
+/** Normalize caller text blocks; only billing lines are gateway-owned. Also used by usage attribution. */
+export function callerSystemBlocksWithoutBilling(system) {
+  const blocks = Array.isArray(system) ? system : system == null ? [] : [system]
+  return blocks.flatMap((item) => {
+    const block = typeof item === 'string' ? { type: 'text', text: item } : item
+    if (!block || typeof block.text !== 'string') return []
+    const text = stripBillingLines(block.text)
+    if (!text.trim()) return []
+    return [text === block.text ? block : { ...block, text }]
+  })
 }
 
 function sanitizeMessageContent(content) {
@@ -638,6 +680,9 @@ function collapseBudgetReminderBlocks(system) {
     const text = collapseRepeatedBudgetReminders(block.text, state)
     if (!text.trim()) {
       changed = true
+      // Deduplication may remove the text, but this boundary still belongs to
+      // the caller. Keep a nonempty anchor so its TTL and position survive.
+      if (block.cache_control != null) next.push({ ...block, text: '\u200b' })
       continue
     }
     if (text === block.text) {
@@ -836,15 +881,15 @@ export function personaTemplateVars({
     firstUserText,
     cliVersion,
     sessionId,
-    billingIndexesFromMessages(messages),
+    billingIndexesFromMessages(messages, entrypoint),
     entrypoint,
   )
   const envTimezoneOnly = () => buildOfficialEnvironmentSection(env, { sourceTexts, contextManagement: false })
   return {
     billing,
     billing_semi: billing.endsWith(';') ? billing : `${billing};`,
-    identity: CRS_OFFICIAL_CLI_SYSTEM,
-    identity_cli: CRS_OFFICIAL_CLI_SYSTEM,
+    identity: entrypoint === 'sdk-cli' ? OFFICIAL_303_AGENT_IDENTITY : CRS_OFFICIAL_CLI_SYSTEM,
+    identity_cli: entrypoint === 'sdk-cli' ? OFFICIAL_303_AGENT_IDENTITY : CRS_OFFICIAL_CLI_SYSTEM,
     identity_compact: CRS_COMPACT_IDENTITY,
     reporting: CRS_REPORTING_OUTCOMES,
     dynamic_boundary: '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__',
@@ -1158,7 +1203,8 @@ export function personaExpansionToolsFromRouting(routing = {}) {
 export function personaExpansionFromRoutingFile(filePath) {
   if (!filePath) return { mode: DEFAULT_PERSONA_EXPANSION, extraNames: [] }
   try {
-    const routing = JSON.parse(fs.readFileSync(filePath, 'utf8'))
+    const routing = readJsonParsedCached(filePath)
+    if (!routing) return { mode: DEFAULT_PERSONA_EXPANSION, extraNames: [] }
     return {
       mode: personaExpansionFromRouting(routing),
       extraNames: personaExpansionToolsFromRouting(routing),
@@ -1178,7 +1224,8 @@ export const PERSONA_STANDING_MAX = 800
 export function standingConstraintFromRoutingFile(filePath) {
   if (filePath) {
     try {
-      const raw = JSON.parse(fs.readFileSync(filePath, 'utf8'))?.compatibility?.persona_standing
+      const routing = readJsonParsedCached(filePath)
+      const raw = routing?.compatibility?.persona_standing
       const text = String(raw ?? '').trim()
       if (text) return text.slice(0, PERSONA_STANDING_MAX)
     } catch {
@@ -1273,11 +1320,11 @@ export function collectCallerSystemAppend(body, options = {}) {
 const OFFICIAL_CALLER_AGENT_CACHE = Object.freeze({ type: 'ephemeral', ttl: '1h' })
 
 /** Stored official templates that predate {{caller_agent}} still get the prompt back, before env. */
-function insertOfficialCallerAgent(system, callerAgent) {
+function insertOfficialCallerAgent(system, callerAgent, cacheControl = OFFICIAL_CALLER_AGENT_CACHE) {
   const text = String(callerAgent || '').trim()
   if (!text || !Array.isArray(system)) return system
   if (system.some((block) => String(block?.text || '').includes(text))) return system
-  const block = { type: 'text', text, cache_control: { ...OFFICIAL_CALLER_AGENT_CACHE } }
+  const block = { type: 'text', text, cache_control: { ...cacheControl } }
   const identityAt = system.findIndex((item) => isStandaloneOfficialLine(item?.text || ''))
   const at = identityAt >= 0 ? identityAt + 1 : Math.min(system.length, 2)
   return [...system.slice(0, at), block, ...system.slice(at)]
@@ -1388,7 +1435,11 @@ export function personaOptionsFromRoutingFile(filePath) {
     return { mode: DEFAULT_PERSONA_MODE, park: DEFAULT_PERSONA_PARK, agent: DEFAULT_PERSONA_AGENT }
   }
   try {
-    return personaOptionsFromRouting(JSON.parse(fs.readFileSync(filePath, 'utf8')))
+    const routing = readJsonParsedCached(filePath)
+    if (!routing) {
+      return { mode: DEFAULT_PERSONA_MODE, park: DEFAULT_PERSONA_PARK, agent: DEFAULT_PERSONA_AGENT }
+    }
+    return personaOptionsFromRouting(routing)
   } catch {
     return { mode: DEFAULT_PERSONA_MODE, park: DEFAULT_PERSONA_PARK, agent: DEFAULT_PERSONA_AGENT }
   }
@@ -1456,7 +1507,9 @@ export function personaTemplateSettingsFromRouting(routing = {}) {
 export function personaTemplateSettingsFromRoutingFile(filePath) {
   if (!filePath) return personaTemplateSettingsFallback()
   try {
-    return personaTemplateSettingsFromRouting(JSON.parse(fs.readFileSync(filePath, 'utf8')))
+    const routing = readJsonParsedCached(filePath)
+    if (!routing) return personaTemplateSettingsFallback()
+    return personaTemplateSettingsFromRouting(routing)
   } catch {
     return personaTemplateSettingsFallback()
   }
@@ -1576,6 +1629,8 @@ export function looksLikeOhMyPiSystem(system, headers = {}) {
   if (/<system-conventions>/i.test(text) && /<workstation>/i.test(text)) return true
   if (/^ROLE\s*\n\s*=+/m.test(text) && /^PROJECT\s*\n\s*=+/m.test(text)) return true
   if (/\b(?:oh my pi|pi coding harness|omp coding harness)\b/i.test(text)) return true
+  // OMP 18.12–18.16 send the Claude Code envelope plus their own role line (captured).
+  if (/^You are omp['’]s trusted coding assistant\.?\s*$/im.test(text)) return true
   return false
 }
 
@@ -1651,7 +1706,7 @@ function headerBetaTokens(headers = {}) {
     .filter(Boolean)
 }
 
-function systemLooksLikeRelayedClaudeCode(system) {
+export function systemLooksLikeRelayedClaudeCode(system) {
   if (hasOfficialClaudeLine(system)) return true
   if (isOfficialClaudeSecurityMonitorPrompt(system)) return true
   return eachSystemText(system).some((text) => looksLikeAgentPrompt(text))
@@ -1681,7 +1736,9 @@ export function detectProxiedOfficialCcFromRouting(routing = {}) {
 export function detectProxiedOfficialCcFromRoutingFile(filePath) {
   if (!filePath) return true
   try {
-    return detectProxiedOfficialCcFromRouting(JSON.parse(fs.readFileSync(filePath, 'utf8')))
+    const routing = readJsonParsedCached(filePath)
+    if (!routing) return true
+    return detectProxiedOfficialCcFromRouting(routing)
   } catch {
     return true
   }
@@ -1690,6 +1747,11 @@ export function detectProxiedOfficialCcFromRoutingFile(filePath) {
 /** Off unless the protocol tab turns it on. Official family then keeps its inbound system. */
 export function officialCcPassthroughFromRouting(routing = {}) {
   return routing?.compatibility?.official_cc_passthrough === true
+}
+
+/** Recognition is not passthrough. The body is kept only when that switch is on. */
+export function officialFamilyBodyPassthrough(officialTraffic, routing = {}) {
+  return officialTraffic === true && officialCcPassthroughFromRouting(routing)
 }
 
 function stripSystemCacheControl(body) {
@@ -1798,6 +1860,170 @@ function collectOverlayParts(routingFile) {
   return { standing: standingConstraintFromRoutingFile(routingFile) }
 }
 
+function personaCacheNodes(body) {
+  const messages = Array.isArray(body.messages) ? body.messages : []
+  return [
+    ...(Array.isArray(body.tools) ? body.tools : []),
+    ...(Array.isArray(body.system) ? body.system : []),
+    ...messages.flatMap((message) => (Array.isArray(message?.content) ? message.content : [])),
+    body,
+  ]
+}
+
+/**
+ * A zero template can move caller system text past a short message cache or
+ * reorder caller variables. Preserve its layout and every caller TTL, deferring
+ * only short controls that now precede an hour control. Their anchors follow
+ * the last caller hour boundary, so they still cover their original text and
+ * the hour controls never move before the content they were meant to cache.
+ * The original caller policy must be valid; this is not an inbound repair.
+ */
+function deferReorderedCallerCache(body, original, templateOwned) {
+  const nodes = personaCacheNodes(body)
+  const lastHour = nodes.findLastIndex((node) => !templateOwned.has(node) && node?.cache_control?.ttl === '1h')
+  const earlyShort = nodes.flatMap((node, index) =>
+    index < lastHour && !templateOwned.has(node) && node?.cache_control != null && node.cache_control.ttl !== '1h'
+      ? [index]
+      : [],
+  )
+  if (!earlyShort.length) return body
+  try {
+    validateCacheBreakpoints(original)
+  } catch {
+    return body
+  }
+  const deferred = new Set(earlyShort)
+  const anchors = earlyShort.map((index) => ({
+    type: 'text',
+    text: '\u200b',
+    cache_control: { ...nodes[index].cache_control },
+  }))
+  // Valid input cannot need a tool/root control moved: only the interpolated
+  // system and message blocks have changed their relative order.
+  let index = Array.isArray(body.tools) ? body.tools.length : 0
+  const rewrite = (blocks) => {
+    let changed = false
+    const next = []
+    for (const block of blocks) {
+      const at = index++
+      if (deferred.has(at)) {
+        const { cache_control, ...rest } = block
+        next.push(rest)
+        changed = true
+      } else next.push(block)
+      if (at === lastHour) {
+        next.push(...anchors)
+        changed = true
+      }
+    }
+    return changed ? next : blocks
+  }
+  const system = rewrite(Array.isArray(body.system) ? body.system : [])
+  let messagesChanged = false
+  const messages = (body.messages || []).map((message) => {
+    if (!Array.isArray(message?.content)) return message
+    const content = rewrite(message.content)
+    if (content === message.content) return message
+    messagesChanged = true
+    return { ...message, content }
+  })
+  return { ...body, system, messages: messagesChanged ? messages : body.messages }
+}
+
+/** Budget the assembled body: variable expansions keep caller ownership. */
+function mergeTemplateCache(body, templateOwned, cacheTtl) {
+  const system = Array.isArray(body.system) ? body.system : []
+  const messages = Array.isArray(body.messages) ? body.messages : []
+  const nodes = personaCacheNodes(body)
+  const hasMarker = (block) => block?.cache_control != null
+  const callerMarkers = nodes.filter((block) => hasMarker(block) && !templateOwned.has(block))
+  const available = Math.max(0, 4 - callerMarkers.length)
+  const lastCallerHour = nodes.findLastIndex((block) => !templateOwned.has(block) && block?.cache_control?.ttl === '1h')
+  const lastHour = nodes.findLastIndex((block) => block?.cache_control?.ttl === '1h')
+  let short = false
+  const withoutMarker = (block) => {
+    const { cache_control, ...rest } = block
+    return rest
+  }
+  const replacements = new Map()
+  const marked = []
+  nodes.forEach((block, index) => {
+    const control = block?.cache_control
+    if (!control) return
+    if (!templateOwned.has(block)) {
+      if (control.ttl !== '1h') short = true
+      return
+    }
+    const ttl =
+      control.ttl ??
+      (short ? '5m' : index < lastHour ? '1h' : cacheTtl == null ? undefined : normalizeCacheTtl(cacheTtl))
+    if ((short && ttl === '1h') || (index < lastCallerHour && ttl !== '1h')) {
+      replacements.set(block, withoutMarker(block))
+      return
+    }
+    if (ttl !== '1h') short = true
+    marked.push(block)
+    if (control.ttl == null && ttl != null) replacements.set(block, { ...block, cache_control: { ...control, ttl } })
+  })
+  for (const block of marked.slice(0, Math.max(0, marked.length - available))) {
+    replacements.set(block, withoutMarker(block))
+  }
+  const replace = (block) => replacements.get(block) || block
+  let messagesChanged = false
+  const nextMessages = messages.map((message) => {
+    if (!Array.isArray(message?.content) || !message.content.some((block) => replacements.has(block))) return message
+    messagesChanged = true
+    return { ...message, content: message.content.map(replace) }
+  })
+  return {
+    ...body,
+    system: system.map(replace),
+    messages: messagesChanged ? nextMessages : messages,
+  }
+}
+
+/** Render message-bound templates without flattening cached variable expansions. */
+function renderJoinedTemplateBlocks(blocks, vars, options) {
+  return renderPersonaTemplate(blocks, vars, { ...options, separator: '\u200b\n\n' })
+}
+
+function wrapCallerSystemBlocks(blocks, templateOwned) {
+  const text = blocks.map((block) => block.text).join('')
+  let start = 0
+  let end = text.length
+  // Strip wrapper tags by offset, without trimming caller block whitespace or
+  // searching for an inner string that might also occur inside the tag itself.
+  for (let i = 0; i < 4; i++) {
+    const match = text.slice(start, end).match(/^\s*<system-reminder>([\s\S]*)<\/system-reminder>\s*$/di)
+    if (!match) break
+    end = start + match.indices[1][1]
+    start += match.indices[1][0]
+  }
+  const inner = text.slice(start, end)
+  const leading = inner.length - inner.trimStart().length
+  if (inner.slice(leading).startsWith(MANDATORY_CONSTRAINT_LINE)) start += leading + MANDATORY_CONSTRAINT_LINE.length
+  let offset = 0
+  const parts = blocks.flatMap((block) => {
+    const from = Math.max(0, start - offset)
+    const to = Math.min(block.text.length, end - offset)
+    offset += block.text.length
+    const kept = to > from ? block.text.slice(from, to) : ''
+    if (!kept.trim() && !block.cache_control) return []
+    const copy = { ...block, text: kept.trim() ? kept : '\u200b' }
+    if (templateOwned.has(block)) templateOwned.add(copy)
+    return [copy]
+  })
+  return [{ type: 'text', text: '<system-reminder>\n' }, ...parts, { type: 'text', text: '\n</system-reminder>\n' }]
+}
+
+function prependBlocksToFirstUserMessage(messages, prefix) {
+  const at = firstUserIndex(messages)
+  if (at < 0) return messages
+  const message = messages[at]
+  const content = Array.isArray(message.content) ? message.content : [{ type: 'text', text: message.content || '' }]
+  return [...messages.slice(0, at), { ...message, content: [...prefix, ...content] }, ...messages.slice(at + 1)]
+}
+
 /**
  * Template-driven persona. `zero` forces the overlay off, matching the legacy
  * zero-inject contract; every other preset honours overlay_preset.
@@ -1817,12 +2043,28 @@ function applyTemplatePersona(
     model,
     callerAgent: rawCallerAgent = '',
     entrypoint = 'cli',
+    cacheTtl = null,
   } = {},
 ) {
   const messages = Array.isArray(body.messages) ? body.messages : []
   const zero = preset === 'zero'
   const blocks = selectedTemplateBlocks(resolvePersonaTemplate(preset, templates), switches, preset)
   const withEnv = presetFlagEnabled(switches, 'persona_env_presets', preset)
+  const hasUser = messages.some((message) => message?.role === 'user')
+  // A variable only consumes caller text if its block will actually be sent.
+  const zeroVars = new Set(
+    zero
+      ? blocks
+          .filter((block) =>
+            block?.id === 'caller_system'
+              ? !block.role && hasUser
+              : block?.role === 'system'
+                ? withEnv && hasUser
+                : !block?.role,
+          )
+          .flatMap((block) => extractTemplateVars(block?.text))
+      : [],
+  )
   const timezoneOnlyEnv = false
   const callerOptions = { preserveEnvironment: !withEnv }
   const usesEnv = blocks.some((block) => extractTemplateVars(block?.text).includes('env'))
@@ -1832,7 +2074,11 @@ function applyTemplatePersona(
     overwrite: blocks.some((block) => block.role === 'system' && extractTemplateVars(block?.text).includes('env_303')),
     forceTimezone: zero || usesEnv,
   })
-  const harness = thirdPartyClientPrompt(body.system, callerOptions)
+  const harness = zero
+    ? looksLikeOhMyPiSystem(body.system)
+      ? extractSystemTexts(body.system).join('\n\n').trim()
+      : ''
+    : thirdPartyClientPrompt(body.system, callerOptions)
   if (harness) env.timezone = requiredTimezone(identity, facts)
   env.timezone = String(env.timezone || '').trim() || requiredTimezone(identity, facts)
   const templateHasHarness = blocks.some(
@@ -1843,15 +2089,27 @@ function applyTemplatePersona(
   const templateWantsCallerAgent = blocks.some((block) => extractTemplateVars(block?.text).includes('caller_agent'))
   const usesCallerAgent = !harness && !templateHasHarness && (preset === 'official' || templateWantsCallerAgent)
   const suppliedAgent = usesCallerAgent ? String(rawCallerAgent || '').trim() : ''
-  const callerAgent =
-    suppliedAgent || (preset === 'official' && !harness && !templateHasHarness ? CRS_OFFICIAL_AGENT_PROMPT : '')
-  const leftover = harness
-    ? harness
-    : usesCallerAgent
-      ? parkableSystemTexts(body.system, callerOptions)
-          .filter((text) => !looksLikeAgentPrompt(text))
-          .join('\n\n')
-      : collectCallerSystemAppend(body, callerOptions)
+  const zeroAgentBlocks =
+    zero && usesCallerAgent && zeroVars.has('caller_agent')
+      ? body.system.filter((block) => looksLikeAgentPrompt(block.text))
+      : []
+  const callerAgent = zero
+    ? extractSystemTexts(zeroAgentBlocks).join('\n\n')
+    : suppliedAgent || (preset === 'official' && !harness && !templateHasHarness ? CRS_OFFICIAL_AGENT_PROMPT : '')
+  const zeroRemaining = zero
+    ? harness && zeroVars.has('agent_official')
+      ? []
+      : body.system.filter((block) => !zeroAgentBlocks.includes(block))
+    : []
+  const leftover = zero
+    ? extractSystemTexts(zeroRemaining).join('\n\n')
+    : harness
+      ? harness
+      : usesCallerAgent
+        ? parkableSystemTexts(body.system, callerOptions)
+            .filter((text) => !looksLikeAgentPrompt(text))
+            .join('\n\n')
+        : collectCallerSystemAppend(body, callerOptions)
   const modelId = model || body.model
   const midSystem = leftoverGoesToMidSystem(preset, modelId)
   const vars = personaTemplateVars({
@@ -1874,43 +2132,72 @@ function applyTemplatePersona(
   })
   const callerBlocks = blocks.filter((block) => block?.id === 'caller_system')
   const officialBlocks = blocks.filter((block) => block?.id !== 'caller_system')
-  let system = renderPersonaTemplate(officialBlocks, vars)
+  const templateOwned = new Set()
+  const blockVars = zero
+    ? Object.fromEntries(
+        Object.entries({
+          caller_system: zeroRemaining,
+          caller_agent: zeroAgentBlocks,
+          agent_official: harness ? body.system : [],
+        }).filter(([, parts]) => parts.some((block) => block.cache_control != null)),
+      )
+    : null
+  const renderOptions = { blockVars, templateOwned, usedCallerCache: new Set() }
+  let system = renderPersonaTemplate(officialBlocks, vars, renderOptions)
 
-  if (preset === 'official') system = insertOfficialCallerAgent(system, callerAgent)
+  if (preset === 'official') {
+    system = insertOfficialCallerAgent(system, callerAgent, cacheTtl == null ? undefined : { type: 'ephemeral' })
+    for (const block of system) templateOwned.add(block)
+  }
+  if (zero && !zeroVars.has('caller_system')) system = [...system, ...zeroRemaining]
   let outMessages = messages
-  if (withEnv) {
-    const environment = renderPersonaTemplate(officialBlocks, vars, { role: 'system' })
-      .map((block) => block.text)
+
+  // Preserve marked expansions through the reminder wrapper. Unmarked
+  // templates keep their existing string rendering and whitespace behavior.
+  const renderedCaller = renderJoinedTemplateBlocks(callerBlocks, vars, renderOptions)
+  if (renderedCaller.some((block) => block.cache_control != null)) {
+    outMessages = prependBlocksToFirstUserMessage(outMessages, wrapCallerSystemBlocks(renderedCaller, templateOwned))
+  } else {
+    const callerText = renderPersonaTemplate(callerBlocks, vars)
+      .map((block) => unwrapSystemReminder(block.text))
+      .filter(Boolean)
       .join('\n\n')
-    if (environment && !modelSupportsMidConversationSystem(modelId)) {
-      // Haiku 4.5 / Sonnet 5 / Claude 4.x reject mid-conversation role=system: keep it in top-level system.
-      system = [...system, { type: 'text', text: environment }]
-    } else if (environment) {
-      const at = messages.findLastIndex((message) => message?.role === 'user')
+    if (callerText) {
+      outMessages = prependRawToFirstUserMessage(outMessages, `<system-reminder>\n${callerText}\n</system-reminder>\n`)
+    }
+  }
+  if (withEnv) {
+    const environment = renderJoinedTemplateBlocks(officialBlocks, vars, { ...renderOptions, role: 'system' })
+    const content = environment.some((block) => block.cache_control != null)
+      ? environment
+      : renderPersonaTemplate(officialBlocks, vars, { role: 'system' })
+          .map((block) => block.text)
+          .join('\n\n')
+    if (content.length && !modelSupportsMidConversationSystem(modelId)) {
+      // Unsupported models need top-level instructions; keep marked variable
+      // expansions as blocks so the assembled cache merger can budget them.
+      system = [...system, ...(Array.isArray(content) ? content : [{ type: 'text', text: content }])]
+    } else if (content.length) {
+      // Official presets anchor to the first user turn: callers resend history
+      // without this injected block, so a tail position shifts every turn and
+      // breaks the cache prefix from that point on. Zero templates keep the
+      // caller-visible tail placement.
+      const at = zero ? outMessages.findLastIndex((message) => message?.role === 'user') : firstUserIndex(outMessages)
       if (at >= 0)
-        outMessages = [
-          ...messages.slice(0, at + 1),
-          { role: 'system', content: environment },
-          ...messages.slice(at + 1),
-        ]
+        outMessages = [...outMessages.slice(0, at + 1), { role: 'system', content }, ...outMessages.slice(at + 1)]
     }
   }
   if (midSystem) {
     outMessages = wrapExistingMidConversationSystem(insertMidConversationSystem(outMessages, leftover))
   }
-  // Saved templates still carry a bare {{caller_system}} block. Unwrap once, then wrap the capture shape.
-  const callerText = renderPersonaTemplate(callerBlocks, vars)
-    .map((block) => unwrapSystemReminder(block.text))
-    .filter(Boolean)
-    .join('\n\n')
-  if (callerText) {
-    outMessages = prependRawToFirstUserMessage(outMessages, `<system-reminder>\n${callerText}\n</system-reminder>\n`)
-  }
+  let assembled = { ...body, system, messages: outMessages }
+  if (zero && renderOptions.usedCallerCache.size) assembled = deferReorderedCallerCache(assembled, body, templateOwned)
+  assembled = mergeTemplateCache(assembled, templateOwned, zero ? normalizeCacheTtl(cacheTtl) : cacheTtl)
   const overlayBlocks = zero ? [] : resolveOverlayTemplate(overlayPreset, overlayTemplates)
-  if (!overlayBlocks.length) return { ...body, system, messages: outMessages }
+  if (!overlayBlocks.length) return assembled
   const overlay = renderOverlayTemplate(overlayBlocks, collectOverlayParts(routingFile))
-  if (!overlay) return { ...body, system, messages: outMessages }
-  return { ...body, system, messages: prependRawToFirstUserMessage(outMessages, overlay) }
+  if (!overlay) return assembled
+  return { ...assembled, messages: prependRawToFirstUserMessage(assembled.messages, overlay) }
 }
 
 export function applyCrsUnofficialPersona(
@@ -1929,21 +2216,34 @@ export function applyCrsUnofficialPersona(
     identity,
     model,
     entrypoint,
+    cacheTtl = null,
   } = {},
 ) {
   if (!body || typeof body !== 'object') return body
-  if (!forceConfigured && (officialClient || isOfficialClaudeCodeTraffic(headers || {}, body))) return body
-  const fromFile = routingFile ? personaOptionsFromRoutingFile(routingFile) : null
+  // Looking like Claude Code is not passthrough. The handler sets officialClient
+  // only when routing.compatibility.official_cc_passthrough is on.
+  if (!forceConfigured && officialClient) return body
+  let fromFile = null
+  let fileSettings = personaTemplateSettingsFallback()
+  let routing = null
+  if (routingFile) {
+    try {
+      routing = readJsonParsedCached(routingFile)
+      if (routing) {
+        fromFile = personaOptionsFromRouting(routing)
+        fileSettings = personaTemplateSettingsFromRouting(routing)
+      } else {
+        fromFile = { mode: DEFAULT_PERSONA_MODE, park: DEFAULT_PERSONA_PARK, agent: DEFAULT_PERSONA_AGENT }
+      }
+    } catch {
+      routing = null
+      fromFile = { mode: DEFAULT_PERSONA_MODE, park: DEFAULT_PERSONA_PARK, agent: DEFAULT_PERSONA_AGENT }
+      fileSettings = personaTemplateSettingsFallback()
+    }
+  }
   const resolved = normalizePersonaMode(mode ?? fromFile?.mode)
   // Read the caller's agent prompt before stripLeakySystem drops it as known official text.
   const rawCallerAgent = extractCallerAgentPrompt(body.system)
-  const fileSettings = personaTemplateSettingsFromRoutingFile(routingFile)
-  let routing = null
-  try {
-    routing = routingFile ? JSON.parse(fs.readFileSync(routingFile, 'utf8')) : null
-  } catch {
-    routing = null
-  }
   const resolvedEntrypoint =
     entrypoint === 'cli' || entrypoint === 'sdk-cli' ? entrypoint : ccEntrypointFromRouting(routing)
   const hopPreset = mode != null ? personaPresetFromHopMode(mode) : null
@@ -1960,7 +2260,10 @@ export function applyCrsUnofficialPersona(
     !presetFlagEnabled(templateSettings.switches, 'persona_env_presets', templateSettings.preset)
   const cleaned = {
     ...body,
-    system: stripLeakySystem(body.system, { preserveEnvironment }),
+    system:
+      templateSettings.preset === 'zero'
+        ? callerSystemBlocksWithoutBilling(body.system)
+        : stripLeakySystem(body.system, { preserveEnvironment }),
     messages: sanitizeUnofficialMessages(body.messages),
   }
   if (personaUsesTemplate(templateSettings)) {
@@ -1977,6 +2280,7 @@ export function applyCrsUnofficialPersona(
       model,
       callerAgent: rawCallerAgent,
       entrypoint: resolvedEntrypoint,
+      cacheTtl,
     })
   }
   const doPark =

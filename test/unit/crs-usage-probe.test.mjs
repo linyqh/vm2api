@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   parseOAuthUsage,
+  isCompleteOAuthUsage,
   parseFableProbe,
   isFablePlanDenied,
   isFableUnavailablePro,
@@ -15,6 +16,62 @@ import {
   probeFromPassiveHeaders,
   probeVmUsage,
 } from '../../src/lib/oauth/crs-usage-probe.mjs'
+
+test('probe takes the plan from official profile even when native usage has no model catalog', async () => {
+  const result = await probeVmUsage({
+    exec: { vmId: 'vm-01' },
+    includeFable: false,
+    usageGet: async () => ({
+      ok: true,
+      status: 200,
+      body: {
+        five_hour: { utilization: 10 },
+        seven_day: { utilization: 20 },
+        seven_day_sonnet: null,
+        extra_usage: null,
+      },
+    }),
+    slotOauth: async (_exec, op) => {
+      assert.equal(op, 'profile')
+      return { ok: true, body: { account: { has_claude_pro: true, has_claude_max: false } } }
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.account_tier, 'pro')
+  assert.equal(result.account_tier_source, 'profile')
+  assert.equal(result.usage_has_fable, null)
+})
+
+test('unavailable profile leaves the plan unknown without hiding a successful usage read', async () => {
+  const result = await probeVmUsage({
+    exec: { vmId: 'vm-01' },
+    includeFable: false,
+    usageGet: async () => ({ ok: true, status: 200, body: { seven_day: { utilization: 20 }, extra_usage: null } }),
+    slotOauth: async () => ({ ok: false, body: { error: { code: 'profile_failed' } } }),
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.account_tier, null)
+  assert.equal(result.profile_error, 'profile_failed')
+})
+
+test('official weekly-only usage is complete without inventing a session window', () => {
+  const data = {
+    five_hour: null,
+    seven_day: { utilization: 4, resets_at: '2026-11-05T12:00:00Z' },
+    limits: [{ kind: 'weekly_all', percent: 4, resets_at: '2026-11-05T12:00:00Z' }],
+  }
+  const parsed = parseOAuthUsage(data)
+  assert.equal(isCompleteOAuthUsage(data, parsed), true)
+  assert.equal(parsed.five_hour, null)
+  assert.equal(parsed.seven_day.utilization, 0.04)
+  const { five_hour, ...omitted } = data
+  assert.equal(isCompleteOAuthUsage(omitted), true)
+  assert.equal(isCompleteOAuthUsage({ ...data, five_hour: { utilization: 12 } }), true)
+  assert.equal(isCompleteOAuthUsage({ ...data, five_hour: {} }), false)
+  assert.equal(isCompleteOAuthUsage({ ...data, seven_day: null }), false)
+  assert.equal(isCompleteOAuthUsage({ five_hour: null, seven_day: null, limits: [] }), false)
+  assert.equal(isCompleteOAuthUsage({}), false)
+})
 
 test('oauth usage parse: official percent scale 1 = 1%', () => {
   const p = parseOAuthUsage({
@@ -132,7 +189,7 @@ test('fable attempts: 200 is Max, 403-only is Pro, 429 does not classify', () =>
   )
   assert.equal(tierFromFableAttempts([{ ok: false, limited: true, status: 429, model: FABLE_PROBE_MODEL }]).tier, null)
   assert.equal(tierFromFableAttempts([{ transport: true, status: 0 }]).tier, null)
-  assert.equal(FABLE_PROBE_MODEL, 'claude-fable-5-1')
+  assert.equal(FABLE_PROBE_MODEL, 'claude-fable-5-2')
 })
 
 test('fable 403 permission is plan denied, not account ban', () => {

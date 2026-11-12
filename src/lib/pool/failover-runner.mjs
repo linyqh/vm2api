@@ -18,6 +18,7 @@ import {
 } from '../core/errors.mjs'
 import { hasRefreshPresence, readWorkerCredentialFile } from '../oauth/oauth-credentials.mjs'
 import { ensureWorkerCredential } from '../transport/go-worker-client.mjs'
+import { kernelFaults } from '../transport/rust-kernel-client.mjs'
 import { resolveOfficialCcInference } from '../vm/slot-engine.mjs'
 import { AttemptCoordinator } from './unit-decision.mjs'
 import { SOFT_COOLDOWN_REASONS } from './pool-scheduler.mjs'
@@ -26,6 +27,25 @@ import { SOFT_COOLDOWN_REASONS } from './pool-scheduler.mjs'
 const REPAIR_HOP_WAIT_MS = 30_000
 const SEARCH_REPAIR_IDLE_MS = 60 * 60 * 1000
 const SEARCH_REPAIR_LIMIT = 512
+
+export const vmTimeoutTracker = {
+  counts: new Map(),
+  recordTimeout(vmId, threshold = 3) {
+    if (!vmId) return false
+    const entry = this.counts.get(vmId) || { count: 0, lastAt: 0 }
+    entry.count += 1
+    entry.lastAt = Date.now()
+    this.counts.set(vmId, entry)
+    return entry.count >= threshold
+  },
+  recordSuccess(vmId) {
+    if (vmId) this.counts.delete(vmId)
+  },
+  reset(vmId) {
+    if (vmId) this.counts.delete(vmId)
+    else this.counts.clear()
+  },
+}
 
 const DEFAULTS = {
   max_account_switches: 10,
@@ -471,10 +491,34 @@ export class FailoverRunner {
 
   noteUnitHealth(selected, policy, result) {
     const circuit = this.scheduler?.unitCircuit
-    if (!circuit || !selected?.accountId) return
-    if (policy?.circuit) circuit.recordFailure(selected.accountId)
-    else if (verifiedSuccess(result)) circuit.recordSuccess(selected.accountId)
-    else circuit.releaseProbe?.(selected.accountId)
+    if (circuit && selected?.accountId) {
+      if (policy?.circuit) circuit.recordFailure(selected.accountId)
+      else if (verifiedSuccess(result)) circuit.recordSuccess(selected.accountId)
+      else circuit.releaseProbe?.(selected.accountId)
+    }
+
+    const vmId = selected?.vmId
+    if (vmId) {
+      if (verifiedSuccess(result)) {
+        vmTimeoutTracker.recordSuccess(vmId)
+      } else {
+        const isTimeout =
+          policy?.reason === 'worker_timeout' ||
+          policy?.reason === 'provider_timeout' ||
+          result?.status === 504 ||
+          result?.upstream_status === 504 ||
+          /no CLI frame|timed out|timeout/i.test(String(result?.error?.message || result?.message || ''))
+        const ttft = result?.ttft_ms ?? result?.meta?.ttft_ms
+        if (isTimeout && ttft == null) {
+          const tripped = vmTimeoutTracker.recordTimeout(vmId, 3)
+          if (tripped) {
+            const fault = `consecutive_timeouts: VM ${vmId} had 3 consecutive silent inference timeouts`
+            console.error(`[vm-circuit] ${fault}; marking kernel fault to prevent routing`)
+            kernelFaults.set(vmId, fault)
+          }
+        }
+      }
+    }
   }
 
   /**
@@ -659,11 +703,13 @@ export class FailoverRunner {
         for (const key of bindKeys) {
           if (pinMoved(key)) continue
           const prev = this.stickyRouter.resolve?.(key)
+          // A granted seat follows the scheduler's device home even when the
+          // previous account is still eligible. Capacity spills keep its pin.
           const ownMove =
-            !!outboundSessionAccountId &&
-            prev?.accountId === outboundSessionAccountId &&
+            !!prev?.accountId &&
             prev.accountId !== account.accountId &&
-            opts?.borrowed !== true
+            opts?.borrowed !== true &&
+            (prev.accountId === outboundSessionAccountId || (!!lastSelected?.seatKey && !spilled.has(prev.accountId)))
           if (prev?.accountId && prev.accountId !== account.accountId && !ownMove) continue
           let guard = opts
           if (prev) guard = { ...opts, ifGeneration: prev.generation || 0 }
@@ -714,6 +760,7 @@ export class FailoverRunner {
     let lastResult = null
     let lastPolicy = null
     let repaired = false
+    let repairPolicy = null
     // The repaired body is the known fix and has not been sent yet; a slow
     // rejected hop (a 400 can take minutes on a long transcript) must not
     // turn it into the client's error. Bounded: repair is one-shot.
@@ -768,6 +815,7 @@ export class FailoverRunner {
           quotaRequest: {
             body: requestBody,
             sessionId: outboundSessionId || quotaRequest?.sessionId || stickyKey,
+            preserveMessageCache: quotaRequest?.preserveMessageCache,
           },
         }
         if (avoid) {
@@ -795,52 +843,7 @@ export class FailoverRunner {
         }
         throw error
       }
-      if (selected?.familyGated && familyKey && familyVmId) {
-        // The family home left the pool (quota, credential): the family moves
-        // with the next bind. An exclusion this request made itself is not proof.
-        const home = this.stickyRouter?.resolve?.(familyKey)
-        const ownExclusion =
-          !!home && (budget.tried.has(home.accountId) || budget.tried.has(home.vmId) || spilled.has(home.accountId))
-        if (!ownExclusion) this.stickyRouter?.unbind?.(familyKey)
-        familyVmId = null
-      }
-      if (!selected?.ok && selected?.reason === 'fable_requires_max') {
-        return {
-          ...fableRequiresMaxError({
-            wait_ms: selected?.waitMs ?? selected?.wait_ms ?? 0,
-            eligible: selected?.eligible ?? 0,
-            available: selected?.available ?? 0,
-            attempt_count: budget.hops,
-          }),
-          ...attribution(),
-        }
-      }
-      if (!selected?.ok) {
-        const exhausted = selectionFailure(selected, { excluded, lastPolicy, lastResult, hops: budget.hops })
-        return preferLastResult(lastResult, lastPolicy, exhausted, attribution())
-      }
-      repairPending = false
-      snapshotPins()
-      const attemptStickyBound = pinBaseline.get(stickyKey) || null
-      lastSelected = selected
-      pinnedSlot = selected.slotIndex ?? null
-      if (selected.seatMoved) seatMovedTo = selected.vmId
-      bindAll(
-        { accountId: selected.accountId, vmId: selected.vmId, slotIndex: pinnedSlot },
-        { countHit: false, borrowed: lastPolicy?.reason === 'slot_busy' },
-      )
-      const attemptStarted = Date.now()
-      this.attemptsRepo?.begin?.({
-        requestId,
-        attemptNo,
-        vmId: selected.vmId,
-        accountId: selected.accountId,
-        model,
-        selectionReason: selected.selectionReason,
-        waitMs: selected.waitMs,
-        queueWaitMs: selected.queueWaitMs,
-        schedulingMs: selected.schedulingMs,
-      })
+      let attemptStarted
       let result
       let policy
       let committed = false
@@ -852,6 +855,56 @@ export class FailoverRunner {
         if (executions > 0) budget.noteHop(selected.accountId, selected.vmId, executions)
       }
       try {
+        if (signal?.aborted) {
+          return { ...clientCancelledResult(), via: 'pool-failover', ...attribution() }
+        }
+        if (selected?.familyGated && familyKey && familyVmId) {
+          // The family home left the pool (quota, credential): the family moves
+          // with the next bind. An exclusion this request made itself is not proof.
+          const home = this.stickyRouter?.resolve?.(familyKey)
+          const ownExclusion =
+            !!home && (budget.tried.has(home.accountId) || budget.tried.has(home.vmId) || spilled.has(home.accountId))
+          if (!ownExclusion) this.stickyRouter?.unbind?.(familyKey)
+          familyVmId = null
+        }
+        if (!selected?.ok && selected?.reason === 'fable_requires_max') {
+          return {
+            ...fableRequiresMaxError({
+              wait_ms: selected?.waitMs ?? selected?.wait_ms ?? 0,
+              eligible: selected?.eligible ?? 0,
+              available: selected?.available ?? 0,
+              attempt_count: budget.hops,
+            }),
+            ...attribution(),
+          }
+        }
+        if (!selected?.ok) {
+          const exhausted = selectionFailure(selected, { excluded, lastPolicy, lastResult, hops: budget.hops })
+          return preferLastResult(lastResult, lastPolicy, exhausted, attribution())
+        }
+        repairPending = false
+        snapshotPins()
+        const attemptStickyBound = pinBaseline.get(stickyKey) || null
+        lastSelected = selected
+        pinnedSlot = selected.slotIndex ?? null
+        if (selected.seatMoved) seatMovedTo = selected.vmId
+        bindAll(
+          { accountId: selected.accountId, vmId: selected.vmId, slotIndex: pinnedSlot },
+          { countHit: false, borrowed: lastPolicy?.reason === 'slot_busy' },
+        )
+        const started = Date.now()
+        this.attemptsRepo?.begin?.({
+          requestId,
+          attemptNo,
+          vmId: selected.vmId,
+          accountId: selected.accountId,
+          model,
+          selectionReason: selected.selectionReason,
+          waitMs: selected.waitMs,
+          queueWaitMs: selected.queueWaitMs,
+          schedulingMs: selected.schedulingMs,
+        })
+        attemptStarted = started
         const repairKey = searchRepairKey(stickyKey, model, selected)
         const hint = this.searchRepairs.get(repairKey)
         if (hint && hint.expiresAt <= Date.now()) this.searchRepairs.delete(repairKey)
@@ -862,11 +915,21 @@ export class FailoverRunner {
             ? await applyAttempt(clone(attemptBody), selected, {
                 attemptNo,
                 repaired,
+                // Assemblers may rebuild from caller input for each selected
+                // slot. Replay the same repairs on that freshly rendered body.
+                repairs: [
+                  ...(knownSearchRepair ? [{ action: 'repair-and-retry', reason: 'search_repairable' }] : []),
+                  ...(repairPolicy ? [repairPolicy] : []),
+                ],
                 attemptStartedAt: attemptStarted,
                 freshSlot,
                 stickyBound: attemptStickyBound,
               })
             : clone(attemptBody)
+        if (signal?.aborted) {
+          noteHop({ upstreamExecutions: 0 })
+          throw Object.assign(new Error('Request cancelled'), { code: 'request_cancelled' })
+        }
         const wrappedAttempt =
           prepared &&
           typeof prepared === 'object' &&
@@ -977,14 +1040,18 @@ export class FailoverRunner {
         if (typeof onAttempt === 'function') {
           await onAttempt({ attemptNo, selected, result, policy })
         }
-        if (policy.reason === 'content_filter_refusal' || policy.reason === 'usage_policy_refusal') {
+        if (
+          policy.reason === 'content_filter_refusal' ||
+          policy.reason === 'usage_policy_refusal' ||
+          policy.reason === 'content_policy_refusal'
+        ) {
           this.scheduler.markSuccess(selected, { workerStatus: result.workerStatus || null, countUsage })
           bindAll({ accountId: selected.accountId, vmId: selected.vmId })
           releaseStickySlots()
           return {
             ...result,
             ...attribution(),
-            finalState: policy.reason === 'usage_policy_refusal' ? 'rejected' : 'content_filter',
+            finalState: policy.reason === 'content_filter_refusal' ? 'content_filter' : 'rejected',
             policy,
           }
         }
@@ -1011,6 +1078,7 @@ export class FailoverRunner {
         }
         if (policy.action === 'repair-and-retry' && !repaired && !result?.committed) {
           repaired = true
+          repairPolicy = { action: policy.action, reason: policy.reason }
           repairPending = true
           if (policy.reason === 'search_repairable' && repairKey && fingerprint()) {
             searchRepair = { key: repairKey }
@@ -1045,8 +1113,11 @@ export class FailoverRunner {
         }
         budget.noteSwitch(selected.accountId, selected.vmId, { spill: policy.reason === 'slot_busy' })
       } catch (error) {
-        const invalidCache = error?.status === 400 && error.body?.error?.code === 'invalid_cache_control'
-        noteHop(invalidCache ? { upstreamExecutions: 0 } : null)
+        if (attemptStarted === undefined) throw error
+        const invalidRequest =
+          error?.status === 400 &&
+          (error.body?.error?.code === 'invalid_cache_control' || error.body?.error?.code === 'crag_prompt_too_large')
+        noteHop(invalidRequest ? { upstreamExecutions: 0 } : null)
         if (error?.code === 'response_sent') {
           this.attemptsRepo?.complete?.(requestId, attemptNo, {
             upstreamStatus: 403,
@@ -1068,7 +1139,7 @@ export class FailoverRunner {
             finalState: 'policy_block',
           }
         }
-        if (invalidCache) {
+        if (invalidRequest) {
           this.attemptsRepo?.complete?.(requestId, attemptNo, {
             upstreamStatus: 0,
             errorScope: 'request',
@@ -1159,7 +1230,8 @@ export class FailoverRunner {
         }
         budget.noteSwitch(selected.accountId, selected.vmId, { spill: policy.reason === 'slot_busy' })
       } finally {
-        selected.release?.()
+        // Setup and attempt share the same permit lifetime.
+        selected?.release?.()
       }
     }
   }

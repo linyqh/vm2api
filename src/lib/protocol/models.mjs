@@ -15,7 +15,7 @@ import {
 } from './model-policy.mjs'
 import { hasClaudeCode1mSuffix, stripClaudeCode1mSuffix } from './context-1m.mjs'
 import { isGptSeriesId } from './gpt-ids.mjs'
-import { listGptPolicyModels, listImageToolModels } from './gpt-model-policy.mjs'
+import { listGptFastAliases, listGptPolicyModels, listImageToolModels } from './gpt-model-policy.mjs'
 import { listAntigravityPublicModels } from './antigravity-route.mjs'
 import { detectInboundPlatform } from './platform-detect.mjs'
 
@@ -44,9 +44,9 @@ export function seedModelCatalog() {
   return setModelCatalog(ids, { source: 'model-policy' })
 }
 
-function listGptPublicModels() {
+export function listGptPublicModels(mappingKeys = []) {
   try {
-    return listGptPolicyModels().map((m) => ({
+    const models = listGptPolicyModels().map((m) => ({
       id: m.id,
       object: 'model',
       type: 'model',
@@ -56,6 +56,15 @@ function listGptPublicModels() {
       enabled: m.enabled !== false,
       source: 'gpt-model-policy',
     }))
+    return [
+      ...models,
+      ...listGptFastAliases({ mappingKeys }).map((m) => ({
+        ...m,
+        object: 'model',
+        type: 'model',
+        owned_by: 'openai',
+      })),
+    ]
   } catch {
     return []
   }
@@ -85,13 +94,15 @@ function listImagePublicModels() {
  * Local catalog for GET /v1/models and boot. Does not touch workers.
  * groupType is the key's account platform. Antigravity uses the current local routing snapshot.
  */
-export function gatewayModelCatalog({ groupType = 'all', antigravityRouting = {} } = {}) {
+export function gatewayModelCatalog({ groupType = 'all', antigravityRouting = {}, mappingKeys = [] } = {}) {
   seedModelCatalog()
   try {
     loadModelPolicy()
   } catch {}
   const gpt =
-    groupType === 'all' || groupType === 'openai' ? [...listGptPublicModels(), ...listImagePublicModels()] : []
+    groupType === 'all' || groupType === 'openai'
+      ? [...listGptPublicModels(mappingKeys), ...listImagePublicModels()]
+      : []
   const claude = groupType === 'all' || groupType === 'anthropic' ? listOfficialModels() : []
   // Same-name Claude/GPT models reach Antigravity only with an Antigravity-group key; list
   // each ID once, under the platform this key actually reaches.
@@ -238,6 +249,7 @@ export function setModelCatalog(ids, { source = 'go-slot-worker' } = {}) {
         (ids || [])
           .map((id) => {
             if (id === 'claude-fable-5.1') return 'claude-fable-5-1'
+            if (id === 'claude-fable-5.2') return 'claude-fable-5-2'
             if (id === 'claude-opus-5.5') return 'claude-opus-5-5'
             return id
           })

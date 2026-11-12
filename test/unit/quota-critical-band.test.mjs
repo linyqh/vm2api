@@ -128,6 +128,22 @@ test('failed or cancelled release does not leave a reservation or stale band deb
   assert.equal(q.canAccept('rel', { requestRisk: smallRisk }).ok, true)
 })
 
+test('out-of-order release preserves the surviving reservation’s draining-band charge', () => {
+  const q = quota()
+  setUtil(q, 'ordered', { u5: 0.79 })
+  const first = q.tryAcquire('ordered', { requestRisk: smallRisk })
+  assert(first.ok)
+  setUtil(q, 'ordered', { u5: 0.5 })
+  const second = q.tryAcquire('ordered', { requestRisk: smallRisk })
+  assert(second.ok)
+  first.release()
+  first.release()
+  assert.equal(q.inflight.get('ordered'), 1)
+  assert.equal(q.noteBandSettled('ordered', second.token), 0)
+  second.release()
+  assert.equal(q.inflight.get('ordered'), 0)
+})
+
 test('stale reading after an in-band settle blocks the next large request', () => {
   const q = quota()
   setUtil(q, 'stale', { u5: 0.79 })
@@ -401,6 +417,36 @@ test('output ceiling does not make a short prompt large in the critical band', (
     q.canAccept(account, { quotaRequest: { body: huge, sessionId: 'sess-huge' } }).reason,
     'quota_guard_request_too_large',
   )
+})
+
+test('quota prediction respects caller cache ownership when switching away from image optimization', () => {
+  clearCachePrefixSessions()
+  const history = {
+    messages: Array.from({ length: 5 }, (_, i) => ({
+      role: 'user',
+      content: [
+        { type: 'text', text: `shot ${i}` },
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: `image-${i}` } },
+      ],
+    })),
+  }
+  prepareCachePrefix('images:s', history, 0)
+  const dropped = structuredClone(history)
+  dropped.messages[0].content.pop()
+  assert.ok(prepareCachePrefix('images:s', dropped, 1).image_floor > 0)
+  confirmCachePrefix('images:s', 1)
+  dropped.messages.at(-1).content.at(-1).cache_control = { type: 'ephemeral', ttl: '1h' }
+  assert.equal(estimateRequestRisk(dropped, { accountId: 'images', sessionId: 's', now: 2 }).cold, false)
+  // Caller policy sends all remaining images, so the old trimmed prefix is cold.
+  const risk = estimateRequestRisk(dropped, {
+    accountId: 'images',
+    sessionId: 's',
+    now: 2,
+    quotaRequest: { preserveMessageCache: true },
+  })
+  const actual = prepareCachePrefix('images:s', dropped, 2, { preserveMessageCache: true })
+  assert.equal(risk.coldReason, 'prefix_break')
+  assert.equal(risk.cold, !!actual.break)
 })
 
 test('stale band still blocks a warm turn whose new user text is itself large', () => {

@@ -6,8 +6,9 @@ import path from 'node:path'
 import { isCredentialRefreshTarget } from '../../src/lib/oauth/credential-refresh-monitor.mjs'
 import { isUsageProbeTarget } from '../../src/lib/oauth/usage-probe-monitor.mjs'
 import { isCliNodeGuardTarget } from '../../src/lib/vm/cli-node-guard.mjs'
-import { buildWorkerTelemetry } from '../../src/lib/vm/worker-telemetry.mjs'
-import { ensureTelemetrySidecar } from '../../src/lib/vm/slot-process-status.mjs'
+import { installKernelTargets } from '../../src/lib/vm/kernel-install.mjs'
+import { syncNativeTelemetry } from '../../src/lib/vm/vm-runtime.mjs'
+import { retireLegacyTelemetry, readSlotProcessStatus } from '../../src/lib/vm/slot-process-status.mjs'
 import { collectLivePanelCredentials } from '../../src/lib/admin/panel-live-credentials.mjs'
 import {
   summarizeVm,
@@ -121,9 +122,14 @@ test('Claude telemetry stays disabled with an official identity and stale worker
   fs.mkdirSync(path.join(dir, 'run'), { recursive: true })
   fs.writeFileSync(path.join(dir, 'cli-home', '.claude.json'), JSON.stringify({ userID: 'a'.repeat(64) }))
   fs.writeFileSync(path.join(dir, 'run', 'worker.json'), JSON.stringify({ telemetry: { enabled: true } }))
-  assert.deepEqual(buildWorkerTelemetry(antigravity, projectRoot), { enabled: false })
+  assert.deepEqual(syncNativeTelemetry(antigravity, projectRoot), {
+    wrote: false,
+    supported: false,
+    enabled: false,
+    error: 'telemetry_unsupported',
+  })
   const calls = []
-  const result = await ensureTelemetrySidecar({
+  const result = await retireLegacyTelemetry({
     projectRoot,
     vm: { ...antigravity, runtime: { type: 'docker' } },
     run: async (...args) => {
@@ -132,7 +138,15 @@ test('Claude telemetry stays disabled with an official identity and stale worker
     },
   })
   assert.equal(result.ok, true)
-  assert.notEqual(result.action, 'started')
+  assert.equal(result.running, false)
+  const status = await readSlotProcessStatus({
+    projectRoot,
+    vm: antigravity,
+    health: async () => {
+      throw new Error('Antigravity must not probe the Claude kernel')
+    },
+  })
+  assert.equal(status.telemetry.state, 'unsupported')
   assert.equal(calls.length, 0)
 })
 
@@ -200,4 +214,24 @@ test('old Antigravity scheduled tests remain inactive after reload or platform c
   assert.equal(schedule.jobs.size, 0)
   assert.equal(schedule.get(antigravity.id), null)
   assert.equal(records.has(`${VM_TEST_SCHEDULE_PREFIX}${antigravity.id}`), true)
+})
+
+test('kernel installation rejects Antigravity before lifecycle or credential changes', async (t) => {
+  const projectRoot = tempProject(t)
+  const file = path.join(projectRoot, 'vms', `${antigravity.id}.json`)
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  const original = JSON.stringify(antigravity)
+  fs.writeFileSync(file, original)
+  const result = await installKernelTargets({
+    projectRoot,
+    targets: [{ id: antigravity.id, kernel: 'cli-node' }],
+    ops: {
+      stopSlot() {
+        throw new Error('must not stop Antigravity')
+      },
+    },
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.items[0].code, 'kernel_platform_unsupported')
+  assert.equal(fs.readFileSync(file, 'utf8'), original)
 })

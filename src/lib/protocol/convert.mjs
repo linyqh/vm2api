@@ -5,6 +5,7 @@
  */
 
 import {
+  appendLiftedSystemMessage,
   applyStructuredOutput,
   canonicalizeClaudeMessagesShape,
   openaiResponseFormatToOutputConfig,
@@ -65,17 +66,6 @@ function contentToText(content) {
       .join('\n')
   }
   return content?.text || ''
-}
-
-export function isClaudeMessagesShape(body) {
-  return !!(
-    body &&
-    typeof body === 'object' &&
-    Array.isArray(body.messages) &&
-    typeof body.max_tokens === 'number' &&
-    !('input' in body) &&
-    !('choices' in body)
-  )
 }
 
 /** OpenAI tools → Claude tools. Server search maps to web_search_20250305; function tools stay client tools. */
@@ -194,8 +184,7 @@ function openaiMessagesToClaude(messages) {
 
   for (const m of messages || []) {
     if (m.role === 'system' || m.role === 'developer') {
-      const text = contentToText(m.content)
-      if (text) systemParts.push(text)
+      appendLiftedSystemMessage(systemParts, out, m)
       continue
     }
 
@@ -219,9 +208,13 @@ function openaiMessagesToClaude(messages) {
     }
 
     if (m.role === 'assistant') {
-      const content = []
-      const text = contentToText(m.content)
-      if (text) content.push({ type: 'text', text })
+      // Keep each text/cache boundary before appending tool calls. Flattening
+      // an assistant turn discards controls just as it does for system turns.
+      const parts = Array.isArray(m.content) ? m.content : [m.content]
+      const content = parts.flatMap((part) => {
+        const text = contentToText(Array.isArray(m.content) ? [part] : part)
+        return text ? [withCacheControl({ type: 'text', text }, part)] : []
+      })
       if (Array.isArray(m.tool_calls)) {
         for (const tc of m.tool_calls) {
           let input = {}
@@ -274,13 +267,29 @@ function withUpstreamStream(claude) {
  * Anthropic / OpenAI default: omitted `stream` is JSON. NewAPI health probes
  * omit the field (Go omitempty) and then json.Unmarshal the body — SSE
  * (`event:…`) becomes `invalid character 'e' looking for beginning of value`.
- * Official Claude Code that omits `stream` still streams via Accept.
+ * An omitted `stream` streams only when Accept prefers SSE over JSON. Claude
+ * Code 2.1.311+ sends `Accept: application/json, text/event-stream` on its
+ * non-streaming auto-mode classifier and still parses the reply as JSON.
  */
 export function isClientStream(body, headers = {}) {
   if (body?.stream === false || body?.stream === 0 || body?.stream === 'false') return false
   if (body?.stream === true || body?.stream === 1 || body?.stream === 'true') return true
-  const accept = String(headers?.accept || headers?.Accept || '').toLowerCase()
-  return accept.includes('text/event-stream')
+  const accept = String(headers?.accept || headers?.Accept || '')
+  const sse = acceptQuality(accept, 'text/event-stream')
+  return sse > 0 && sse > acceptQuality(accept, 'application/json')
+}
+
+/** Highest q-value an Accept header gives `type` (exact media range only); -1 when absent. */
+function acceptQuality(accept, type) {
+  let best = -1
+  for (const part of accept.toLowerCase().split(',')) {
+    const [range, ...params] = part.split(';').map((s) => s.trim())
+    if (range !== type) continue
+    const q = params.find((p) => p.startsWith('q='))
+    const value = q ? Number(q.slice(2)) : 1
+    if (Number.isFinite(value) && value > best) best = value
+  }
+  return best
 }
 
 /** Lift OpenAI function tools onto Anthropic Messages without treating the hop as official CC. */
@@ -298,8 +307,8 @@ export function toClaudeMessages(protocol, body, opts = { rewrite: false, model_
   if (protocol === 'anthropic.messages' && !opts.rewrite) {
     const normalized = normalizeOpenAIToolsOnMessages(body)
     const out = sanitizeAnthropicBody(normalized, {
-      strictPassthrough: opts.strict_passthrough,
       preserveContentShape: opts.preserve_content_shape === true,
+      onSystemBlock: opts.onSystemBlock,
     })
     if (!out.max_tokens) out.max_tokens = defaultMaxTokensForModel(out.model)
     return { claude: withUpstreamStream(out), mode: inboundHasOpenAIToolShape(body) ? 'convert' : 'passthrough' }
@@ -310,7 +319,9 @@ export function toClaudeMessages(protocol, body, opts = { rewrite: false, model_
       claude: withUpstreamStream({
         ...body,
         model: mapModel(body.model || DEFAULT_MODEL, { allowMap: opts.model_map }),
-        max_tokens: body.max_tokens || 1024,
+        max_tokens:
+          body.max_tokens ||
+          defaultMaxTokensForModel(mapModel(body.model || DEFAULT_MODEL, { allowMap: opts.model_map })),
       }),
       mode: 'rewrite',
     }
@@ -335,7 +346,7 @@ function openaiToClaude(body, opts) {
     max_tokens: body.max_tokens || body.max_completion_tokens || defaultMaxTokensForModel(body.model),
     messages,
   }
-  if (systemParts.length) out.system = systemParts.map((text) => ({ type: 'text', text }))
+  if (systemParts.length) out.system = systemParts
   if (body.temperature != null) out.temperature = body.temperature
   if (body.top_p != null) out.top_p = body.top_p
   if (body.stop != null) out.stop_sequences = Array.isArray(body.stop) ? body.stop : [body.stop]
@@ -372,7 +383,7 @@ function completionsToClaude(body, opts) {
 function responsesToClaude(body, opts) {
   const systemParts = []
   const messages = []
-  if (body.instructions) systemParts.push(String(body.instructions))
+  if (body.instructions) systemParts.push({ type: 'text', text: String(body.instructions) })
   const input = body.input
   if (typeof input === 'string') {
     messages.push({ role: 'user', content: [{ type: 'text', text: input }] })
@@ -382,12 +393,12 @@ function responsesToClaude(body, opts) {
         messages.push({ role: 'user', content: [{ type: 'text', text: item }] })
         continue
       }
-      const role = item.role === 'assistant' ? 'assistant' : item.role === 'system' ? 'system' : 'user'
-      const text = contentToText(item.content ?? item.text ?? item)
-      if (role === 'system') {
-        if (text) systemParts.push(text)
+      if (item.role === 'system' || item.role === 'developer') {
+        appendLiftedSystemMessage(systemParts, messages, { ...item, content: item.content ?? item.text ?? item })
         continue
       }
+      const role = item.role === 'assistant' ? 'assistant' : 'user'
+      const text = contentToText(item.content ?? item.text ?? item)
       const block = withCacheControl({ type: 'text', text }, item)
       const last = messages[messages.length - 1]
       if (last?.role === role && Array.isArray(last.content)) last.content.push(block)
@@ -398,10 +409,10 @@ function responsesToClaude(body, opts) {
   if (messages[0].role !== 'user') messages.unshift({ role: 'user', content: '' })
   const out = {
     model: mapModel(body.model, { allowMap: opts.model_map !== false }),
-    max_tokens: body.max_output_tokens || body.max_tokens || 1024,
+    max_tokens: body.max_output_tokens || body.max_tokens || defaultMaxTokensForModel(body.model),
     messages,
   }
-  if (systemParts.length) out.system = systemParts.map((text) => ({ type: 'text', text }))
+  if (systemParts.length) out.system = systemParts
   const tools = openaiToolsToClaude(body.tools)
   if (tools?.length) out.tools = tools
   const tc = openaiToolChoiceToClaude(body.tool_choice)

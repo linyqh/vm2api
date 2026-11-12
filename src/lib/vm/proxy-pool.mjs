@@ -12,6 +12,7 @@
 import { EventEmitter } from 'node:events'
 import net from 'node:net'
 import crypto from 'node:crypto'
+import tls from 'node:tls'
 import { resolveStoreDb } from '../db/database.mjs'
 import { ProxiesRepo } from '../db/repos/proxies-repo.mjs'
 import { canBindProxyToVm, normalizeOwnerId, proxyOwnerId, vmOwnerId } from '../admin/resource-owner.mjs'
@@ -51,6 +52,60 @@ const DEFAULT_CONFIG = {
   dns_primary: DNS_PRIMARY_AUTO,
   dns_disable_svcb_https: false,
   ipv6_enabled: false,
+}
+
+/**
+ * A row on the loopback or a private address is a local forwarder (sing-box /
+ * clash / 3proxy on this host). Its listener only proves the forwarder is up:
+ * the node behind it is only as alive as an application reply through it.
+ * Require a real TLS handshake first, then retry with framed DNS over TCP for
+ * exits that block TLS or 1.1.1.1. SOCKS CONNECT alone is not enough because
+ * sing-box's mixed inbound uses a lazy upstream connection.
+ */
+const FORWARDER_CONNECT_TARGETS = Object.freeze([
+  Object.freeze({ host: '1.1.1.1', port: 443, kind: 'tls', servername: 'one.one.one.one' }),
+  Object.freeze({ host: '8.8.8.8', port: 53, kind: 'dns' }),
+])
+
+function forwarderDnsQuery() {
+  const id = crypto.randomInt(0, 0x10000)
+  const labels = ['example', 'com']
+  const name = Buffer.concat([
+    ...labels.map((label) => Buffer.from([label.length, ...Buffer.from(label)])),
+    Buffer.from([0]),
+  ])
+  const query = Buffer.alloc(12 + name.length + 4)
+  query.writeUInt16BE(id, 0)
+  query.writeUInt16BE(0x0100, 2)
+  query.writeUInt16BE(1, 4)
+  name.copy(query, 12)
+  query.writeUInt16BE(1, 12 + name.length)
+  query.writeUInt16BE(1, 14 + name.length)
+  return query
+}
+
+export function isLocalForwarderHost(value) {
+  const host = String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/^\[|\]$/g, '')
+  if (!host) return false
+  if (host === 'localhost' || host === '::1' || host === '::' || host === '0.0.0.0') return true
+  const v4 = host.startsWith('::ffff:') ? host.slice(7) : host
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(v4)
+  if (m) {
+    const a = Number(m[1])
+    const b = Number(m[2])
+    if (a === 0 || a === 127 || a === 10) return true
+    if (a === 172 && b >= 16 && b <= 31) return true
+    if (a === 192 && b === 168) return true
+    if (a === 169 && b === 254) return true
+    return false
+  }
+  // Unique-local fc00::/7 and link-local fe80::/10
+  if (/^f[cd][0-9a-f]{0,2}:/.test(host)) return true
+  if (/^fe[89ab][0-9a-f]?:/.test(host)) return true
+  return false
 }
 
 export function clampBindLimit(value, fallback = MAX_VMS_PER_PROXY) {
@@ -1095,61 +1150,218 @@ export class ProxyPool extends EventEmitter {
     const host = normalizeSocksHost(proxy.host)
     if (!host) return { ok: false, error: 'invalid_proxy_host', latency_ms: null }
     const timeout = this.state.config.probe_timeout_ms || 8000
-    const started = Date.now()
+    // Remote SOCKS endpoints *are* the proxy, so the greeting is the whole
+    // check. A local forwarder only owns its listener: the node behind it is
+    // only as alive as an application reply through it, and only then does the
+    // measured round trip describe the tunnel instead of loopback.
+    const targets = isLocalForwarderHost(host) ? FORWARDER_CONNECT_TARGETS : [null]
+    // Split the operator's total probe budget across targets so a blocked
+    // first destination cannot consume the whole timeout before the fallback.
+    const attemptTimeout = targets.length > 1 ? Math.max(1, Math.floor(timeout / targets.length)) : timeout
+    let last = null
+    for (const target of targets) {
+      last = await this._socksProbe(proxy, host, attemptTimeout, target)
+      if (last.ok) return last
+      // Auth and protocol failures answer the same for every target; only a
+      // refused/unreachable destination is worth retrying elsewhere.
+      if (!last.retryable) break
+    }
+    return last
+  }
+
+  _socksProbe(proxy, host, timeout, target = null) {
     return new Promise((resolve) => {
       const socket = net.connect({ host, port: proxy.port })
       this._probeSockets.set(socket, proxy)
+      const started = Date.now()
+      let activeSocket = socket
       let done = false
       let connected = false
       let greeted = false
+      let phase = 'greeting'
       let buf = Buffer.alloc(0)
-      const finish = (ok, error) => {
+      let dnsId = 0
+      const finish = (ok, error, extra = {}) => {
         if (done) return
         done = true
         this._probeSockets.delete(socket)
         try {
-          socket.destroy()
+          activeSocket.destroy()
         } catch {
           /* */
+        }
+        if (activeSocket !== socket) {
+          try {
+            socket.destroy()
+          } catch {
+            /* */
+          }
         }
         const reason = proxyBlockedReason(proxy, this.state.config.ipv6_enabled)
         if (reason) {
           resolve({ ok: false, scope: 'policy', error: reason, latency_ms: null })
           return
         }
-        resolve({
-          ok,
-          latency_ms: Date.now() - started,
-          error: error || null,
-        })
+        if (ok) {
+          resolve({ ok: true, latency_ms: Date.now() - started, error: null })
+          return
+        }
+        resolve({ ok: false, scope: 'socks', error: error || null, latency_ms: null, ...extra })
       }
+      const notSocks = () => (connected && !greeted ? 'not_socks5：请填写 SOCKS5 端口' : null)
+      const startConnect = () => {
+        if (!target) {
+          finish(true, null)
+          return
+        }
+        phase = 'connect'
+        const port = Buffer.alloc(2)
+        port.writeUInt16BE(target.port)
+        const ip = Buffer.from(target.host.split('.').map((n) => Number(n) & 0xff))
+        socket.write(Buffer.concat([Buffer.from([0x05, 0x01, 0x00, 0x01]), ip, port]))
+      }
+      const startDnsProbe = () => {
+        phase = 'dns'
+        buf = Buffer.alloc(0)
+        const query = forwarderDnsQuery()
+        dnsId = query.readUInt16BE(0)
+        const frame = Buffer.alloc(2 + query.length)
+        frame.writeUInt16BE(query.length, 0)
+        query.copy(frame, 2)
+        socket.write(frame)
+      }
+      const startTlsProbe = () => {
+        phase = 'tls'
+        socket.removeAllListeners('data')
+        socket.removeAllListeners('connect')
+        socket.removeAllListeners('timeout')
+        socket.removeAllListeners('error')
+        socket.removeAllListeners('close')
+        socket.setTimeout(0)
+        try {
+          const secure = tls.connect({
+            socket,
+            servername: target.servername,
+            // Liveness only: the exit may terminate TLS with any certificate.
+            rejectUnauthorized: false,
+          })
+          activeSocket = secure
+          secure.setTimeout(timeout, () =>
+            finish(false, 'egress_tls_timeout：经代理 TLS 握手超时', { retryable: true }),
+          )
+          secure.once('secureConnect', () => finish(true, null))
+          secure.once('error', (err) =>
+            finish(false, `egress_tls_failed：经代理 TLS 握手失败 (${String(err?.message || err)})`, {
+              retryable: true,
+            }),
+          )
+          secure.once('close', () => {
+            if (!done) finish(false, 'egress_tls_closed：代理在 TLS 握手前断开', { retryable: true })
+          })
+          socket.once('error', (err) =>
+            finish(false, `egress_tls_failed：经代理 TLS 握手失败 (${String(err?.message || err)})`, {
+              retryable: true,
+            }),
+          )
+          socket.once('close', () => {
+            if (!done) finish(false, 'egress_tls_closed：代理在 TLS 握手前断开', { retryable: true })
+          })
+        } catch (err) {
+          finish(false, `egress_tls_failed：经代理 TLS 握手失败 (${String(err?.message || err)})`, {
+            retryable: true,
+          })
+        }
+      }
+      const startApplicationProbe = () => {
+        if (!target) return finish(true, null)
+        if (target.kind === 'tls') return startTlsProbe()
+        if (target.kind === 'dns') return startDnsProbe()
+        finish(true, null)
+      }
+
       socket.setTimeout(timeout)
       socket.on('connect', () => {
         connected = true
-        // Offer no-auth and user/pass so a working endpoint is not 0xff-killed.
         socket.write(Buffer.from([0x05, 0x02, 0x00, 0x02]))
       })
       socket.on('data', (data) => {
         buf = Buffer.concat([buf, data])
-        if (buf.length < 2) return
-        greeted = true
-        if (buf[0] !== 0x05) {
-          finish(false, 'not_socks5：请填写 SOCKS5 端口')
+        if (phase === 'greeting') {
+          if (buf.length < 2) return
+          greeted = true
+          if (buf[0] !== 0x05) return finish(false, 'not_socks5：请填写 SOCKS5 端口')
+          const method = buf[1]
+          buf = buf.subarray(2)
+          // 0xff means "no acceptable method": wrong credentials, not health.
+          if (method === 0xff) return finish(false, 'proxy_auth_unsupported：代理不接受提供的认证方式')
+          if (method === 0x02) {
+            const user = Buffer.from(String(proxy.username || ''), 'utf8')
+            const pass = Buffer.from(String(proxy.password || ''), 'utf8')
+            if (!user.length && !pass.length) return finish(false, 'proxy_auth_required：代理要求用户名密码')
+            if (user.length > 255 || pass.length > 255) return finish(false, 'proxy_auth_too_long')
+            phase = 'auth'
+            socket.write(Buffer.concat([Buffer.from([0x01, user.length]), user, Buffer.from([pass.length]), pass]))
+            return
+          }
+          if (method !== 0x00) return finish(false, 'not_socks5：请填写 SOCKS5 端口')
+          startConnect()
           return
         }
-        if (buf[1] === 0x00 || buf[1] === 0x02 || buf[1] === 0xff) {
+        if (phase === 'auth') {
+          if (buf.length < 2) return
+          const accepted = buf[0] === 0x01 && buf[1] === 0x00
+          buf = buf.subarray(2)
+          if (!accepted) return finish(false, 'proxy_auth_failed：代理拒绝用户名密码')
+          startConnect()
+          return
+        }
+        if (phase === 'connect') {
+          if (buf.length < 4) return
+          if (buf[0] !== 0x05) return finish(false, 'not_socks5：请填写 SOCKS5 端口')
+          if (buf[1] !== 0x00) {
+            const code = buf[1]
+            return finish(false, `egress_unreachable：代理无法连接检测目标 (rep=0x${code.toString(16)})`, {
+              retryable: true,
+              reply: code,
+            })
+          }
+          const atyp = buf[3]
+          const need = atyp === 0x01 ? 10 : atyp === 0x04 ? 22 : atyp === 0x03 ? 7 + (buf[4] ?? 0) : -1
+          // Consume the whole bound address so a trailing reply cannot be
+          // mistaken for a later phase.
+          if (need < 0) return finish(false, 'not_socks5：请填写 SOCKS5 端口')
+          if (buf.length < need) return
+          startApplicationProbe()
+          return
+        }
+        if (phase === 'dns') {
+          if (buf.length < 2) return
+          const need = 2 + buf.readUInt16BE(0)
+          if (buf.length < need) return
+          const response = buf.subarray(2, need)
+          if (response.length < 12 || response.readUInt16BE(0) !== dnsId || (response[2] & 0x80) === 0) {
+            return finish(false, 'egress_dns_invalid：经代理 DNS 响应无效', { retryable: true })
+          }
           finish(true, null)
-          return
         }
-        finish(false, 'not_socks5：请填写 SOCKS5 端口')
       })
-      socket.on('timeout', () => finish(false, connected && !greeted ? 'not_socks5：请填写 SOCKS5 端口' : 'timeout'))
-      socket.on('error', (e) => {
-        const message = String(e.message || e)
-        finish(false, connected && !greeted ? 'not_socks5：请填写 SOCKS5 端口' : message)
-      })
+      socket.on('timeout', () =>
+        finish(
+          false,
+          notSocks() ||
+            (phase === 'connect'
+              ? 'egress_timeout：经代理连接检测目标超时'
+              : phase === 'dns'
+                ? 'egress_dns_timeout：经代理 DNS 探测超时'
+                : 'timeout'),
+          phase === 'dns' ? { retryable: true } : {},
+        ),
+      )
+      socket.on('error', (e) =>
+        finish(false, notSocks() || String(e.message || e), phase === 'dns' ? { retryable: true } : {}),
+      )
       socket.on('close', () => {
-        if (!done) finish(false, connected && !greeted ? 'not_socks5：请填写 SOCKS5 端口' : 'connection_closed')
+        if (!done) finish(false, notSocks() || 'connection_closed', phase === 'dns' ? { retryable: true } : {})
       })
     })
   }

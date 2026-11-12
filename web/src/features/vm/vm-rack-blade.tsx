@@ -9,6 +9,7 @@ import type { Vm } from '@/types/panel-vm'
 import { Download, LifeBuoy, Link2, Play, RefreshCw } from 'lucide-react'
 import { credEndpointLabel, credEndpointOf } from '@/lib/cred-type'
 import { fmtAgo, fmtNum, fmtUsd } from '@/lib/format'
+import { subscriptionListLabel } from '@/lib/subscription-expiry'
 import { tierVisual } from '@/lib/tier-visual'
 import { cn } from '@/lib/utils'
 import { isAntigravityVm, slotCredentialLabel } from '@/lib/vm-kind'
@@ -458,6 +459,7 @@ export const VmBlade = memo(function VmBlade({
   const state = bladeState(vm)
   const large = size === 'l'
   const email = String(vm.email || '')
+  const sub = subscriptionListLabel(vm, now)
   const restricted = zoneOf(vm) === 'restricted'
   return (
     <article
@@ -504,6 +506,17 @@ export const VmBlade = memo(function VmBlade({
           )}
         >
           {slotCredentialLabel(vm)}
+        </span>
+        <span
+          className={cn(
+            'col-span-2 truncate font-mono text-[11px] tabular-nums',
+            sub.tone === 'bad' && 'text-[color:var(--status-bad)]',
+            sub.tone === 'warn' && 'text-[color:var(--status-warn)]',
+            sub.tone === 'muted' && 'text-muted-foreground'
+          )}
+          title={sub.title}
+        >
+          {sub.text}
         </span>
         {restricted && state !== 'dead' ? (
           <StatusMark

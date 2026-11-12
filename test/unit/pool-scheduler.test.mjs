@@ -157,6 +157,46 @@ test('scheduler keeps a slot whose access is expired but refresh remains', async
   selected.release()
 })
 
+test('legacy accounts.schedulable false does not hide a panel-on slot', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const repo = new RuntimeRepo()
+  repo.schedulingSnapshot = (ids) =>
+    new Map(
+      ids.map((id) => [
+        id,
+        {
+          state: repo.get(id),
+          account: { status: 'active', schedulable: false, account_id: id },
+        },
+      ]),
+    )
+  const pool = scheduler(root, { runtimeRepo: repo })
+  const selected = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.vmId, 'vm-01')
+  selected.release()
+})
+
+test('inactive account status still excludes the slot', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const repo = new RuntimeRepo()
+  repo.schedulingSnapshot = (ids) =>
+    new Map(
+      ids.map((id) => [
+        id,
+        {
+          state: repo.get(id),
+          account: { status: 'disabled', schedulable: true, account_id: id },
+        },
+      ]),
+    )
+  const pool = scheduler(root, { runtimeRepo: repo })
+  const selected = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(selected.ok, false)
+})
+
 test('scheduler skips excluded account and reserves the next one', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
@@ -1315,7 +1355,7 @@ function writeTier(root, id, tier, extras = {}) {
   fs.writeFileSync(file, JSON.stringify(vm))
 }
 
-test('fable skips pro and unknown, lands on max', async (t) => {
+test('fable does not skip a pro slot when a max slot is also up', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   writeTier(root, 'vm-01', 'pro')
@@ -1323,7 +1363,7 @@ test('fable skips pro and unknown, lands on max', async (t) => {
   const pool = scheduler(root)
   const selected = await pool.selectAndReserve({ model: 'claude-fable-5', allowWait: false })
   assert.equal(selected.ok, true)
-  assert.equal(selected.vmId, 'vm-02')
+  assert.equal(selected.vmId, 'vm-01')
   selected.release()
 })
 
@@ -1351,7 +1391,7 @@ test('fable skips a Max account recently denied that model', async (t) => {
   selected.release()
 })
 
-test('fable with only pro slots returns fable_requires_max', async (t) => {
+test('fable lands on a pro slot', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   writeTier(root, 'vm-01', 'pro')
@@ -1360,8 +1400,9 @@ test('fable with only pro slots returns fable_requires_max', async (t) => {
     model: 'claude-fable-5',
     allowWait: false,
   })
-  assert.equal(selected.ok, false)
-  assert.equal(selected.reason, 'fable_requires_max')
+  assert.equal(selected.ok, true)
+  assert.ok(selected.vmId === 'vm-01' || selected.vmId === 'vm-02')
+  selected.release()
 })
 
 test('sonnet still lands on a pro slot', async (t) => {
@@ -1399,7 +1440,7 @@ test('allowed_models whitelist skips other families', async (t) => {
 test('allowed_models prefix matches dated fable ids', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  writeTier(root, 'vm-01', 'pro')
+  writeTier(root, 'vm-01', 'pro', { allowed_models: ['claude-sonnet-5'] })
   writeTier(root, 'vm-02', 'max', { allowed_models: ['claude-fable-5'] })
   const selected = await scheduler(root).selectAndReserve({
     model: 'claude-fable-5-20260801',
@@ -1825,14 +1866,19 @@ test('a full pool queue still lets a free account be selected without waiting', 
 test('rpm window expiry rechecks instead of failing the waiter', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const resetAt = Date.now() + 40
+  let resetAt = 0
   const pool = scheduler(root, {
     accountQuota: {
       canAccept: () => {
+        if (!resetAt) resetAt = Date.now() + 40
         if (Date.now() < resetAt) return { ok: false, reason: 'rpm_limit', detail: { reset_at: resetAt } }
         return { ok: true }
       },
       tryAcquire: () => ({ ok: true }),
+    },
+    workerHealth: async (exec) => {
+      if (exec.vmId === 'vm-01') await new Promise((resolve) => setTimeout(resolve, 15))
+      return { ok: true, credential: { generation: 1, has_access: true } }
     },
   })
   applyShortWaits(pool, { sticky: 400, fallback: 400 })
@@ -2576,6 +2622,72 @@ test('rebuild outbound session stays on one VM and changes after failover', asyn
   assert.equal(second.vmId, first.vmId)
   assert.equal(secondSeen[0].sessionId, seen[0].sessionId)
   assert.equal(sticky.resolve(stickyKey).sessionId, seen[0].sessionId)
+})
+
+test('a device-affinity seat migrates a stale session pin and reuses its outbound session after restart', async (t) => {
+  const root = project()
+  let sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+  t.after(() => {
+    sticky.db.close()
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const caller = 'device-migration-session'
+  const stickyKey = sticky.canonicalSessionKey(caller)
+  const legacyKey = 'p:anthropic:sess:device-migration-session:klegacy'
+  const deviceKey = sticky.canonicalDeviceKey('device-migration-machine')
+  for (const key of [stickyKey, legacyKey]) {
+    sticky.bind(key, { accountId: 'account-1', vmId: 'vm-01', sessionId: 'old-outbound' }, { countHit: false })
+  }
+  sticky.bindDeviceAffinity(deviceKey, { accountId: 'account-2', vmId: 'vm-02' })
+  const makeRunner = () =>
+    new FailoverRunner({ scheduler: scheduler(root, { stickyRouter: sticky }), stickyRouter: sticky })
+  let runner = makeRunner()
+  const seen = []
+  const headers = []
+  const run = (turn) =>
+    runner.run({
+      requestId: `device-migration-${turn}`,
+      canonicalBody: { model: 'claude-opus-test' },
+      model: 'claude-opus-test',
+      stickyKey,
+      stickyKeys: [stickyKey, legacyKey],
+      seatKey: `seat:sess:${caller}`,
+      deviceKey,
+      applyAttempt: applyRebuildAttempt(caller, { seen, headers, epoch: turn }),
+      callAttempt: () => verifiedHop('reply'),
+    })
+
+  const first = await run(1)
+  assert.equal(first.ok, true)
+  assert.equal(first.vmId, 'vm-02')
+  const sessionId = seen[0].sessionId
+  assert.notEqual(sessionId, 'old-outbound')
+  const assertBound = () => {
+    for (const key of [stickyKey, legacyKey]) {
+      const bound = sticky.resolve(key)
+      assert.equal(bound.accountId, 'account-2')
+      assert.equal(bound.vmId, 'vm-02')
+      assert.equal(bound.sessionId, sessionId)
+      assert.equal(bound.slotIndex, null)
+    }
+  }
+  assertBound()
+  const second = await run(2)
+  assert.equal(second.ok, true)
+  assertBound()
+
+  sticky.db.close()
+  sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+  runner = makeRunner()
+  const restarted = await run(3)
+  assert.equal(restarted.ok, true)
+  assertBound()
+  assert.deepEqual(
+    seen.map((item) => item.sessionId),
+    [sessionId, sessionId, sessionId],
+  )
+  assert.ok(headers.every((item) => item['x-claude-code-session-id'] === sessionId))
+  assert.ok(headers.every((item) => item.metadata_session_id === sessionId))
 })
 
 test('held and restored seats keep their outbound session despite a different family home', async (t) => {

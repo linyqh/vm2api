@@ -15,6 +15,8 @@
  * keeps this module free of any crs-persona.mjs import.
  */
 
+import { isDeepStrictEqual } from 'node:util'
+
 export const PERSONA_PRESETS = Object.freeze(['official', 'official_full', 'zero', 'custom'])
 export const DEFAULT_PERSONA_PRESET = 'official_full'
 /** Read-only compatibility alias; no longer a selectable preset. */
@@ -236,7 +238,7 @@ export const DEFAULT_PERSONA_TEMPLATES = Object.freeze({
   zero: Object.freeze([
     Object.freeze({
       id: 'billing',
-      note: '0注入只留计费头，官方身份句放在 prompt_version',
+      note: '0注入计费头，官方身份句放在 prompt_version；调用方 system 另按原块保留',
       type: 'text',
       text: '{{billing_semi}} prompt_version=<{{identity_cli}}>',
     }),
@@ -485,7 +487,11 @@ function withStandingSlot(blocks, standingText) {
  * other blank blocks keep their slot as a zero-width space because upstream
  * rejects empty text (0注入 agent slot with standing off and no caller agent).
  */
-export function renderPersonaTemplate(blocks, vars = {}, { role = null } = {}) {
+export function renderPersonaTemplate(
+  blocks,
+  vars = {},
+  { role = null, blockVars = null, templateOwned = null, usedCallerCache = new Set(), separator = '' } = {},
+) {
   const source = withStandingSlot(blocks, vars?.agent_standing)
   if (!Array.isArray(source)) return []
   const out = []
@@ -512,10 +518,48 @@ export function renderPersonaTemplate(blocks, vars = {}, { role = null } = {}) {
         ].includes(name),
       )
     if (blank && (block.drop_if_empty || emptyEnvironment)) continue
+    // Zero's caller variables may carry several independent cache boundaries.
+    // Expand those as blocks, retaining controls only on their first use.
+    if (blockVars && extractTemplateVars(block.text).some((name) => blockVars[name]?.length)) {
+      const parts = []
+      const generated = (value) => {
+        if (!value) return
+        const part = { type: 'text', text: value.trim() ? value : `${EMPTY_BLOCK_TEXT}${value}` }
+        templateOwned?.add(part)
+        parts.push(part)
+      }
+      let offset = 0
+      for (const match of String(block.text ?? '').matchAll(VAR_RE)) {
+        const caller = blockVars[match[1].toLowerCase()]
+        if (!caller?.length) continue
+        generated(renderText(block.text.slice(offset, match.index), vars))
+        caller.forEach((original, index) => {
+          if (index) generated('\n\n')
+          const copy = { ...original }
+          if (copy.cache_control != null) {
+            if (usedCallerCache.has(original)) delete copy.cache_control
+            else usedCallerCache.add(original)
+          }
+          parts.push(copy)
+        })
+        offset = match.index + match[0].length
+      }
+      generated(renderText(block.text.slice(offset), vars))
+      if (block.cache_control && typeof block.cache_control === 'object') {
+        // A template policy must never replace a caller's boundary.
+        if (!templateOwned?.has(parts.at(-1))) generated(EMPTY_BLOCK_TEXT)
+        parts.at(-1).cache_control = { ...block.cache_control }
+      }
+      if (out.length && separator) out.push({ type: 'text', text: separator })
+      out.push(...parts)
+      continue
+    }
     const next = { type: 'text', text: blank ? EMPTY_BLOCK_TEXT : text }
     if (block.cache_control && typeof block.cache_control === 'object') {
       next.cache_control = { ...block.cache_control }
     }
+    templateOwned?.add(next)
+    if (out.length && separator) out.push({ type: 'text', text: separator })
     out.push(next)
   }
   return out
@@ -565,10 +609,27 @@ function templateFrom(templates, key, defaults) {
   return defaults.official
 }
 
+/** Only upgrade the known old default; edited templates and explicit block switches still win. */
+export function migrateLegacyOfficialTemplate(preset, blocks) {
+  if (preset !== 'official') return blocks
+  const defaults = DEFAULT_PERSONA_TEMPLATES.official
+  const legacy = defaults.filter((block) => block.id !== 'caller_system')
+  const shape = (value) => {
+    if (!value || typeof value !== 'object') return value
+    const { note: _note, ...block } = value
+    return block
+  }
+  if (!isDeepStrictEqual(blocks.map(shape), legacy.map(shape))) return blocks
+  return [...blocks, defaults.find((block) => block.id === 'caller_system')]
+}
+
 /** Empty array means "use the built-in preset"; empty custom falls back to official. */
 export function resolvePersonaTemplate(preset, templates) {
   const key = normalizePersonaPreset(preset)
-  const blocks = dropLegacyAutoScope(key, templateFrom(templates, key, DEFAULT_PERSONA_TEMPLATES))
+  const blocks = dropLegacyAutoScope(
+    key,
+    migrateLegacyOfficialTemplate(key, templateFrom(templates, key, DEFAULT_PERSONA_TEMPLATES)),
+  )
   if (!['official', 'official_full'].includes(key)) return blocks
   return blocks.map((block) =>
     ['env', 'env_official', 'env_timezone_only', 'env_extra'].includes(block?.id)

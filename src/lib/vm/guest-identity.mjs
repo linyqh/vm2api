@@ -12,7 +12,7 @@ import { readGuestIdentity, normalizeGuestHardware } from './guest-identity-read
 import { OFFICIAL_STAINLESS } from '../identity/vm-identity.mjs'
 import { applyOfficialFingerprintToVm } from '../identity/official-fingerprint.mjs'
 import { isHostKernel } from '../identity/workstation-profile.mjs'
-import { syncWorkerTelemetry } from './vm-runtime.mjs'
+import { syncNativeTelemetry } from './vm-runtime.mjs'
 import { slotHost } from './slot-host.mjs'
 import { isGeneratedHostname } from '../identity/workstation-fingerprint.mjs'
 
@@ -177,6 +177,9 @@ export async function collectSlotIdentity(projectRoot, vm, { callGet = readGuest
     type: runtimeKind(current),
     guest_hostname: current.fingerprint.guest_hostname || current.fingerprint.hostname,
     guest_os: current.fingerprint.os_pretty,
+    guest_os_version: guest.os_version || null,
+    guest_platform: guest.goos || null,
+    guest_arch: guest.arch || null,
     guest_kernel: current.fingerprint.guest_kernel_release || current.fingerprint.kernel_release,
     identity_collected_at: current.fingerprint.collected_at,
   }
@@ -188,7 +191,7 @@ export async function collectSlotIdentity(projectRoot, vm, { callGet = readGuest
     current = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
   } catch {}
   try {
-    const telemetry = syncWorkerTelemetry(current, projectRoot)
+    const telemetry = syncNativeTelemetry(current, projectRoot)
     if (telemetry.wrote) {
       await slotHost(current).syncRun(current, path.join(projectRoot, 'vms', current.id))
     }

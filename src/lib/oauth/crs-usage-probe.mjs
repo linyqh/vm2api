@@ -4,6 +4,8 @@
  */
 import { isCrsMock } from '../transport/crs-mock.mjs'
 import { callGoWorker, callWorkerGet } from '../transport/go-worker-client.mjs'
+import { runSlotOauth } from '../transport/slot-oauth.mjs'
+import { tierFromOauthProfile } from './official-cc-stats.mjs'
 import {
   compareUsageInterpretations,
   fableScopeText,
@@ -14,7 +16,7 @@ import {
 } from './usage-interpret.mjs'
 
 /** Current Max model first; the previous id is only a fallback when this one is missing. */
-export const FABLE_TIER_MODELS = Object.freeze(['claude-fable-5-1', 'claude-fable-5'])
+export const FABLE_TIER_MODELS = Object.freeze(['claude-fable-5-2', 'claude-fable-5-1', 'claude-fable-5'])
 export const FABLE_PROBE_MODEL = FABLE_TIER_MODELS[0]
 export const OAUTH_USAGE_PATH = '/api/oauth/usage'
 /** sub2api Extra / Messages 响应头被动采样，不打 GET /api/oauth/usage。 */
@@ -135,7 +137,9 @@ export function parseOAuthUsage(data = {}) {
 
 export function isCompleteOAuthUsage(data = {}, parsed = null) {
   const p = parsed || parseOAuthUsage(data)
-  if (!p.five_hour || !p.seven_day) return false
+  // Official usage can omit the session window while retaining weekly limits.
+  // Keep an absent window unknown; a supplied but unreadable window is invalid.
+  if (!p.seven_day || (!p.five_hour && data.five_hour != null)) return false
   if (p.usage_has_fable !== null) return true
   // 2.1.293 GET /api/oauth/usage is a Utilization object: named windows, no limits[] catalog.
   if (
@@ -356,7 +360,14 @@ function mockUsage() {
   }
 }
 
-export async function probeVmUsage({ exec, includeFable = true, timeoutMs = 20000, identity = null } = {}) {
+export async function probeVmUsage({
+  exec,
+  includeFable = true,
+  timeoutMs = 20000,
+  identity = null,
+  slotOauth = runSlotOauth,
+  usageGet = callWorkerGet,
+} = {}) {
   if (!exec) {
     return { ok: false, source: 'official-cc-usage', error: 'no_exec', probed_at: new Date().toISOString() }
   }
@@ -389,7 +400,11 @@ export async function probeVmUsage({ exec, includeFable = true, timeoutMs = 2000
       probed_at: new Date().toISOString(),
     }
   }
-  const usageRes = await callWorkerGet(exec, '/internal/oauth/usage', { timeoutMs })
+  const [usageRes, profileRes] = await Promise.all([
+    usageGet(exec, '/internal/oauth/usage', { timeoutMs }),
+    slotOauth(exec, 'profile', { timeoutMs }),
+  ])
+  const profileTier = profileRes?.ok ? tierFromOauthProfile(profileRes.body) : null
   const usageRateLimited =
     usageRes.status === 429 ||
     isOfficialUsageRateLimited({
@@ -449,6 +464,9 @@ export async function probeVmUsage({ exec, includeFable = true, timeoutMs = 2000
     source: 'official-cc-usage',
     via: usageRes.via || 'go-worker',
     usage_status: usageRes.status,
+    account_tier: profileTier,
+    account_tier_source: profileTier ? 'profile' : null,
+    profile_error: profileRes?.ok ? null : profileRes?.body?.error?.code || 'profile_unavailable',
     limits_present: usageRes.ok ? isCompleteOAuthUsage(rawBody, parsed) : false,
     usage_scope_missing: usageMissingScope,
     credential_scope_required: usageMissingScope ? 'user:profile' : null,

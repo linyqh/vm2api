@@ -3,6 +3,8 @@
  * Derived from status / error_code / message so historical rows classify without a migration.
  */
 
+import { isUnanswerablePromptMessage } from '../core/errors.mjs'
+
 export const ERROR_CLASSES = {
   auth: { id: 'auth', owner: 'client', label: '认证' },
   request: { id: 'request', owner: 'client', label: '请求格式' },
@@ -28,6 +30,7 @@ const CODE_MAP = {
   api_key_expired: 'auth',
   key_group_mismatch: 'request',
   vm_pool_unavailable: 'request',
+  api_key_model_not_allowed: 'request',
   claude_code_only: 'request',
   invalid_json: 'request',
   body_too_large: 'request',
@@ -126,6 +129,7 @@ export const SLA_OK_ERROR_CODES = new Set([
   'policy_blocked',
   'key_group_mismatch',
   'vm_pool_unavailable',
+  'api_key_model_not_allowed',
   'claude_code_only',
   // Pool queue full / timeout moved from 429 to 529; SLA keeps counting them as it did at 429.
   'pool_overloaded',
@@ -236,6 +240,17 @@ export function classifyRequestError(row = {}) {
   if (/signature|thinking block|skip_thought_signature|must contain thinking/.test(text)) id = 'signature'
   else if ((id === 'upstream' || (!id && status === 503)) && /overload|负载过高/.test(text)) id = 'overloaded'
   else if (!id && /no eligible|无可用账号|没有可用账号/.test(text)) id = 'unavailable'
+  // Kernel labels an AUP refusal HTTP 400 upstream_invalid_request. The audit
+  // feed only reads the refusal class, so the sentence wins over that code.
+  // Auth stays credential even when the body quotes the Usage Policy.
+  if (
+    id !== 'auth' &&
+    id !== 'credential' &&
+    isUnanswerablePromptMessage(row?.error_message) &&
+    !isOauthCredentialFailure(row, text, code)
+  ) {
+    id = 'refusal'
+  }
   if (!id) {
     if (/extra usage|entitlement|quota|5h|7d/.test(text) && (status === 429 || /quota|usage/.test(text))) id = 'quota'
     else if (/socks|proxy|cloudflare|just a moment/.test(text)) id = 'proxy'

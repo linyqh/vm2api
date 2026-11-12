@@ -3,8 +3,8 @@
  * Default 1h (2× input). Customers may request 5m (1.25× input);
  * billing must use the TTL we actually sent.
  */
-import fs from 'node:fs'
 import { isAnthropicServerTool } from './web-search.mjs'
+import { readJsonParsedCached } from '../vm/vm-file.mjs'
 
 export const DEFAULT_CACHE_TTL = '1h'
 export const CACHE_TTL_HEADER = 'x-kin-cache-ttl'
@@ -35,7 +35,9 @@ export function cacheTtlFromRouting(routing = {}) {
 export function cacheTtlFromRoutingFile(filePath) {
   if (!filePath) return DEFAULT_CACHE_TTL
   try {
-    return cacheTtlFromRouting(JSON.parse(fs.readFileSync(filePath, 'utf8')))
+    const routing = readJsonParsedCached(filePath)
+    if (!routing) return DEFAULT_CACHE_TTL
+    return cacheTtlFromRouting(routing)
   } catch {
     return DEFAULT_CACHE_TTL
   }
@@ -113,14 +115,39 @@ export function validateCacheBreakpoints(body) {
   check(body)
 }
 
-/** Only call for a rewritten native body: every surviving marker is Node-owned. */
+/**
+ * Only call for a rewritten native body: every surviving marker is Node-owned.
+ * Explicit TTLs stay. A missing TTL takes `ttl`, or 5m once a short marker
+ * precedes it, so filling never puts a 1h after a 5m. Anthropic reads tools,
+ * system, messages, then the root automatic marker at the message tail.
+ */
 export function fillMissingCacheTtl(body, ttl = DEFAULT_CACHE_TTL) {
+  if (!body || typeof body !== 'object') return body
   const target = normalizeCacheTtl(ttl)
-  return walkCacheNodes(body, (node) => {
+  let short = false
+  const fill = (node) => {
     const control = node?.cache_control
-    if (!control || control.type !== 'ephemeral' || control.ttl != null) return node
-    return { ...node, cache_control: { ...control, ttl: target } }
-  })
+    if (!control || control.type !== 'ephemeral') return node
+    if (control.ttl != null) {
+      if (control.ttl !== '1h') short = true
+      return node
+    }
+    const next = short ? '5m' : target
+    if (next !== '1h') short = true
+    return { ...node, cache_control: { ...control, ttl: next } }
+  }
+  const out = { ...body }
+  if (Array.isArray(out.tools)) out.tools = out.tools.map(fill)
+  if (Array.isArray(out.system)) out.system = out.system.map(fill)
+  if (Array.isArray(out.messages)) {
+    out.messages = out.messages.map((message) => {
+      if (!Array.isArray(message?.content)) return message
+      const content = message.content.map(fill)
+      return content.some((block, i) => block !== message.content[i]) ? { ...message, content } : message
+    })
+  }
+  if (out.cache_control) out.cache_control = fill({ cache_control: out.cache_control }).cache_control
+  return out
 }
 
 const CACHE_TTL_MS = Object.freeze({ '5m': 5 * 60_000, '1h': 60 * 60_000 })
@@ -323,23 +350,6 @@ export function enforceCacheTtlOrder(body) {
   return changed ? out : body
 }
 
-/** Retarget every Node marker to one TTL. Default matches DEFAULT_CACHE_TTL. */
-export function forceEphemeralCacheTtl(body, ttl = DEFAULT_CACHE_TTL) {
-  const target = normalizeCacheTtl(ttl)
-  if (!body || typeof body !== 'object') return body
-  let changed = false
-  const fix = (node) => {
-    if (!node?.cache_control) return node
-    const control = node.cache_control
-    if (control.type && control.type !== 'ephemeral') return node
-    if (control.type === 'ephemeral' && control.ttl === target) return node
-    changed = true
-    return { ...node, cache_control: { ...control, type: 'ephemeral', ttl: target } }
-  }
-  const out = walkCacheNodes(body, fix)
-  return changed ? out : body
-}
-
 /** Rewrite every outbound cache breakpoint to this request's resolved TTL. */
 export function applyCacheTtlToBody(body, ttl = DEFAULT_CACHE_TTL) {
   const target = normalizeCacheTtl(ttl)
@@ -399,7 +409,9 @@ export function cacheBreakpointsFromRouting(routing = {}) {
 export function cacheBreakpointsFromRoutingFile(filePath) {
   if (!filePath) return normalizeCacheBreakpoints(null)
   try {
-    return cacheBreakpointsFromRouting(JSON.parse(fs.readFileSync(filePath, 'utf8')))
+    const routing = readJsonParsedCached(filePath)
+    if (!routing) return normalizeCacheBreakpoints(null)
+    return cacheBreakpointsFromRouting(routing)
   } catch {
     return normalizeCacheBreakpoints(null)
   }

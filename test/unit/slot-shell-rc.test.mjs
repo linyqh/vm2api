@@ -10,10 +10,11 @@ import {
   createLiveLoginAdoption,
   createSlotShell,
   panelShellLaunch,
+  terminalClaudeBin,
   syncShellLoginCredentials,
 } from '../../src/lib/vm/slot-shell.mjs'
 import { FULL_OAUTH_SCOPE } from '../../src/lib/oauth/oauth-contract.mjs'
-import { OFFICIAL_CLI_VERSION } from '../../src/lib/identity/vm-identity.mjs'
+import { CONTAINER_CLI_NODE_BIN, LOCAL_CRAG_CLAUDE, REMOTE_CRAG_CLAUDE } from '../../src/lib/vm/slot-engine.mjs'
 import {
   ensureOfficialCredentialLink,
   readWorkerCredentialFile,
@@ -31,12 +32,7 @@ test('claude in the panel shell runs cli-node and points config at .claude', () 
   fs.writeFileSync(path.join(home, '.claude', '.claude.json'), '{"oauthAccount":{}}\n')
   fs.writeFileSync(bin, '#!/bin/sh\necho "cli-node $*"\n', { mode: 0o755 })
   fs.writeFileSync(path.join(decoyDir, 'claude'), '#!/bin/sh\necho DECOY\n', { mode: 0o755 })
-  const { rc, cmd } = panelShellLaunch(bin)
-  assert.match(cmd.at(-1), /bash --rcfile/)
-  assert.match(rc, /CLAUDE_CONFIG_DIR/)
-  assert.match(rc, /CLAUDE_CODE_HOST_REFRESH=1/)
-  assert.match(rc, new RegExp(`CLAUDE_CODE_VERSION=${OFFICIAL_CLI_VERSION.replaceAll('.', '\\.')}`))
-  assert.match(rc, /USER_TYPE=external/)
+  const { rc } = panelShellLaunch(bin)
   const rcPath = path.join(dir, 'rc')
   fs.writeFileSync(rcPath, `${rc}\n`)
   const ran = spawnSync(
@@ -61,7 +57,35 @@ test('claude in the panel shell runs cli-node and points config at .claude', () 
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
-test('official login starts claude only when the panel login marker is set', () => {
+test('a CRAG v2 terminal runs the package claude instead of cli-node', () => {
+  assert.equal(terminalClaudeBin({ id: 'vm-local', dataplane: 'crag', crag_kernel_version: 'v2' }), LOCAL_CRAG_CLAUDE)
+  assert.equal(
+    terminalClaudeBin({ id: 'vm-remote', node_id: 'node-a', dataplane: 'crag', crag_kernel_version: 'v2' }),
+    REMOTE_CRAG_CLAUDE,
+  )
+  assert.equal(terminalClaudeBin({ id: 'vm-wrap', dataplane: 'wrap' }), CONTAINER_CLI_NODE_BIN)
+  assert.equal(
+    terminalClaudeBin({ id: 'vm-kvm', dataplane: 'crag', crag_kernel_version: 'v2', runtime: { type: 'kvm' } }),
+    CONTAINER_CLI_NODE_BIN,
+  )
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-crag-'))
+  const binDir = path.join(dir, 'crag-v2')
+  const bin = path.join(binDir, 'claude')
+  fs.mkdirSync(binDir)
+  fs.writeFileSync(bin, '#!/bin/sh\necho "crag-claude $*"\n', { mode: 0o755 })
+  const { rc } = panelShellLaunch(bin)
+  const rcPath = path.join(dir, 'rc')
+  fs.writeFileSync(rcPath, `${rc}\n`)
+  const ran = spawnSync('bash', ['--rcfile', rcPath, '-ic', 'claude --flag'], {
+    encoding: 'utf8',
+    env: { ...process.env, HOME: dir, PATH: `${dir}:${process.env.PATH}`, KIN_PANEL_RCFILE: rcPath },
+  })
+  assert.equal(ran.status, 0, ran.stderr)
+  assert.match(ran.stdout, /crag-claude --flag/)
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('official login starts claude auth login only when the panel login marker is set', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-login-'))
   const bin = path.join(dir, 'cli-node')
   fs.writeFileSync(bin, '#!/bin/sh\necho "cli-node $*"\n', { mode: 0o755 })
@@ -79,9 +103,38 @@ test('official login starts claude only when the panel login marker is set', () 
   assert.equal(plain.status, 0, plain.stderr)
   assert.doesNotMatch(plain.stdout, /cli-node/)
   assert.equal(login.status, 0, login.stderr)
-  assert.match(login.stdout, /cli-node\s*$/m)
-  assert.doesNotMatch(login.stdout, /auth login/)
+  assert.match(login.stdout, /cli-node auth login\s*$/m)
+  assert.doesNotMatch(plain.stdout, /auth login/)
   fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('native shell uses its own version and routes usage and login to the selected Claude', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-native-'))
+  try {
+    const bin = path.join(dir, 'claude')
+    fs.writeFileSync(bin, '#!/bin/sh\nprintf "native:%s:%s\\n" "$*" "${CLAUDE_CODE_VERSION-unset}"\n', { mode: 0o755 })
+    const { rc } = panelShellLaunch(bin, { native: true })
+    const ran = spawnSync('bash', ['-c', `${rc}\nusage\n/usage\nclaude auth login`], {
+      encoding: 'utf8',
+      env: { ...process.env, HOME: dir, CLAUDE_CODE_VERSION: 'stale', KIN_PANEL_RCFILE: path.join(dir, 'rc') },
+    })
+    assert.equal(ran.status, 0, ran.stderr)
+    assert.match(ran.stdout, /native:\/usage:unset/)
+    assert.match(ran.stdout, /native:auth login:unset/)
+    const rcPath = path.join(dir, 'interactive-rc')
+    fs.writeFileSync(rcPath, rc)
+    const interactive = spawnSync('bash', ['--rcfile', rcPath, '-i'], {
+      input: '/usage\nexit\n',
+      encoding: 'utf8',
+      env: { ...process.env, HOME: dir, KIN_PANEL_RCFILE: rcPath },
+    })
+    assert.equal(interactive.status, 0, interactive.stderr)
+    assert.match(interactive.stdout, /native:\/usage:unset/)
+    assert.match(interactive.stderr, /\x1b\]133;A\x07/)
+    assert.match(interactive.stderr, /\x1b\]133;C\x07/)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('a fresh slot login links the official credential file onto the worker file', () => {
@@ -444,7 +497,46 @@ test('a slow interactive import is shared by the next tick and close', async () 
   assert.equal(calls, 2)
 })
 
-test('official login tickets check a cluster slot for its container cli-node', async () => {
+test('existing credentials are not reported as a newly completed login', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-login-baseline-'))
+  const vm = { id: 'vm-02' }
+  const home = path.join(root, 'vms', vm.id, 'cli-home')
+  const official = path.join(home, '.claude', '.credentials.json')
+  const publish = (refresh) => {
+    fs.mkdirSync(path.dirname(official), { recursive: true })
+    fs.writeFileSync(
+      official,
+      JSON.stringify({
+        claudeAiOauth: {
+          accessToken: `access-${refresh}`,
+          refreshToken: refresh,
+          expiresAt: Date.now() + 3600000,
+          scopes: FULL_OAUTH_SCOPE.split(' '),
+        },
+      }),
+    )
+  }
+  const events = []
+  try {
+    publish('previous')
+    const run = createLiveLoginAdoption({
+      initialSeen: 'previous',
+      adopt: (seen) => adoptLiveShellLogin(root, vm, { seen }),
+      onImported: (value) => events.push(value.refresh),
+    })
+    assert.equal((await run()).imported, false)
+    assert.deepEqual(events, [])
+    publish('new-login')
+    assert.equal((await run()).imported, true)
+    assert.equal((await run()).imported, false)
+    assert.deepEqual(events, ['new-login'])
+    assert.equal(readWorkerCredentialFile(home).refresh_token, 'new-login')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('official login tickets reject unavailable cluster containers without fallback', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-ticket-'))
   fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
   fs.writeFileSync(path.join(root, 'vms', 'vm-01.json'), JSON.stringify({ id: 'vm-01', node_id: 'node-a' }))
@@ -529,8 +621,8 @@ test('a stopped container rejects the official login upgrade', async () => {
 })
 
 test('panelShellLaunch rejects a non-absolute cli-node path', () => {
-  assert.throws(() => panelShellLaunch('cli-node'), /invalid cli-node path/)
-  assert.throws(() => panelShellLaunch('/tmp/a\nb'), /invalid cli-node path/)
+  assert.throws(() => panelShellLaunch('cli-node'), /invalid Claude CLI path/)
+  assert.throws(() => panelShellLaunch('/tmp/a\nb'), /invalid Claude CLI path/)
 })
 
 function escapeRe(s) {
@@ -596,8 +688,9 @@ test('panel shell 系统特征 still prints under sh -i fallback', () => {
   const home = path.join(dir, 'home')
   fs.mkdirSync(home)
   const rcPath = writeLaunchRc(dir)
-  const ran = spawnSync('sh', ['-ic', ':'], {
+  const ran = spawnSync('sh', ['-i'], {
     encoding: 'utf8',
+    input: ':\nexit\n',
     env: {
       ...process.env,
       HOME: home,
@@ -609,6 +702,7 @@ test('panel shell 系统特征 still prints under sh -i fallback', () => {
   assert.equal(ran.status, 0, ran.stderr)
   assert.match(ran.stdout, /系统特征/)
   assert.match(ran.stdout, /机器ID\s+(已采集|未采集)/)
+  assert.match(ran.stderr, /\x1b\]133;A\x07/)
   fs.rmSync(dir, { recursive: true, force: true })
 })
 

@@ -6,26 +6,42 @@ import {
   imageGenerationTools,
 } from '../../src/lib/protocol/image-tool-models.mjs'
 import { detectInboundPlatform } from '../../src/lib/protocol/platform-detect.mjs'
-
-test('ships flare as upstream default and sunburst', () => {
+test('ships Image 2, 2.5 and 2.6 models with Flare as default', () => {
   assert.deepEqual(
     IMAGE_TOOL_MODELS.map((m) => [m.id, m.upstream_default]),
     [
-      ['gpt-image-2.5-flare', true],
+      ['gpt-image-2.6-flare', true],
+      ['gpt-image-2.6-sunburst', false],
+      ['gpt-image-2.5-flare', false],
       ['gpt-image-2.5-sunburst', false],
+      ['gpt-image-2', false],
     ],
   )
 })
 
 test('canonicalImageToolModel folds snapshots, case and provider prefix', () => {
+  assert.equal(canonicalImageToolModel('gpt-image-2.6-flare'), 'gpt-image-2.6-flare')
+  assert.equal(canonicalImageToolModel('GPT-Image-2.6-Sunburst'), 'gpt-image-2.6-sunburst')
+  assert.equal(canonicalImageToolModel('openai/gpt-image-2.6-flare'), 'gpt-image-2.6-flare')
+  assert.equal(canonicalImageToolModel(' gpt-image-2.6-sunburst '), 'gpt-image-2.6-sunburst')
   assert.equal(canonicalImageToolModel('gpt-image-2.5-flare'), 'gpt-image-2.5-flare')
   assert.equal(canonicalImageToolModel('GPT-Image-2.5-Sunburst-2026-09-08'), 'gpt-image-2.5-sunburst')
   assert.equal(canonicalImageToolModel('openai/gpt-image-2.5-flare-2026-09-08'), 'gpt-image-2.5-flare')
   assert.equal(canonicalImageToolModel(' gpt-image-2.5-flare '), 'gpt-image-2.5-flare')
+  assert.equal(canonicalImageToolModel('openai/gpt-image-2-2026-04-21'), 'gpt-image-2')
 })
 
 test('canonicalImageToolModel returns null for other ids', () => {
-  for (const id of ['', null, undefined, 'gpt-image-2', 'gpt-image-2.5', 'gpt-6-luna', 'gpt-image-2.5-flare-x']) {
+  for (const id of [
+    '',
+    null,
+    undefined,
+    'gpt-image-2-future',
+    'gpt-image-2.5',
+    'gpt-image-2.6',
+    'gpt-6-luna',
+    'gpt-image-2.5-flare-x',
+  ]) {
     assert.equal(canonicalImageToolModel(id), null, String(id))
   }
 })
@@ -49,6 +65,7 @@ test('imageGenerationTools picks only image_generation entries', () => {
 
 test('image models stay out of chat routing', () => {
   const detected = detectInboundPlatform('gpt-image-2.5-flare')
+  assert.equal(detectInboundPlatform('gpt-image-2.6-flare').ok, false)
   assert.equal(detected.ok, false)
   assert.equal(detected.code, 'model_not_supported')
 })

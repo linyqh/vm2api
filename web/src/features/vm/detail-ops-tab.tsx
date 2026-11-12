@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import type { Vm, VmProxySnap } from '@/types/panel-vm'
+import type { Vm, VmKernelSnapshot, VmProxySnap } from '@/types/panel-vm'
 import { type CredType, credTypeLabel } from '@/lib/cred-type'
 import { isAntigravityVm, isClaudeVm, isCodexVm } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
@@ -21,6 +21,7 @@ import {
 import { ChoiceTiles } from '@/components/choice-tiles'
 import { isActiveVmPointer } from '@/features/vm/active-vm'
 import { Field } from '@/features/vm/detail-section-primitives'
+import { VmEngineEditor } from '@/features/vm/engine-editor'
 import { VmEnvironmentCard } from '@/features/vm/environment-card'
 import { NodeChip } from '@/features/vm/node-chip'
 import { VmPhysicalFeaturesCard } from '@/features/vm/physical-features-card'
@@ -30,6 +31,7 @@ import { VmShellCard } from '@/features/vm/vm-shell-card'
 
 type VmOpsTabProps = {
   vm: Vm
+  kernel?: VmKernelSnapshot | null
   proxy: VmProxySnap
   officialCc: boolean
   credType: CredType
@@ -72,6 +74,9 @@ export function VmOpsTab(props: VmOpsTabProps) {
   return (
     <TabsContent value='ops' className='space-y-3 pt-4'>
       <VmOwnerAdminCard vm={vm} />
+      {!gpt ? (
+        <VmEngineEditor id={vm.id} vm={vm} kernel={props.kernel} />
+      ) : null}
       <Card>
         <CardHeader className='pb-2'>
           <CardTitle className='text-sm'>容器</CardTitle>
@@ -127,16 +132,18 @@ export function VmOpsTab(props: VmOpsTabProps) {
           <Button
             size='sm'
             variant='outline'
-            disabled={isActiveVmPointer(vm)}
-            loading={busy('/activate')}
+            disabled={busy('/activate') || busy('/deactivate')}
+            loading={busy('/activate') || busy('/deactivate')}
             title={
               isActiveVmPointer(vm)
-                ? '已是当前活跃槽'
+                ? '清空面板默认槽位，不影响调度'
                 : '写入 vms/active.json，面板默认接口指向此槽'
             }
-            onClick={() => onAction('/activate')}
+            onClick={() =>
+              onAction(isActiveVmPointer(vm) ? '/deactivate' : '/activate')
+            }
           >
-            设为活跃
+            {isActiveVmPointer(vm) ? '取消活跃' : '设为活跃'}
           </Button>
         ) : null}
         <Button

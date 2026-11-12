@@ -31,7 +31,7 @@ type UsageProbe = {
   source?: string
   via?: string | null
   probed_at?: string
-  account_tier?: string | null
+  subscription_type?: string | null
   five_hour?: UsageWindow
   seven_day?: UsageWindow
   seven_day_oi?: UsageWindow
@@ -68,7 +68,7 @@ function windowRow(label: string, w: UsageWindow): string {
 
 function usageLines(p: UsageProbe): string[] {
   const meta = [
-    p.account_tier ? `层级 ${p.account_tier}` : null,
+    p.subscription_type ? `套餐 ${p.subscription_type}` : null,
     `来源 ${probeSourceLabel(p.source)}${p.via ? ` · ${p.via}` : ''}`,
     fmtResetClock(p.probed_at),
   ]
@@ -129,6 +129,11 @@ export function VmShellCard({
     () => [
       {
         name: '/usage',
+        desc: '打开当前内核对应 Claude CLI 的用量',
+        input: 'claude /usage',
+      },
+      {
+        name: '/probe',
         desc: '查看用量（同「探测」）',
         run: async () => {
           const probe = await postVm<UsageProbe>(id, '/probe')

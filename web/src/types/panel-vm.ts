@@ -70,6 +70,50 @@ export type VmProxySnap = {
 
 export type InferenceEngine = 'auto' | 'go' | 'rust'
 
+export type CragLicenseStatus = {
+  status:
+    | 'unlicensed'
+    | 'valid'
+    | 'expired'
+    | 'not_yet_valid'
+    | 'invalid'
+    | 'unconfigured'
+  valid: boolean
+  vm_id: string
+  /** offline: CRAGU1 universal code. online: device-bound CRAGL1. */
+  kind?: 'offline' | 'online'
+  /** kernel: one offline code covers every slot and machine. device: one VM. */
+  scope?: 'kernel' | 'device'
+  license_id?: string
+  term?: '1m' | '6m' | '1y'
+  /** Signed UTC epoch seconds, not browser-local timestamps. */
+  issued_at?: number
+  not_before?: number
+  expires_at?: number
+  code?: string
+  message?: string
+}
+
+export type CragLicenseResponse = {
+  license: CragLicenseStatus
+  machine_code: string
+}
+
+export type VmTelemetryState = {
+  enabled: boolean
+  state:
+    | 'disabled'
+    | 'idle'
+    | 'waiting_credentials'
+    | 'waiting_egress'
+    | 'uploading'
+    | 'error'
+    | 'unsupported'
+  pending_events: number
+  last_upload_at: string | null
+  last_error: string | null
+}
+
 export type VmKernelHealth = {
   reachable?: boolean
   process_up?: boolean
@@ -84,17 +128,15 @@ export type VmKernelHealth = {
   proxy_ok?: boolean | null
   accounts?: number | null
   vm_id?: string | null
+  vm_telemetry?: boolean
+  telemetry_ready?: boolean
+  telemetry?: VmTelemetryState | null
 }
 export type VmKernelSnapshot = {
   credential_owner?: string | null
   credential_state?: string | null
   proxy_state?: string | null
-  telemetry?: {
-    enabled?: boolean | null
-    running?: boolean | null
-    process?: string | null
-    read_only?: boolean
-  } | null
+  telemetry?: VmTelemetryState | null
   process_topology?: {
     rust_pid1?: boolean
     go_worker_pid1?: boolean
@@ -227,8 +269,10 @@ export type Vm = {
   id: string
   name?: string
   owner_user_id?: string | null
-  /** 所在集群节点；null / 缺省 = 本机。远端槽位不支持官方初装、wrap-cli、换内核等。 */
+  /** 所在集群节点；null / 缺省 = 本机。 */
   node_id?: string | null
+  /** linux Docker 节点可切 CRAG；darwin 是 macOS 原生槽，不能切。 */
+  node_platform?: 'linux' | 'darwin' | null
   /** Admin-only cluster node label for `node_id`. Tenants never receive this. */
   node_name?: string | null
   origin?: string | null
@@ -354,7 +398,10 @@ export type Vm = {
   fable?: Record<string, unknown>
   weekly_split?: Record<string, unknown>
   account_tier?: string
-  /** Complete official usage: true = Max, false = Pro, null = unconfirmed. */
+  /** Official OAuth subscription metadata, independent of model availability. */
+  subscription_type?: string | null
+  rate_limit_tier?: string | null
+  /** Whether official usage lists a Fable window; not a subscription identifier. */
   usage_has_fable?: boolean | null
   /** anthropic | openai | antigravity。缺省兼容旧 Claude 槽。 */
   platform?: string | null
@@ -365,8 +412,12 @@ export type Vm = {
   resolved_inference_engine?: 'go' | 'rust' | null
   persona_preset?: string | null
   resolved_persona_preset?: string | null
+  /** CRAG v2 print only: official_full appends the caller tail; zero replaces. */
+  resolved_crag_print_persona?: 'official_full' | 'zero' | null
   dataplane?: 'wrap' | 'cc' | 'crag' | null
   resolved_dataplane?: 'wrap' | 'cc' | 'crag' | null
+  crag_kernel_version?: 'legacy' | 'v2' | null
+  resolved_crag_kernel_version?: 'legacy' | 'v2' | null
   kernel?: string
   /** docker | kvm。缺省按 docker 展示。 */
   runtime_type?: RuntimeType | null
@@ -663,6 +714,17 @@ export type VmDetailPayload = {
   [key: string]: unknown
 }
 
+export type VmSeedFileObservation = {
+  ok: boolean
+  source: 'local' | 'node'
+  files: {
+    settings_json: 'present' | 'missing' | 'error'
+    claude_setting: 'present' | 'missing' | 'error'
+    kin_seed: 'present' | 'missing' | 'error'
+  }
+  error?: string
+}
+
 /** `GET/PUT /api/panel/vms/:id/seed-settings` 剥壳后的 payload。不展示 `cli_home`。 */
 export type VmSeedSettings = {
   vm_id?: string
@@ -675,6 +737,22 @@ export type VmSeedSettings = {
   settings_json?: Record<string, unknown> | null
   claude_setting?: string | null
   kin_seed?: Record<string, unknown> | null
+  seed_files?: VmSeedFileObservation
+  telemetry_log?: string[]
+  telemetry_log_error?: string | null
+  saved?: boolean
+  published?: boolean
+  applied?: boolean
+  service?: {
+    ok?: boolean
+    wrote?: boolean
+    published?: boolean
+    applied?: boolean
+    supported?: boolean
+    state?: string
+    code?: string
+    error?: string
+  }
   [key: string]: unknown
 }
 
@@ -712,6 +790,8 @@ export type OfficialCcStatus = {
   hello_ok?: boolean
   usage_ok?: boolean
   account_tier?: string
+  subscription_type?: string | null
+  rate_limit_tier?: string | null
   /** `profile` = 官方 /api/oauth/profile；`usage` = /usage 推断兜底。 */
   account_tier_source?: string
   /** 槽内 GET /v1/models 返回的模型 id。 */

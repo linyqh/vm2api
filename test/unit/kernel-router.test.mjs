@@ -45,6 +45,10 @@ import { socksUidFor } from '../../src/lib/vm/vm-runtime.mjs'
 const unix = process.platform !== 'win32'
 const unixTest = unix ? test : test.skip
 
+function kernelInspectResult(path = '/home/kincli/.kin/kin-kernel', args = null) {
+  return { ok: true, stdout: `${JSON.stringify(path)}\n${JSON.stringify(args)}` }
+}
+
 test('wrap system error is not a credential ensure; 401 still is', () => {
   assert.equal(
     isNeedsRefreshResult({
@@ -200,6 +204,380 @@ async function kernelFixture(handler) {
     },
   }
 }
+
+const cragCapabilities = ['prompt_append', 'prompt_replace', 'model_directive', 'caller_cwd']
+const cragHealth = (capabilities) => ({ ok: true, runtime_variant: 'crag-v2', ready_slots: 1, capabilities })
+
+function cragHopBody(mode) {
+  return {
+    model: 'claude-haiku-4-5',
+    messages: [{ role: 'user', content: 'hi' }],
+    crag_prompt: { mode, text: 'prepared caller guidance' },
+    crag_model: { id: 'caller-supplied-model' },
+  }
+}
+
+async function readPostedEnvelope(req) {
+  const chunks = []
+  for await (const chunk of req) chunks.push(chunk)
+  return JSON.parse(Buffer.concat(chunks).toString('utf8'))
+}
+
+function respondToCragHop(res, stream) {
+  if (stream) {
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'x-terminal-state': 'verified' })
+    res.end(
+      'data: {"type":"message_start","message":{"id":"msg_crag","type":"message","role":"assistant","content":[]}}\n\n' +
+        'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":"ok"}}\n\n' +
+        'data: {"type":"message_stop"}\n\n',
+    )
+  } else {
+    res.writeHead(200, { 'content-type': 'application/json', 'x-terminal-state': 'verified' })
+    res.end(JSON.stringify({ type: 'message', role: 'assistant', content: [{ type: 'text', text: 'ok' }] }))
+  }
+}
+
+for (const [name, dispatch, stream] of [
+  ['call', dispatchCallInference, false],
+  ['stream', dispatchStreamInference, true],
+]) {
+  unixTest(`${name} dispatch gates each CRAG field on final readiness, not the scheduler snapshot`, async () => {
+    const previous = process.env.KIN_KERNEL_BIN
+    const posted = []
+    const fx = await kernelFixture(async (req, res) => {
+      posted.push({ url: req.url, token: req.headers['x-kin-internal-token'], envelope: await readPostedEnvelope(req) })
+      respondToCragHop(res, stream)
+    })
+    process.env.KIN_KERNEL_BIN = '/bin/true'
+    const callerCwd = '/synthetic/router-workspace'
+    try {
+      for (const mode of ['append', 'replace']) {
+        const body = cragHopBody(mode)
+        for (const capabilities of [[], ...cragCapabilities.map((cap) => [cap]), cragCapabilities]) {
+          const label = `${mode}: ${capabilities.join(', ') || 'no capabilities'}`
+          const stale = cragHealth(cragCapabilities.filter((cap) => !capabilities.includes(cap)))
+          const result = await dispatch({
+            exec: { ...fx.exec, workerStatus: stale },
+            body: { ...body, stream },
+            callerCwd,
+            cliHop: true,
+            routing: { inference: { engine: 'rust' } },
+            ensureRust: async () => ({ ok: true, health: cragHealth(capabilities) }),
+            timeoutMs: 3000,
+          })
+          assert.equal(result.engine, 'rust', label)
+          assert.equal(result.ok, true, label)
+          assert.equal(posted.length, 1, label)
+          const { url, token, envelope } = posted.pop()
+          assert.equal(url, '/internal/v1/messages', label)
+          assert.equal(token, 'internal-test', label)
+          assert.equal(envelope.stream, stream, label)
+          assert.deepEqual(
+            envelope.body.crag_prompt,
+            capabilities.includes(`prompt_${mode}`) ? body.crag_prompt : undefined,
+            label,
+          )
+          assert.equal(
+            envelope.body.crag_model?.id,
+            capabilities.includes('model_directive') ? 'claude-haiku-4-5-20251001' : undefined,
+            label,
+          )
+          assert.equal(Object.hasOwn(envelope, 'caller_cwd'), capabilities.includes('caller_cwd'), label)
+          if (capabilities.includes('caller_cwd')) assert.equal(envelope.caller_cwd, callerCwd, label)
+          assert.equal(Object.hasOwn(envelope.body, 'caller_cwd'), false, label)
+          assert.equal(JSON.stringify(envelope.body).includes(callerCwd), false, label)
+        }
+      }
+    } finally {
+      if (previous == null) delete process.env.KIN_KERNEL_BIN
+      else process.env.KIN_KERNEL_BIN = previous
+      await fx.close()
+    }
+  })
+}
+
+unixTest('transport and credential retries preserve the readiness-gated CRAG envelope', async () => {
+  const previous = process.env.KIN_KERNEL_BIN
+  const posted = []
+  const fx = await kernelFixture(async (req, res) => {
+    posted.push(await readPostedEnvelope(req))
+    if (posted.length === 1) {
+      res.destroy()
+      return
+    }
+    if (posted.length === 2) {
+      res.writeHead(401, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ type: 'error', error: { code: 'needs_refresh', message: 'credential needs refresh' } }))
+      return
+    }
+    respondToCragHop(res, false)
+  })
+  process.env.KIN_KERNEL_BIN = '/bin/true'
+  const callerCwd = '/synthetic/retry-workspace'
+  const body = cragHopBody('replace')
+  let readyChecks = 0
+  let credentialEnsures = 0
+  try {
+    const result = await dispatchCallInference({
+      exec: { ...fx.exec, workerStatus: cragHealth(['prompt_append', 'model_directive']) },
+      body,
+      callerCwd,
+      cliHop: true,
+      routing: { inference: { engine: 'rust' } },
+      ensureRust: async () => {
+        readyChecks++
+        return { ok: true, health: cragHealth(['prompt_replace', 'caller_cwd']) }
+      },
+      ensureCredential: async (_exec, { force }) => {
+        credentialEnsures++
+        assert.equal(force, true)
+        return { ok: true }
+      },
+      timeoutMs: 3000,
+    })
+    assert.equal(result.ok, true)
+    assert.equal(result.credential_retried, true)
+    assert.equal(readyChecks, 1)
+    assert.equal(credentialEnsures, 1)
+    assert.equal(posted.length, 3)
+    const comparable = posted.map(({ request_id: _id, ...envelope }) => envelope)
+    assert.deepEqual(comparable[1], comparable[0], 'transport retry')
+    assert.deepEqual(comparable[2], comparable[0], 'credential retry')
+    assert.equal(comparable[0].caller_cwd, callerCwd)
+    assert.deepEqual(comparable[0].body.crag_prompt, body.crag_prompt)
+    assert.equal(Object.hasOwn(comparable[0].body, 'crag_model'), false)
+    assert.equal(Object.hasOwn(comparable[0].body, 'caller_cwd'), false)
+    assert.equal(JSON.stringify(comparable[0].body).includes(callerCwd), false)
+  } finally {
+    if (previous == null) delete process.env.KIN_KERNEL_BIN
+    else process.env.KIN_KERNEL_BIN = previous
+    await fx.close()
+  }
+})
+
+unixTest('managed CRAG retries consume the original queue deadline', async (t) => {
+  const previous = process.env.KIN_KERNEL_BIN
+  const posted = []
+  const tenantId = 'a'.repeat(64)
+  const startedAt = Date.now()
+  let now = startedAt
+  t.mock.method(Date, 'now', () => now)
+  const fx = await kernelFixture(async (req, res) => {
+    posted.push({ path: req.url, headers: req.headers, envelope: await readPostedEnvelope(req) })
+    if (posted.length === 1) {
+      now += 300
+      res.destroy()
+    } else if (posted.length === 2) {
+      res.writeHead(401, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ type: 'error', error: { code: 'needs_refresh', message: 'credential needs refresh' } }))
+    } else {
+      // JSON headers arrive after the first-byte budget, as they can on native CRAG.
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      respondToCragHop(res, false)
+    }
+  })
+  process.env.KIN_KERNEL_BIN = '/bin/true'
+  try {
+    const result = await dispatchCallInference({
+      exec: { ...fx.exec, workerStatus: cragHealth([]) },
+      envelope: {
+        body: { ...cragHopBody('append'), gateway_policy: { queue_wait_ms: 5000 } },
+        headers: { 'X-Tenant-ID': 'prebuilt-tenant' },
+        gateway_policy: { queue_wait_ms: 5000 },
+      },
+      reqHeaders: { 'x-tenant-id': 'inbound-tenant' },
+      routing: { inference: { engine: 'rust', session_idle_ttl_seconds: 75 } },
+      tenantId,
+      slotWaitMs: 1000,
+      slotWaitDeadlineMs: startedAt + 1000,
+      timeoutMs: 1,
+      idleTimeoutMs: 25_000.4,
+      ensureRust: async () => {
+        now += 200
+        return { ok: true, health: { ...cragHealth([]), gateway_policy_v1: true } }
+      },
+      ensureCredential: async () => {
+        now += 600
+        return { ok: true }
+      },
+    })
+    assert.equal(result.ok, true)
+    assert.equal(result.credential_retried, true)
+    assert.equal(posted.length, 3)
+    for (const [i, hop] of posted.entries()) {
+      assert.equal(hop.path, '/internal/v1/messages')
+      assert.equal(hop.headers['x-kin-internal-token'], 'internal-test')
+      assert.equal(hop.headers['x-tenant-id'], tenantId)
+      assert.equal(Object.hasOwn(hop.envelope.body, 'gateway_policy'), false)
+      assert.equal(Object.hasOwn(hop.envelope.headers, 'X-Tenant-ID'), false)
+      assert.deepEqual(hop.envelope.gateway_policy, {
+        queue_wait_ms: [800, 500, 0][i],
+        first_byte_timeout_ms: 1,
+        stream_idle_timeout_ms: 25_000,
+        session_idle_ttl_seconds: 75,
+      })
+    }
+  } finally {
+    if (previous == null) delete process.env.KIN_KERNEL_BIN
+    else process.env.KIN_KERNEL_BIN = previous
+    await fx.close()
+  }
+})
+
+unixTest('only exact managed queue errors become local slot rejections', async () => {
+  const previous = process.env.KIN_KERNEL_BIN
+  const native = { ...cragHealth([]), gateway_policy_v1: true, ready: true, ready_slots: 0 }
+  const legacy = cragHealth([])
+  const replies = [
+    { status: 503, type: 'overloaded_error', message: 'runtime queue is full', busy: true },
+    { status: 504, type: 'timeout_error', message: 'runtime queue timeout', busy: true },
+    { status: 504, type: 'timeout_error', message: 'upstream first byte timeout' },
+    { status: 504, type: 'timeout_error', message: 'runtime queue timeout', legacy: true },
+  ]
+  let health = native
+  const posted = []
+  const fx = await kernelFixture(async (req, res) => {
+    if (req.url === '/internal/health') {
+      res.end(JSON.stringify(health))
+      return
+    }
+    const reply = replies[posted.length]
+    posted.push({ headers: req.headers, envelope: await readPostedEnvelope(req) })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    res.writeHead(reply.status, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ type: 'error', error: { type: reply.type, message: reply.message } }))
+  })
+  process.env.KIN_KERNEL_BIN = '/bin/true'
+  try {
+    for (const [i, reply] of replies.entries()) {
+      health = reply.legacy ? legacy : native
+      const dispatch = i === 0 ? dispatchCallInference : dispatchStreamInference
+      const result = await dispatch({
+        exec: { ...fx.exec, workerStatus: reply.legacy ? native : legacy },
+        body: { ...cragHopBody('append'), gateway_policy: { queue_wait_ms: 5000 } },
+        reqHeaders: { 'x-tenant-id': 'inbound-tenant' },
+        routing: { inference: { engine: 'rust', health_ttl_ms: 0 } },
+        deliveryMode: 'verified',
+        slotWaitDeadlineMs: Date.now(),
+        timeoutMs: reply.legacy ? 3000 : 1,
+      })
+      assert.equal(result.status, reply.status)
+      assert.equal(result.body.error.code, reply.busy ? 'slot_busy' : undefined)
+      assert.equal(result.upstreamExecutions, reply.busy ? 0 : undefined)
+      if (reply.busy) assert.equal(result.terminalState, 'rejected')
+      assert.equal(posted[i].envelope.gateway_policy?.queue_wait_ms, reply.legacy ? undefined : 0)
+      assert.equal(Object.hasOwn(posted[i].envelope.body, 'gateway_policy'), false)
+      assert.equal(posted[i].headers['x-tenant-id'], undefined)
+    }
+    assert.equal(posted.length, replies.length)
+  } finally {
+    clearRustHealthCache(fx.exec.vmId)
+    if (previous == null) delete process.env.KIN_KERNEL_BIN
+    else process.env.KIN_KERNEL_BIN = previous
+    await fx.close()
+  }
+})
+
+unixTest('recovering native worker does not poll beyond the original slot budget', async () => {
+  const previous = process.env.KIN_KERNEL_BIN
+  let probes = 0
+  const fx = await kernelFixture((req, res) => {
+    assert.equal(req.url, '/internal/health')
+    probes++
+    res.end(JSON.stringify({ ...cragHealth([]), gateway_policy_v1: true, recovering: true, ready_slots: 0 }))
+  })
+  process.env.KIN_KERNEL_BIN = '/bin/true'
+  try {
+    const result = await dispatchCallInference({
+      exec: fx.exec,
+      body: cragHopBody('append'),
+      routing: { inference: { engine: 'rust', health_ttl_ms: 0 } },
+      slotWaitMs: 1000,
+      slotWaitDeadlineMs: Date.now() - 1,
+    })
+    assert.equal(result.body.error.code, 'slot_busy')
+    assert.equal(probes, 1)
+  } finally {
+    if (previous == null) delete process.env.KIN_KERNEL_BIN
+    else process.env.KIN_KERNEL_BIN = previous
+    await fx.close()
+  }
+})
+
+unixTest('managed timeout SSE remains a timeout before and after downstream commit', async () => {
+  const previous = process.env.KIN_KERNEL_BIN
+  let visible = false
+  const fx = await kernelFixture(async (req, res) => {
+    await readPostedEnvelope(req)
+    res.writeHead(200, { 'content-type': 'text/event-stream' })
+    res.write('data: {"type":"message_start","message":{"content":[]}}\n\n')
+    if (visible)
+      res.write('data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}\n\n')
+    res.end('data: {"type":"error","error":{"type":"timeout_error","message":"request timed out"}}\n\n')
+  })
+  process.env.KIN_KERNEL_BIN = '/bin/true'
+  try {
+    const dispatch = () =>
+      dispatchStreamInference({
+        exec: fx.exec,
+        body: cragHopBody('append'),
+        routing: { inference: { engine: 'rust' } },
+        timeoutMs: 3000,
+        ensureRust: async () => ({ ok: true, health: { ...cragHealth([]), gateway_policy_v1: true } }),
+      })
+    const uncommitted = await dispatch()
+    assert.equal(uncommitted.committed, false)
+    assert.equal(uncommitted.status, 504)
+    assert.equal(uncommitted.terminalState, 'rejected')
+    assert.equal(uncommitted.body.error.type, 'timeout_error')
+    visible = true
+    const committed = await dispatch()
+    assert.equal(committed.committed, true)
+    assert.equal(committed.status, 200)
+    assert.equal(committed.terminalState, 'incomplete')
+    assert.equal(committed.body.error.type, 'timeout_error')
+  } finally {
+    if (previous == null) delete process.env.KIN_KERNEL_BIN
+    else process.env.KIN_KERNEL_BIN = previous
+    await fx.close()
+  }
+})
+
+unixTest('managed realtime header timeout is not replayed', async (t) => {
+  const previous = process.env.KIN_KERNEL_BIN
+  let posts = 0
+  let expireHeaderTimer
+  const fx = await kernelFixture(async (req, res) => {
+    await readPostedEnvelope(req)
+    posts++
+    if (expireHeaderTimer) expireHeaderTimer()
+    else respondToCragHop(res, true)
+  })
+  process.env.KIN_KERNEL_BIN = '/bin/true'
+  const schedule = globalThis.setTimeout
+  const headerTimers = t.mock.method(globalThis, 'setTimeout', (fn, ms, ...args) => {
+    if (ms === 5001) expireHeaderTimer = fn
+    return schedule(fn, ms, ...args)
+  })
+  try {
+    const result = await dispatchStreamInference({
+      exec: fx.exec,
+      body: cragHopBody('append'),
+      routing: { inference: { engine: 'rust' } },
+      slotWaitDeadlineMs: Date.now(),
+      timeoutMs: 1,
+      ensureRust: async () => ({ ok: true, health: { ...cragHealth([]), gateway_policy_v1: true } }),
+    })
+    assert.equal(result.body.error.code, 'worker_timeout')
+    assert.equal(result.rust_transport_retried, undefined)
+    assert.equal(headerTimers.mock.calls.filter(({ arguments: [, ms] }) => ms === 5001).length, 1)
+    assert.equal(posts, 1)
+  } finally {
+    if (previous == null) delete process.env.KIN_KERNEL_BIN
+    else process.env.KIN_KERNEL_BIN = previous
+    await fx.close()
+  }
+})
 
 unixTest('dispatchStreamInference uses rust socket when ready', async () => {
   const prev = process.env.KIN_KERNEL_BIN
@@ -634,12 +1012,32 @@ test('writeKernelConfig separates container paths from host socket paths', () =>
   assert.equal(doc.https_proxy, undefined)
   assert.equal(doc.slots_per_worker, WRAP_SLOT_MAX)
   assert.equal(doc.default_cache_ttl, '1h')
+  assert.equal(doc.thinking_display, 'summarized')
   assert.equal(doc.auto_compact_window, null)
   assert.match(written.socketPath.replace(/\\/g, '/'), /vms\/vm-09\/run\/kernel\.sock$/)
   assert.equal(fs.readFileSync(written.tokenPath, 'utf8').trim(), 'tok')
   const exec = { vmId: 'vm-09', homeDir: path.join(root, 'vms', 'vm-09', 'cli-home'), vm: { id: 'vm-09' } }
   assert.equal(rustKernelPaths(exec).socketPath, written.socketPath)
   fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('writeKernelConfig projects thinking display and preserves it only without routing', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-thinking-cfg-'))
+  const vm = { id: 'vm-09' }
+  const displayOf = (options = {}) => {
+    const written = writeKernelConfig(root, vm, { token: 'tok', ...options })
+    return JSON.parse(fs.readFileSync(written.configPath, 'utf8')).thinking_display
+  }
+  try {
+    assert.equal(displayOf(), 'summarized')
+    assert.equal(displayOf({ routing: { compatibility: { thinking_display: 'passthrough' } } }), 'passthrough')
+    assert.equal(displayOf(), 'passthrough')
+    assert.equal(displayOf({ routing: {} }), 'summarized')
+    assert.equal(displayOf({ routing: { compatibility: { thinking_display: 'invalid' } } }), 'summarized')
+    assert.equal(displayOf(), 'summarized')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })
 
 test('model effort changes rewrite kernel.json without a routing save or restart', () => {
@@ -744,15 +1142,91 @@ test('writeKernelConfig cli-hop writes local_cli without secrets', () => {
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-test('writeKernelConfig points cc and crag at cc-node', () => {
+test('writeKernelConfig points cc at cc-node and crag at native Claude', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-cc-cfg-'))
   try {
-    for (const dataplane of ['cc', 'crag']) {
-      const written = writeKernelConfig(root, { id: 'vm-09', dataplane }, { token: 'tok' })
-      const doc = JSON.parse(fs.readFileSync(written.configPath, 'utf8'))
-      assert.equal(doc.dataplane, dataplane)
-      assert.equal(doc.claude_bin, '/home/kincli/.kin/cc-node')
-    }
+    const cc = JSON.parse(
+      fs.readFileSync(writeKernelConfig(root, { id: 'vm-09', dataplane: 'cc' }, { token: 'tok' }).configPath, 'utf8'),
+    )
+    assert.equal(cc.dataplane, 'cc')
+    assert.equal(cc.claude_bin, '/home/kincli/.kin/cc-node')
+    const crag = JSON.parse(
+      fs.readFileSync(writeKernelConfig(root, { id: 'vm-09', dataplane: 'crag' }, { token: 'tok' }).configPath, 'utf8'),
+    )
+    assert.equal(crag.dataplane, 'crag')
+    assert.equal(crag.claude_bin, '/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude')
+    assert.equal(crag.crag_kernel_version, 'v2')
+    assert.equal(crag.runtime_variant, 'crag-v2')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('writeKernelConfig adds CRAG v2 fields for a local slot and a cluster Docker slot', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-crag-v2-cfg-'))
+  try {
+    const legacy = JSON.parse(
+      fs.readFileSync(writeKernelConfig(root, { id: 'vm-09', dataplane: 'crag' }, { token: 'tok' }).configPath, 'utf8'),
+    )
+    assert.equal(legacy.claude_bin, '/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude')
+    assert.equal(legacy.crag_kernel_version, 'v2')
+    assert.equal(legacy.runtime_variant, 'crag-v2')
+    assert.equal(legacy.license_dir, '/run/kin/crag-license')
+    const v2 = JSON.parse(
+      fs.readFileSync(
+        writeKernelConfig(root, { id: 'vm-09', dataplane: 'crag', crag_kernel_version: 'v2' }, { token: 'tok' })
+          .configPath,
+        'utf8',
+      ),
+    )
+    assert.equal(v2.dataplane, 'crag')
+    assert.equal(v2.claude_bin, '/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude')
+    assert.equal(v2.crag_kernel_version, 'v2')
+    assert.equal(v2.runtime_variant, 'crag-v2')
+    assert.equal(v2.license_dir, '/run/kin/crag-license')
+    assert.equal(v2.crag_v2_root, undefined)
+    assert.equal(v2.node_bin, undefined)
+    assert.equal(v2.telemetry.identity, undefined)
+    const enabled = JSON.parse(
+      fs.readFileSync(
+        writeKernelConfig(
+          root,
+          {
+            id: 'vm-09',
+            dataplane: 'crag',
+            crag_kernel_version: 'v2',
+            kernel: 'ubuntu-24.04',
+            seed_policy: { telemetry_disabled: false },
+          },
+          { token: 'tok' },
+        ).configPath,
+        'utf8',
+      ),
+    )
+    assert.equal(enabled.telemetry.enabled, true)
+    assert.equal(enabled.telemetry.dmi_dir, '/etc/kin-dmi')
+    assert.equal(enabled.telemetry.identity.enabled, true)
+    assert.equal(enabled.telemetry.identity.linux_distro_id, 'ubuntu')
+    assert.equal(enabled.telemetry.identity.linux_distro_version, '24.04')
+    assert.equal(enabled.telemetry.identity.linux_kernel, '6.8.0-51-generic')
+    assert.equal(enabled.telemetry.identity.shell, '/bin/bash')
+    assert.equal(enabled.telemetry.identity.terminal, 'xterm-256color')
+    assert.equal(enabled.telemetry.identity.package_managers, 'apt')
+    const remote = JSON.parse(
+      fs.readFileSync(
+        writeKernelConfig(
+          root,
+          { id: 'vm-09', dataplane: 'crag', crag_kernel_version: 'v2', node_id: 'node-1' },
+          { token: 'tok' },
+        ).configPath,
+        'utf8',
+      ),
+    )
+    assert.equal(remote.crag_kernel_version, 'v2')
+    assert.equal(remote.runtime_variant, 'crag-v2')
+    assert.equal(remote.claude_bin, '/opt/kin-live/crag-v2/claude-code-2.1.321/claude')
+    assert.equal(remote.license_dir, '/run/kin/crag-license')
+    assert.equal(remote.asset_dir, '/run/kin/crag-native-assets')
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
@@ -1108,6 +1582,58 @@ test('writeKernelConfig cli-hop native slots ignore live 并行', () => {
   fs.rmSync(root, { recursive: true, force: true })
 })
 
+unixTest('Rust supervisor retires legacy telemetry without root docker exec', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-retire-user-'))
+  const written = writeKernelConfig(
+    root,
+    { id: 'vm-retire-user' },
+    { token: 'tok', proxyUrl: '', proxyRequired: false },
+  )
+  const exec = {
+    vmId: 'vm-retire-user',
+    homeDir: path.join(root, 'vms', 'vm-retire-user', 'cli-home'),
+    vm: {
+      id: 'vm-retire-user',
+      runtime: { container: 'kin-retire-user', kernel_socket: written.socketPath },
+    },
+  }
+  let readySlots = 0
+  let server = null
+  const serve = async () => {
+    if (server) await new Promise((resolve) => server.close(resolve))
+    server = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: readySlots, worker_version: 'fixture' }))
+    })
+    await new Promise((resolve, reject) => {
+      server.once('error', reject)
+      server.listen(written.socketPath, resolve)
+    })
+  }
+  const execCalls = []
+  const runDockerExec = async (args) => {
+    execCalls.push(args)
+    if (args[0] === 'inspect') return kernelInspectResult()
+    if (args[0] === 'restart' && args[1] === 'kin-retire-user') {
+      readySlots = 1
+      await serve()
+    }
+    return { ok: true }
+  }
+  await serve()
+  try {
+    const ready = await ensureRustKernel(exec, { timeoutMs: 8000, runDockerExec })
+    assert.equal(ready.ok, true, JSON.stringify(ready))
+    const retireArgv = execCalls.find((args) => args[0] === 'exec' && args.includes('sh'))
+    assert.ok(retireArgv, execCalls.map((args) => args.slice(0, 6)).join('\n'))
+    assert.equal(retireArgv.includes('-u'), false)
+    assert.equal(retireArgv[1], 'kin-retire-user')
+  } finally {
+    if (server) await new Promise((resolve) => server.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 unixTest('Rust supervisor recycles when ready_slots stay at 0', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-wedged-'))
   const written = writeKernelConfig(root, { id: 'vm-wedged' }, { token: 'tok', proxyUrl: '', proxyRequired: false })
@@ -1134,7 +1660,7 @@ unixTest('Rust supervisor recycles when ready_slots stay at 0', async () => {
     })
   }
   const runDockerExec = async (args) => {
-    if (args[0] === 'inspect') return { ok: true, stdout: '/home/kincli/.kin/kin-kernel' }
+    if (args[0] === 'inspect') return kernelInspectResult()
     if (args[0] === 'restart' && args[1] === 'kin-wedged') {
       restarts += 1
       readySlots = 1
@@ -1170,7 +1696,7 @@ unixTest('Rust supervisor does not recycle a busy CLI with ready_slots=0', async
     res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: 0, cli_pid: 4412, worker_version: 'fixture' }))
   })
   const runDockerExec = async (args) => {
-    if (args[0] === 'inspect') return { ok: true, stdout: '/home/kincli/.kin/kin-kernel' }
+    if (args[0] === 'inspect') return kernelInspectResult()
     if (args[0] === 'restart') restarts += 1
     return { ok: true }
   }
@@ -1183,6 +1709,43 @@ unixTest('Rust supervisor does not recycle a busy CLI with ready_slots=0', async
     assert.equal(ready.ok, true, JSON.stringify(ready))
     assert.equal(ready.reason, 'busy')
     assert.equal(restarts, 0)
+  } finally {
+    await new Promise((resolve) => server.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+unixTest('Rust supervisor honors a longer preflight timeout for a slow kernel response', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-slow-remote-'))
+  const vm = { id: 'vm-slow-remote' }
+  const written = writeKernelConfig(root, vm, { token: 'tok', proxyUrl: '', proxyRequired: false })
+  const homeDir = path.join(root, 'vms', vm.id, 'cli-home')
+  const exec = {
+    vmId: vm.id,
+    homeDir,
+    vm: {
+      ...vm,
+      runtime: { container: 'kin-slow-remote', kernel_socket: written.socketPath },
+    },
+  }
+  const server = http.createServer((_req, res) => {
+    setTimeout(() => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: 1, worker_version: 'fixture' }))
+    }, 900)
+  })
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(written.socketPath, resolve)
+  })
+  try {
+    const ready = await ensureRustKernel(exec, {
+      timeoutMs: 3000,
+      healthTimeoutMs: 2000,
+      runDockerExec: async () => ({ ok: true }),
+    })
+    assert.equal(ready.ok, true, JSON.stringify(ready))
+    assert.equal(ready.reason, 'already_up')
   } finally {
     await new Promise((resolve) => server.close(resolve))
     fs.rmSync(root, { recursive: true, force: true })
@@ -1219,7 +1782,7 @@ for (const state of ['idle', 'partly occupied', 'full']) {
     const commands = []
     const runDockerExec = async (args) => {
       commands.push(args)
-      if (args[0] === 'inspect') return { ok: true, stdout: '/home/kincli/.kin/kin-kernel' }
+      if (args[0] === 'inspect') return kernelInspectResult()
       if (args[0] === 'restart') return { ok: false, error: 'unexpected restart' }
       return { ok: true }
     }
@@ -1287,7 +1850,7 @@ unixTest('Rust supervisor launches the gateway worker with docker restart', asyn
   }
   let server = null
   const runDockerExec = async (args) => {
-    if (args[0] === 'inspect') return { ok: true, stdout: '/home/kincli/.kin/kin-kernel' }
+    if (args[0] === 'inspect') return kernelInspectResult()
     if (args[0] === 'restart' && args[1] === 'kin-container') {
       server = http.createServer((_req, res) => {
         res.writeHead(200, { 'content-type': 'application/json' })
@@ -1325,7 +1888,7 @@ unixTest('pid1 kernel already booting is not docker-restarted', async () => {
   let restarts = 0
   let server = null
   const runDockerExec = async (args) => {
-    if (args[0] === 'inspect') return { ok: true, stdout: '/home/kincli/.kin/kin-kernel' }
+    if (args[0] === 'inspect') return kernelInspectResult()
     if (args[0] === 'restart') {
       restarts += 1
       return { ok: true }
@@ -1349,6 +1912,63 @@ unixTest('pid1 kernel already booting is not docker-restarted', async () => {
   }
 })
 
+unixTest('wrapped PID1 recovery restarts the container instead of detaching a second kernel', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-wrapped-pid1-'))
+  const written = writeKernelConfig(
+    root,
+    { id: 'vm-wrapped-pid1' },
+    { token: 'tok', proxyUrl: '', proxyRequired: false },
+  )
+  const exec = {
+    vmId: 'vm-wrapped-pid1',
+    homeDir: path.join(root, 'vms', 'vm-wrapped-pid1', 'cli-home'),
+    vm: {
+      id: 'vm-wrapped-pid1',
+      runtime: { container: 'kin-wrapped-pid1', kernel_socket: written.socketPath },
+    },
+  }
+  const wrapped = [
+    '/bin/sh',
+    '-c',
+    'export TOKIO_WORKER_THREADS=2; exec "$@"',
+    'kin-kernel-cpu',
+    '/home/kincli/.kin/kin-kernel',
+    '--gateway-worker',
+    '--config',
+    '/run/kin/kernel.json',
+  ]
+  const calls = []
+  let server = null
+  const runDockerExec = async (args) => {
+    calls.push(args)
+    if (args[0] === 'inspect') return kernelInspectResult(wrapped[0], wrapped.slice(1))
+    if (args[0] === 'restart' && args[1] === 'kin-wrapped-pid1') {
+      server = http.createServer((_req, res) => {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: 1, worker_version: 'fixture' }))
+      })
+      await new Promise((resolve, reject) => {
+        server.once('error', reject)
+        server.listen(written.socketPath, resolve)
+      })
+    }
+    return { ok: true }
+  }
+
+  try {
+    const ready = await ensureRustKernel(exec, { timeoutMs: 1000, healthTimeoutMs: 200, runDockerExec })
+    assert.equal(ready.ok, true, JSON.stringify(ready))
+    assert.equal(calls.filter((args) => args[0] === 'restart').length, 1)
+    assert.equal(
+      calls.some((args) => args.includes('-d')),
+      false,
+    )
+  } finally {
+    if (server) await new Promise((resolve) => server.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 unixTest('concurrent Rust ensures issue one docker restart', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-concurrent-'))
   const written = writeKernelConfig(root, { id: 'vm-concurrent' }, { token: 'tok', proxyUrl: '', proxyRequired: false })
@@ -1360,7 +1980,7 @@ unixTest('concurrent Rust ensures issue one docker restart', async () => {
   let starts = 0
   let server = null
   const runDockerExec = async (args) => {
-    if (args[0] === 'inspect') return { ok: true, stdout: '/home/kincli/.kin/kin-kernel' }
+    if (args[0] === 'inspect') return kernelInspectResult()
     if (args[0] === 'restart' && args[1] === 'kin-concurrent') {
       starts += 1
       server = http.createServer((_req, res) => {
@@ -1417,6 +2037,7 @@ unixTest('Rust supervisor fails fast when kernel process never stays up', async 
     assert.equal(ready.reason, 'start_failed')
     assert.ok(Date.now() - started < 3500)
     assert.ok(calls.some((args) => args.map(String).join(' ').includes('pgrep') || args.includes('pidof')))
+    assert.ok(calls.some((args) => args.includes('-d')))
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
@@ -1446,5 +2067,51 @@ test('writeKernelConfig gates local upstream endpoints behind test mode', () => 
     if (previous.oauth == null) delete process.env.KIN_OAUTH_TOKEN_URL
     else process.env.KIN_OAUTH_TOKEN_URL = previous.oauth
     fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('native V2 idle reload distinguishes runnable ceiling from live tool waits', async () => {
+  const exec = { vmId: 'vm-native-idle' }
+  const restarts = []
+  let status = {
+    ok: true,
+    runtime_variant: 'crag-v2',
+    capacity: 20,
+    runnable_capacity: 4,
+    ready_slots: 3,
+    active: 0,
+    waiting: 1,
+    queued: 0,
+    pids: [42],
+  }
+  let observed
+  const firstProbe = new Promise((resolve) => {
+    observed = resolve
+  })
+  let timer
+  try {
+    const request = requestKernelReloadWhenIdle(exec, {
+      pollMs: 10,
+      health: async () => {
+        const snapshot = status
+        observed()
+        return snapshot
+      },
+      restart: async (target) => {
+        restarts.push(target.vmId)
+        return { ok: true }
+      },
+    })
+    await firstProbe
+    assert.deepEqual(restarts, [])
+    status = { ...status, ready_slots: 4, waiting: 0, pids: [] }
+    const deadline = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('native idle reload did not complete')), 3000)
+    })
+    assert.deepEqual(await Promise.race([request.done, deadline]), { ok: true })
+    assert.deepEqual(restarts, ['vm-native-idle'])
+  } finally {
+    clearTimeout(timer)
+    resetWrapRecycleState()
   }
 })

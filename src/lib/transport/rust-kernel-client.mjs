@@ -3,7 +3,22 @@
  * go-worker-client; the socket is run/kernel.sock instead of worker.sock.
  */
 import path from 'node:path'
-import { callGoWorker, streamGoWorker, workerHealth, workerPaths } from './go-worker-client.mjs'
+import {
+  callGoWorker,
+  callWorkerPost,
+  credentialSummary,
+  streamGoWorker,
+  workerHealth,
+  workerPaths,
+} from './go-worker-client.mjs'
+import { readWorkerCredentialFile } from '../oauth/oauth-credentials.mjs'
+import { cragV2KernelActive } from '../protocol/crag-print-prompt.mjs'
+import { checkCragLicense, cragLicenseDeniedResult } from '../vm/crag-license.mjs'
+
+function licenseCheck(opts) {
+  const root = opts.exec?.projectRoot || (opts.exec?.homeDir ? path.resolve(opts.exec.homeDir, '../../..') : '')
+  return checkCragLicense(root, opts.exec?.vm, opts.routing)
+}
 
 export function rustKernelPaths(exec = {}) {
   const base = workerPaths(exec)
@@ -41,19 +56,51 @@ function remapVia(result) {
 }
 
 export async function callRustKernel(opts = {}) {
+  const licensed = licenseCheck(opts)
+  if (!licensed.ok) return cragLicenseDeniedResult(licensed)
   return remapVia(await callGoWorker({ ...opts, exec: withRustKernelExec(opts.exec) }))
 }
 
 export async function streamRustKernel(opts = {}) {
+  const licensed = licenseCheck(opts)
+  if (!licensed.ok) return cragLicenseDeniedResult(licensed)
   return remapVia(await streamGoWorker({ ...opts, exec: withRustKernelExec(opts.exec) }))
+}
+
+export async function postRustKernelTelemetryEvent(exec, event, options = {}) {
+  return remapVia(await callWorkerPost(withRustKernelExec(exec), '/internal/v1/telemetry/events', event, options))
+}
+
+export function withCragCredential(exec, health) {
+  if (!health || health.credential) return health
+  const native = health.runtime_variant === 'crag-v2' || (health.dataplane === 'crag' && health.kernel_version === 'v2')
+  if (!native) return health
+  const file = readWorkerCredentialFile(exec?.homeDir)
+  if (!file) return health
+  return { ...health, credential: credentialSummary(file) }
 }
 
 export async function rustKernelHealth(exec, opts = {}) {
   const health = await workerHealth(withRustKernelExec(exec), opts)
-  if (health?.source) {
-    return { ...health, source: String(health.source).replace(/go-worker/g, 'rust-kernel') }
-  }
-  return health
+  const reported = health?.source
+    ? { ...health, source: String(health.source).replace(/go-worker/g, 'rust-kernel') }
+    : health
+  return withCragCredential(exec, reported)
+}
+
+export function supportsGatewayPolicy(health) {
+  return health?.gateway_policy_v1 === true && cragV2KernelActive({ health })
+}
+
+export function gatewayPolicyReady(health) {
+  return (
+    supportsGatewayPolicy(health) &&
+    health.ok === true &&
+    (health.status == null || health.status === 200) &&
+    health.healthy !== false &&
+    health.ready !== false &&
+    health.recovering !== true
+  )
 }
 
 export function rustKernelProcessUp(health) {
@@ -89,9 +136,11 @@ export function rustKernelReachable(health) {
   return rustKernelProcessUp(health) && health?.healthy !== false && rustKernelCliReady(health)
 }
 
-/** Only the container restart (L4) can help: the kernel is gone or gave up on its CLI. */
+/** Only the container restart (L4) can help: the kernel is gone, gave up on CLI, or all slots are closed. */
 export function rustKernelNeedsRestart(health) {
-  return !rustKernelProcessUp(health) || health?.healthy === false
+  if (!rustKernelProcessUp(health) || health?.healthy === false) return true
+  if (health?.ready_slots === 0 && Number(health?.closed_slots) > 0) return true
+  return false
 }
 
 /**
@@ -104,6 +153,25 @@ function finiteNumber(value) {
   if (value == null || value === '') return null
   const n = Number(value)
   return Number.isFinite(n) ? n : null
+}
+
+const TELEMETRY_STATES = new Set(['disabled', 'idle', 'waiting_credentials', 'waiting_egress', 'uploading', 'error'])
+
+export function toPublicTelemetryState(value) {
+  if (!value || typeof value.enabled !== 'boolean' || !TELEMETRY_STATES.has(value.state)) return null
+  const pending = finiteNumber(value.pending_events)
+  if (!Number.isInteger(pending) || pending < 0) return null
+  return {
+    enabled: value.enabled,
+    state: value.state,
+    pending_events: pending,
+    last_upload_at:
+      typeof value.last_upload_at === 'string' && Number.isFinite(Date.parse(value.last_upload_at))
+        ? value.last_upload_at
+        : null,
+    last_error:
+      typeof value.last_error === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(value.last_error) ? value.last_error : null,
+  }
 }
 
 /**
@@ -133,6 +201,9 @@ export function toPublicKernelHealth(health, engine) {
     healthy: health?.healthy !== false,
     unhealthy_reason: health?.unhealthy_reason || null,
     cli_pid: finiteNumber(health?.cli_pid),
+    vm_telemetry: health?.vm_telemetry === true,
+    telemetry_ready: health?.telemetry_ready === true,
+    telemetry: toPublicTelemetryState(health?.telemetry),
     error_code: reachable ? null : health?.code || `${engine}_worker_unavailable`,
   }
 }
@@ -142,6 +213,7 @@ export function isNeedsRefreshResult(result) {
   const code = String(result?.body?.error?.code || result?.error?.code || '')
   const message = String(result?.body?.error?.message || result?.error?.message || '')
   const hay = `${code} ${message}`
+  if (code.startsWith('license_')) return false
   if (code === 'needs_refresh' || /needs_refresh/i.test(hay)) return true
   if (status === 401) return true
   if (/authentication_error|token has been revoked|oauth_revoked|invalid_grant/i.test(hay)) return true

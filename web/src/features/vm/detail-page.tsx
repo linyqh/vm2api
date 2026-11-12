@@ -6,9 +6,14 @@ import {
   useQueryClient,
 } from '@tanstack/react-query'
 import { Link, useNavigate, useParams } from '@tanstack/react-router'
-import type { Vm, VmKernelSnapshot, VmProxySnap } from '@/types/panel-vm'
+import type {
+  Vm,
+  VmKernelSnapshot,
+  VmProxySnap,
+  VmSeedSettings,
+} from '@/types/panel-vm'
 import { toast } from 'sonner'
-import { api } from '@/lib/api'
+import { api, isApiError } from '@/lib/api'
 import {
   canRefreshCredential,
   credTypeOf,
@@ -56,7 +61,6 @@ import { StatusMark } from '@/components/status-mark'
 import { dashboardQueryOptions } from '@/features/overview/queries'
 import { proxiesForVmBind } from '@/features/proxies/proxy-sort'
 import { proxiesQueryOptions } from '@/features/proxies/queries'
-import { routingQueryOptions } from '@/features/settings/queries'
 import {
   planDeleteActiveVm,
   type DeleteActiveVmPlan,
@@ -84,8 +88,10 @@ import {
   vmSchedulableProps,
 } from '@/features/vm/schedulable-switch'
 import { SeedPolicyCard } from '@/features/vm/seed-policy-card'
+import { seedSaveState } from '@/features/vm/seed-settings'
 import { usePoolSeatStream } from '@/features/vm/use-pool-seat-stream'
 import { useVmTestChat } from '@/features/vm/use-vm-test-chat'
+import { VmNameField } from '@/features/vm/vm-name-field'
 import {
   pickBindTarget,
   useVmPerms,
@@ -160,7 +166,6 @@ function VmDetailBody({
       !isAntigravityVm(detail.data.vm),
     refetchInterval: seedDebug && wantedTab === 'seed' ? 2000 : false,
   })
-  const routing = useQuery({ ...routingQueryOptions(), enabled: perms.admin })
   usePoolSeatStream()
 
   const [bindId, setBindId] = useState('')
@@ -238,6 +243,8 @@ function VmDetailBody({
           else toast.warning(boot.message)
         } else if (path === '/stop') {
           toast.success('已关机，调度已关闭')
+        } else if (path === '/deactivate') {
+          toast.success('已取消活跃')
         } else if (path === '/activate') {
           toast.success('已设为活跃槽')
         } else {
@@ -263,15 +270,36 @@ function VmDetailBody({
     },
     onError: (error: Error) => toast.error(error.message),
   })
+  const saveName = useMutation({
+    mutationFn: (name: string) =>
+      api(`/api/panel/vms/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ name }),
+      }),
+    onSuccess: async () => {
+      toast.success('已保存名称')
+      await refreshAll()
+    },
+    onError: (error: Error) => toast.error(error.message),
+  })
 
   const saveSeed = useMutation({
     mutationFn: (body: Record<string, unknown>) =>
-      api(`/api/panel/vms/${encodeURIComponent(id)}/seed-settings`, {
-        method: 'PUT',
-        body: JSON.stringify(body),
-      }),
-    onSuccess: async () => {
-      toast.success('已播种')
+      api<VmSeedSettings>(
+        `/api/panel/vms/${encodeURIComponent(id)}/seed-settings`,
+        {
+          method: 'PUT',
+          body: JSON.stringify(body),
+        }
+      ),
+    onSuccess: async (result) => {
+      const state = seedSaveState(result)
+      if (state === 'applied') toast.success('播种已发布，VM 已确认生效')
+      else if (state === 'published')
+        toast.info('播种文件已发布，等待 VM 启动或确认')
+      else if (state === 'unsupported')
+        toast.warning('播种已保存；此环境不支持 VM 原生遥测')
+      else toast.warning('策略已保存，原生生效状态尚未确认')
       await refreshAll()
       await qc.invalidateQueries({
         queryKey: ['panel', 'vm', id, 'seed'],
@@ -280,7 +308,14 @@ function VmDetailBody({
         queryKey: ['panel', 'vm', id, 'seed-upload-log'],
       })
     },
-    onError: (error: Error) => toast.error(error.message),
+    onError: async (error: Error) => {
+      const state = seedSaveState(isApiError(error) ? error.data : null)
+      if (state !== 'unknown')
+        toast.warning(`策略已保存，发布或原生确认未完成：${error.message}`)
+      else toast.error(`播种失败：${error.message}`)
+      await refreshAll()
+      await qc.invalidateQueries({ queryKey: ['panel', 'vm', id, 'seed'] })
+    },
   })
   const deletePlan: DeleteActiveVmPlan = planDeleteActiveVm(vm, slotList)
   const remove = useMutation({
@@ -323,9 +358,6 @@ function VmDetailBody({
   // 本地代理固定第一。已绑到本槽的留在下拉里，否则正在用它时列表里没有。
   const free = proxiesForVmBind(pool, id, 5, vm.node_id ?? null)
   const bindTarget = pickBindTarget(bindId, free)
-  const syncTelemetry =
-    (routing.data?.official_cc as { sync_telemetry?: boolean } | undefined)
-      ?.sync_telemetry === true
   const quotaSrc = {
     utilization_5h: acc.utilization_5h ?? vm.utilization_5h,
     utilization_7d: acc.utilization_7d ?? vm.utilization_7d,
@@ -473,6 +505,12 @@ function VmDetailBody({
             </div>
           ) : null}
         </div>
+        <VmNameField
+          vm={vm}
+          canEdit={perms.admin}
+          saving={saveName.isPending}
+          onSave={(name) => saveName.mutate(name)}
+        />
         <Tabs value={tab} onValueChange={onTabChange}>
           <TabsList>
             <TabsTrigger value='overview'>概览</TabsTrigger>
@@ -602,6 +640,7 @@ function VmDetailBody({
               credType={credType}
               isCodex={isCodexVm(vm)}
               dataplane={vm.resolved_dataplane}
+              cragKernelVersion={vm.resolved_crag_kernel_version}
               schedule={<VmTestSchedule key={vm.id} vm={vm} {...test} />}
             />
           ) : null}
@@ -609,6 +648,7 @@ function VmDetailBody({
             <>
               <VmOpsTab
                 vm={vm}
+                kernel={kernel}
                 proxy={proxy}
                 officialCc={officialCc}
                 credType={credType}
@@ -631,16 +671,21 @@ function VmDetailBody({
               <TabsContent value='seed' className='pt-4'>
                 {seed.data ? (
                   <SeedPolicyCard
+                    key={id}
                     seed={seed.data}
                     slot={seedSlot}
                     telemetry={kernel?.telemetry}
                     saving={saveSeed.isPending}
-                    syncTelemetry={syncTelemetry}
+                    readError={seed.isError ? seed.error.message : null}
                     debug={seedDebug}
                     onDebug={setSeedDebug}
                     uploadLog={seedUploadLog.data}
+                    uploadLoading={seedUploadLog.isPending && seedDebug}
+                    uploadError={
+                      seedUploadLog.isError ? seedUploadLog.error.message : null
+                    }
                     proxyTimezone={proxy.geo?.timezone || ''}
-                    onSave={(next) => saveSeed.mutate(next)}
+                    onSave={(next) => saveSeed.mutateAsync(next)}
                   />
                 ) : (
                   <p className='text-sm text-muted-foreground'>

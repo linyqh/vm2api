@@ -1,3 +1,5 @@
+import { OFFICIAL_CLAUDE_CLI_UA } from '../identity/vm-identity.mjs'
+import { stripIllegalCacheControlFields } from '../protocol/cache-ttl.mjs'
 import { officialMessagesBody } from '../protocol/anthropic-messages.mjs'
 import { prepareClassifierBody } from '../protocol/request-purpose.mjs'
 import { consumeClaudeSSEData } from '../protocol/convert.mjs'
@@ -14,12 +16,14 @@ import {
   responsesSseToAnthropicEvents,
   isToolArgumentsError,
   responsesSseToChatChunk,
+  chatToCodexResponses,
 } from '../protocol/codex-convert.mjs'
 import { usageFromSseLine } from '../protocol/handle-codex.mjs'
 import { BETA_CONTEXT_1M } from '../protocol/claude-code-betas.mjs'
 import { shouldPassContext1mByPolicy } from '../protocol/model-policy.mjs'
 import { createStreamTiming } from '../protocol/stream-timing.mjs'
 import { mergeUsage } from '../protocol/openai-usage.mjs'
+import { ensureRedaction, maskJson, restoreSseLine } from '../redaction/runtime.mjs'
 
 export function resolveInferenceBackend(req) {
   if (req?.apiKeyKind !== 'managed') return 'oauth'
@@ -31,6 +35,70 @@ export function resolveInferenceBackend(req) {
 }
 
 export { messagesUrl, responsesUrl } from './api-presets.mjs'
+
+const STATELESS_RESPONSES_FIELDS = new Set([
+  'model',
+  'input',
+  'instructions',
+  'max_output_tokens',
+  'max_tool_calls',
+  'parallel_tool_calls',
+  'reasoning',
+  'text',
+  'tool_choice',
+  'tools',
+  'truncation',
+  'temperature',
+  'top_p',
+  'stream',
+  'stream_options',
+  'store',
+  'metadata',
+  'service_tier',
+  'user',
+  'safety_identifier',
+  'prompt_cache_key',
+  'prompt_cache_retention',
+  'include',
+])
+const STATELESS_OPENAI_TOOLS = new Set(['function', 'custom', 'web_search', 'web_search_preview', 'image_generation'])
+
+// Endpoint credentials are shared across managed keys; never resolve caller-supplied account resources.
+export function validateApiOpenAIRequest(protocol, body = {}) {
+  if (!['openai.responses', 'openai.chat'].includes(protocol)) return null
+  const invalid = (field) => ({
+    code: 'api_shared_resource_forbidden',
+    message: `Shared API endpoints require stateless input; unsupported field or resource: ${field}`,
+  })
+  if (protocol === 'openai.responses') {
+    for (const field of Object.keys(body)) {
+      if (!STATELESS_RESPONSES_FIELDS.has(field)) return invalid(field)
+    }
+  }
+  if (body.tools != null && !Array.isArray(body.tools)) return invalid('tools')
+  for (const tool of body.tools || []) {
+    if (!STATELESS_OPENAI_TOOLS.has(tool?.type)) return invalid('tools.type')
+  }
+  const pending = [body.input]
+  for (const tool of body.tools || []) {
+    if (!['function', 'custom'].includes(tool.type)) pending.push(tool)
+  }
+  while (pending.length) {
+    const value = pending.pop()
+    if (!value || typeof value !== 'object') continue
+    if (Array.isArray(value)) {
+      for (const child of value) pending.push(child)
+      continue
+    }
+    if (value.type === 'item_reference' || (value.id && !value.type && !value.role))
+      return invalid('input.item_reference')
+    for (const [field, child] of Object.entries(value)) {
+      if (['file_id', 'file_ids', 'vector_store_ids', 'container', 'server_url'].includes(field)) return invalid(field)
+      pending.push(child)
+    }
+  }
+  return null
+}
 
 function joinHeaderMap(headers = {}) {
   const out = {}
@@ -47,11 +115,12 @@ function joinHeaderMap(headers = {}) {
  * know yet.  Headers the operator configured on the endpoint win; anthropic-beta
  * is the union of endpoint and caller tokens so neither opt-in is dropped.
  */
-function forwardAnthropicProtocolHeaders(headers = {}, protocol = '', protocolKind = '') {
+function forwardAnthropicProtocolHeaders(headers = {}, protocol = '', protocolKind = '', { passthrough = false } = {}) {
   if (protocol !== 'anthropic.messages' || protocolKind !== 'anthropic') return {}
   const out = {}
   for (const [rawName, rawValue] of Object.entries(headers || {})) {
     const name = String(rawName || '').toLowerCase()
+    if (name === 'user-agent' && !passthrough) continue
     if (
       !name.startsWith('anthropic-') &&
       !name.startsWith('x-claude-code-') &&
@@ -205,6 +274,7 @@ export async function runApiInference({
   res,
   cfg,
   scheduler,
+  picked: selected = null,
   store,
   protocol,
   inbound,
@@ -217,10 +287,14 @@ export async function runApiInference({
   cacheTtl,
   converters,
   requestContext = null,
+  passthrough = false,
+  routing = null,
+  redactionPrincipal = '',
+  redactionSession = '',
 } = {}) {
   const canonical = officialMessagesBody(convertedBody)
   const model = canonical.model
-  const picked = scheduler.pick(model)
+  const picked = selected || scheduler.pick(model)
   if (!picked.ok) {
     return {
       ok: false,
@@ -251,19 +325,49 @@ export async function runApiInference({
     }
   }
   const body = isOpenAI
-    ? { ...claudeToOpenAIResponsesRequest({ ...canonical, model: picked.upstream_model }), stream: true }
-    : { ...canonical, model: picked.upstream_model, stream: true }
+    ? {
+        ...(protocol === 'openai.responses'
+          ? inbound
+          : protocol === 'openai.chat'
+            ? chatToCodexResponses(inbound)
+            : claudeToOpenAIResponsesRequest(canonical)),
+        model: picked.upstream_model,
+        stream: true,
+        store: false,
+      }
+    : { ...stripIllegalCacheControlFields(canonical), model: picked.upstream_model, stream: true }
+  if (isOpenAI && protocol === 'openai.chat') {
+    for (const name of ['temperature', 'top_p', 'parallel_tool_calls']) {
+      if (inbound?.[name] != null) body[name] = inbound[name]
+    }
+    if (body.reasoning_effort != null) {
+      body.reasoning = { ...body.reasoning, effort: body.reasoning?.effort ?? body.reasoning_effort }
+      delete body.reasoning_effort
+    }
+  }
   if (requestContext) Object.assign(body, prepareClassifierBody(body))
-  const callerProtocolHeaders = forwardAnthropicProtocolHeaders(req?.headers, protocol, protocolKind)
+  const redactionState = await ensureRedaction(routing || {}, { projectRoot: cfg?.paths?.project })
+  const redaction = redactionState.enabled ? { principal: redactionPrincipal, session: redactionSession } : null
+  if (redaction) body = await maskJson(body, redaction)
+  const callerProtocolHeaders = forwardAnthropicProtocolHeaders(req?.headers, protocol, protocolKind, {
+    passthrough,
+  })
+  const authHeaders = upstreamAuthHeaders(protocolKind, picked.key.api_key, {
+    ...extraHeaders,
+    auth_scheme: picked.endpoint.auth_scheme || extraHeaders.auth_scheme || extraHeaders.anthropic_apikey_auth_scheme,
+  })
+  if (
+    protocolKind === 'anthropic' &&
+    !passthrough &&
+    !Object.keys(authHeaders).some((key) => key.toLowerCase() === 'user-agent')
+  ) {
+    authHeaders['user-agent'] = OFFICIAL_CLAUDE_CLI_UA
+  }
   const headers = mergeCallerProtocolHeaders(
     {
       'content-type': 'application/json',
       accept: 'text/event-stream',
-      ...upstreamAuthHeaders(protocolKind, picked.key.api_key, {
-        ...extraHeaders,
-        auth_scheme:
-          picked.endpoint.auth_scheme || extraHeaders.auth_scheme || extraHeaders.anthropic_apikey_auth_scheme,
-      }),
+      ...authHeaders,
     },
     callerProtocolHeaders,
     extraHeaders,
@@ -424,6 +528,7 @@ export async function runApiInference({
     let sawMessageStop = false
     let terminalError = null
     await readUpstreamLines(async (line) => {
+      if (redaction) line = await restoreSseLine(line, redaction)
       applyMaybeUsageHide(line, personaHideTokens, cacheTtl, converters)
       converters.applyClaudeSSELineToMessage(line, assembler)
       const raw = String(line || '')
@@ -494,6 +599,7 @@ export async function runApiInference({
   let committed = false
   let sawStop = false
   await readUpstreamLines(async (line) => {
+    if (redaction) line = await restoreSseLine(line, redaction)
     if (personaHideTokens) line = converters.hidePersonaUsageInSseLine(line, personaHideTokens, cacheTtl) || line
     if (String(line).includes('message_stop')) sawStop = true
     if (!committed && String(line).startsWith('data:')) {
@@ -618,7 +724,7 @@ async function runOpenAIResponsesUpstream({
     try {
       assembled = assembleCodexBodyFromSse(chunks, {})
       outBody =
-        protocol === 'anthropic.messages'
+        protocol !== 'openai.responses'
           ? codexBodyToAnthropicMessage(assembled, inbound?.model || body?.model)
           : assembled
     } catch (error) {

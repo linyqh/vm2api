@@ -54,6 +54,7 @@ export const ErrorCode = {
   API_KEY_QUOTA_EXHAUSTED: 'api_key_quota_exhausted',
   API_KEY_RATE_LIMIT: 'api_key_rate_limit',
   API_KEY_CONCURRENCY_LIMIT: 'api_key_concurrency_limit',
+  API_KEY_MODEL_NOT_ALLOWED: 'api_key_model_not_allowed',
   KEY_GROUP_MISMATCH: 'key_group_mismatch',
   VM_POOL_UNAVAILABLE: 'vm_pool_unavailable',
   API_BACKEND_FORBIDDEN: 'api_backend_forbidden',
@@ -139,6 +140,8 @@ const POOL_CAPACITY_MESSAGE = /no eligible|no ready api|account pool|号池没�
 const WRAP_CONNECTION_MESSAGE = /provider error:.*connection error/i
 const USAGE_POLICY_MESSAGE =
   /usage policy|legal\/aup|unable to respond to this request|violate our usage|content_filter_refusal/i
+// Billing refusal, not a content violation and not "extra usage required".
+const UNANSWERABLE_PROMPT_MESSAGE = /third[-\s]?party apps now draw from|no third[-\s]?party apps(?:\s+are)?\s+allowed/i
 
 export function isWrapConnectionError(message = '') {
   return WRAP_CONNECTION_MESSAGE.test(String(message || ''))
@@ -146,6 +149,12 @@ export function isWrapConnectionError(message = '') {
 
 export function isUsagePolicyErrorMessage(message = '') {
   return USAGE_POLICY_MESSAGE.test(String(message || ''))
+}
+
+/** Usage Policy text, or a 400/503 the upstream will not answer for this prompt. */
+export function isUnanswerablePromptMessage(message = '') {
+  const text = String(message || '')
+  return USAGE_POLICY_MESSAGE.test(text) || UNANSWERABLE_PROMPT_MESSAGE.test(text)
 }
 
 export const REFUSAL_GUARD_MESSAGE =
@@ -424,6 +433,14 @@ export function mapUpstreamError(status, body, headers = {}) {
     (upType ? body?.message : null) ||
     body?.raw ||
     null
+  if (/^license_(required|expired|not_yet_valid|invalid|binding_mismatch|unconfigured)$/.test(inboundCode)) {
+    return makeError({
+      type: ErrorType.PERMISSION,
+      code: inboundCode,
+      message: String(msg || 'CRAG registration is required.'),
+      status: 403,
+    })
+  }
   if (inboundCode === ErrorCode.FABLE_REQUIRES_MAX) {
     return makeError({
       type: ErrorType.RATE_LIMIT,
@@ -514,7 +531,7 @@ export function mapUpstreamError(status, body, headers = {}) {
       request_id,
     })
   }
-  if (isUsagePolicyErrorMessage(msg)) {
+  if (isUnanswerablePromptMessage(msg)) {
     return makeRefusalGuardError({
       requestId: request_id,
       details: {

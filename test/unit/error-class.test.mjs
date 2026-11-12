@@ -13,6 +13,7 @@ test('classifyRequestError maps known codes and statuses', () => {
   assert.equal(classifyRequestError({ status: 503, error_code: 'server_overloaded' }).error_class, 'overloaded')
   assert.equal(classifyRequestError({ status: 429, error_code: 'upstream_rate_limit' }).error_class, 'rate_limit')
   assert.equal(classifyRequestError({ status: 400, error_code: 'invalid_json' }).error_class, 'request')
+  assert.equal(classifyRequestError({ status: 400, error_code: 'api_key_model_not_allowed' }).error_class, 'request')
   assert.equal(
     classifyRequestError({ status: 400, error_message: 'thinking signature invalid' }).error_class,
     'signature',
@@ -65,6 +66,48 @@ test('classifyRequestError maps known codes and statuses', () => {
       error_message: 'Invalid `signature` in thinking block',
     }).error_class,
     'signature',
+  )
+  assert.equal(
+    classifyRequestError({
+      status: 400,
+      error_code: 'upstream_invalid_request',
+      error_message:
+        'API Error: Claude Code is unable to respond to this request, which appears to violate our Usage Policy',
+    }).error_class,
+    'refusal',
+  )
+  assert.equal(
+    classifyRequestError({
+      status: 400,
+      error_code: 'upstream_invalid_request',
+      error_message: 'HTTP 400: Third-party apps now draw from your extra usage, not your plan limits.',
+    }).error_class,
+    'refusal',
+  )
+  assert.equal(
+    classifyRequestError({
+      status: 503,
+      error_code: 'upstream_error',
+      error_message: 'no third-party apps allowed on this subscription',
+    }).error_class,
+    'refusal',
+  )
+  assert.equal(
+    classifyRequestError({
+      status: 400,
+      error_code: 'upstream_invalid_request',
+      error_message: 'max_tokens: 1 is too small',
+    }).error_class,
+    'request',
+  )
+  assert.equal(
+    classifyRequestError({
+      status: 401,
+      error_code: 'upstream_auth_error',
+      vm_id: 'slot',
+      error_message: 'Usage Policy quoted inside an auth failure',
+    }).error_class,
+    'credential',
   )
   assert.equal(
     classifyRequestError({

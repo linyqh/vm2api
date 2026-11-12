@@ -21,18 +21,22 @@ export const BETA_THINKING_BINDING_CONTROLS = 'thinking-binding-controls-2026-08
 export const BETA_EFFORT = 'effort-2025-11-24'
 export const BETA_EXTENDED_CACHE_TTL = 'extended-cache-ttl-2025-04-11'
 export const BETA_CACHE_DIAGNOSIS = 'cache-diagnosis-2026-04-07'
+export const BETA_TOOL_PROVENANCE = 'tool-provenance-2026-10-26'
 export const BETA_CONTEXT_MANAGEMENT = 'context-management-2025-06-27'
 export const BETA_FALLBACK_CREDIT = 'fallback-credit-2026-06-01'
 export const BETA_CONTEXT_1M = 'context-1m-2025-08-07'
 /** Request gates must be applied by the final HTTP wire owner. */
 export const BETA_THINKING_DISPLAY_UPDATES = 'thinking-display-updates-2026-08-18'
 export const BETA_DANGEROUS_TOOL_USE = 'dangerous-tool-use-2026-09-03'
+/** Mid-conversation `tool_addition.tool` of type `tool_definition`. Not in the always-on prefix. */
+export const BETA_INLINE_TOOLS = 'inline-tools-2026-09-15'
 
 const PER_TURN_MODELS = {
   'claude-haiku-5-5': true,
   'claude-sonnet-5-5': true,
   'claude-opus-5-5': true,
   'claude-fable-5-1': true,
+  'claude-fable-5-2': true,
 }
 const MID_TOOL_CHANGE_MODELS = {
   'claude-haiku-5-5': true,
@@ -42,6 +46,7 @@ const MID_TOOL_CHANGE_MODELS = {
   'claude-opus-5-5': true,
   'claude-fable-5': true,
   'claude-fable-5-1': true,
+  'claude-fable-5-2': true,
   'claude-mythos-5-1': true,
 }
 const FAST_MODE_MODELS = {
@@ -55,7 +60,18 @@ const MID_OUTPUT_CONFIG_MODELS = {
   'claude-opus-5': true,
   'claude-opus-5-5': true,
   'claude-fable-5-1': true,
+  'claude-fable-5-2': true,
   'claude-mythos-5-1': true,
+}
+
+function contentHasInlineToolDefinition(content) {
+  if (!Array.isArray(content)) return false
+  for (const block of content) {
+    if (!block || typeof block !== 'object' || block.type !== 'tool_addition') continue
+    const tool = block.tool
+    if (tool && typeof tool === 'object' && tool.type === 'tool_definition') return true
+  }
+  return false
 }
 
 function hasHourCache(node) {
@@ -88,7 +104,7 @@ export function withRequestProtocolBetas(tokens = [], body = {}) {
   if (Object.hasOwn(MID_TOOL_CHANGE_MODELS, model) || model === 'auto') add(BETA_MID_CONVERSATION_TOOL_CHANGES)
   if (body.thread != null && Object.hasOwn(MID_OUTPUT_CONFIG_MODELS, model)) add(BETA_MID_CONVERSATION_OUTPUT_CONFIG)
   if (body.output_config?.effort != null) add(BETA_EFFORT)
-  if (body.thinking?.display === 'updates') add(BETA_THINKING_DISPLAY_UPDATES)
+  if (body.thinking?.display === 'updates') add(BETA_THINKING_DISPLAY_UPDATES, BETA_EXTENDED_CACHE_TTL)
   if (Array.isArray(body.safeguards) && body.safeguards.some((item) => item?.type === 'dangerous_tool_use'))
     add(BETA_DANGEROUS_TOOL_USE)
   if (body.output_config?.format) add('structured-outputs-2025-12-15')
@@ -119,6 +135,7 @@ export function withRequestProtocolBetas(tokens = [], body = {}) {
     add(BETA_PROMPT_CACHING_SCOPE)
   if (Array.isArray(body.messages)) {
     let hasClearAt = false
+    let hasInlineToolDefinition = false
     let hasMessageOutputConfig = false
     let hasMessageEffort = false
     let hasMessageFormat = false
@@ -126,6 +143,7 @@ export function withRequestProtocolBetas(tokens = [], body = {}) {
     for (const message of body.messages) {
       if (!message || typeof message !== 'object') continue
       if (message.clear_at != null) hasClearAt = true
+      if (contentHasInlineToolDefinition(message.content)) hasInlineToolDefinition = true
       const config = message.output_config
       if (!config || typeof config !== 'object') continue
       hasMessageOutputConfig = true
@@ -134,6 +152,7 @@ export function withRequestProtocolBetas(tokens = [], body = {}) {
       if (config.task_budget) hasMessageTaskBudget = true
     }
     if (hasClearAt) add(BETA_MID_CONVERSATION_SYSTEM_CLEAR_AT)
+    if (hasInlineToolDefinition) add(BETA_INLINE_TOOLS)
     if (hasMessageOutputConfig) add(BETA_MID_CONVERSATION_OUTPUT_CONFIG)
     if (hasMessageEffort) add(BETA_EFFORT)
     if (hasMessageFormat) add('structured-outputs-2025-12-15')
@@ -144,17 +163,18 @@ export function withRequestProtocolBetas(tokens = [], body = {}) {
 
 export const HAIKU_BETA_HEADER = `${BETA_OAUTH},${BETA_INTERLEAVED}`
 
-/** Official 2.1.303 `--print` prefix. Field-gated tokens stay after it. */
+/** Official 2.1.321 `--print` prefix. Field-gated tokens stay after it. */
 export function fullClaudeCodeMimicryBetas() {
   return [
     BETA_CLAUDE_CODE,
     BETA_OAUTH,
     BETA_INTERLEAVED,
-    BETA_THINKING_TOKEN_COUNT,
     BETA_CONTEXT_MANAGEMENT,
     BETA_PROMPT_CACHING_SCOPE,
     'per-turn-control-2026-07-01',
     BETA_MID_CONVERSATION_TOOL_CHANGES,
+    BETA_TOOL_PROVENANCE,
+    BETA_THINKING_TOKEN_COUNT,
     BETA_ADVANCED_TOOL_USE,
     BETA_MID_CONVERSATION_SYSTEM_CLEAR_AT,
     BETA_EFFORT,

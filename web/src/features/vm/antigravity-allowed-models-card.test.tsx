@@ -66,7 +66,7 @@ describe('Antigravity slot model allowlist', () => {
       </QueryClientProvider>
     )
     expect(html).toContain('gemini-example')
-    expect(html).toContain('同步账号模型')
+    expect(html).not.toContain('同步账号模型')
     expect(html).not.toContain('全选（继承）')
     client.clear()
   })

@@ -120,6 +120,64 @@ export function readFileCached(file) {
   return text
 }
 
+/*
+ * Shared parse cache for hot-path config files (routing.json).
+ *
+ * In-process writers go through atomicWriteJson, which invalidates the entry
+ * after the rename; the next read re-parses lazily. Writers outside the process
+ * (scp, manual edits, other processes) send no notice, so every read still does
+ * one stat and compares dev/ino/size/mtimeNs/ctimeNs. ctime moves on any content
+ * or utimes change, so a same-size swap with a restored mtime is still caught.
+ *
+ * The returned object is deep-frozen and shared across callers: read it, never
+ * mutate it. Copy first when a caller needs a modified version.
+ */
+const parsedJsonCache = new Map()
+
+function deepFreeze(value) {
+  if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value
+  for (const child of Object.values(value)) deepFreeze(child)
+  return Object.freeze(value)
+}
+
+function statSignature(stat) {
+  return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`
+}
+
+function parseFrozen(file) {
+  let text
+  try {
+    text = fs.readFileSync(file, 'utf8')
+  } catch (err) {
+    if (isNotFound(err)) return null
+    throw err
+  }
+  return deepFreeze(JSON.parse(text))
+}
+
+/**
+ * Parsed JSON shared across callers as one deep-frozen object. Missing file → null;
+ * corrupt JSON throws (and drops any stale entry) so each caller keeps its own fallback.
+ */
+export function readJsonParsedCached(file) {
+  if (!readCacheEnabled) return parseFrozen(file)
+  let stat
+  try {
+    stat = fs.statSync(file, { bigint: true })
+  } catch (err) {
+    parsedJsonCache.delete(file)
+    if (isNotFound(err)) return null
+    throw err
+  }
+  const sig = statSignature(stat)
+  const hit = parsedJsonCache.get(file)
+  if (hit && hit.sig === sig) return hit.doc
+  parsedJsonCache.delete(file)
+  const doc = parseFrozen(file)
+  if (doc != null) parsedJsonCache.set(file, { sig, doc })
+  return doc
+}
+
 /** Parsed JSON for `file`. Missing file → null; corrupt JSON and other I/O throw. */
 export function readJsonCached(file) {
   const text = readFileCached(file)
@@ -131,8 +189,10 @@ export function readJsonCached(file) {
 export function invalidateReadCache(file = null) {
   if (!file) {
     readCache.clear()
+    parsedJsonCache.clear()
     return
   }
+  parsedJsonCache.delete(file)
   return readCache.delete(file)
 }
 

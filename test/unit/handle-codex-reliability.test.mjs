@@ -88,6 +88,7 @@ for (const [name, body, headers, streamed] of [
   ['explicit false', { stream: false }, {}, false],
   ['explicit true', { stream: true }, {}, true],
   ['Accept SSE', {}, { accept: 'text/event-stream' }, true],
+  ['Accept JSON and SSE', {}, { accept: 'application/json, text/event-stream' }, false],
   ['false overrides Accept', { stream: false }, { accept: 'text/event-stream' }, false],
 ]) {
   test(`Codex Responses respects ${name}`, async (t) => {

@@ -30,6 +30,7 @@ import {
   FINGERPRINT_SALT,
   isOfficialClaudeCodeTraffic,
   officialCcPassthroughFromRouting,
+  officialFamilyBodyPassthrough,
   isLeakyClientFingerprint,
   looksLikeOhMyPiSystem,
   looksLikeOfficialClaudeSystem,
@@ -147,11 +148,12 @@ test('forceConfigured rewrites official and proxied-official system onto the pre
   }
   const headers = { 'user-agent': 'claude-cli/2.1.293 (external, cli)' }
   assert.equal(isOfficialClaudeCodeTraffic(headers, body), true)
-  const skipped = applyCrsUnofficialPersona(body, {
+  const kept = applyCrsUnofficialPersona(body, {
     headers,
     mode: 'official_full',
+    officialClient: true,
   })
-  assert.equal(skipped.system.length, 3)
+  assert.equal(kept.system.length, 3)
   const out = applyCrsUnofficialPersona(body, {
     headers,
     mode: 'official_full',
@@ -192,6 +194,8 @@ test('forceConfigured custom preset still writes billing and keeps caller system
 
 test('official family passthrough is off unless the protocol switch is on', () => {
   assert.equal(officialCcPassthroughFromRouting({}), false)
+  assert.equal(officialFamilyBodyPassthrough(true, {}), false)
+  assert.equal(officialFamilyBodyPassthrough(false, { compatibility: { official_cc_passthrough: true } }), false)
   assert.equal(
     officialCcPassthroughFromRouting({
       compatibility: { official_cc_passthrough: false },
@@ -199,7 +203,7 @@ test('official family passthrough is off unless the protocol switch is on', () =
     false,
   )
   assert.equal(
-    officialCcPassthroughFromRouting({
+    officialFamilyBodyPassthrough(true, {
       compatibility: { official_cc_passthrough: true },
     }),
     true,
@@ -630,7 +634,7 @@ test('spoofed claude-cli UA without valid user_id still gets default mimic', () 
   assertParkedStanding(out, 'hi')
 })
 
-test('official claude-cli UA plus valid user_id skips mimic', () => {
+test('official claude-cli UA plus valid user_id is cleaned unless passthrough is on', () => {
   const body = {
     system: CRS_OFFICIAL_SYSTEM,
     messages: [{ role: 'user', content: 'hi' }],
@@ -643,9 +647,11 @@ test('official claude-cli UA plus valid user_id skips mimic', () => {
     },
   }
   const headers = { 'user-agent': 'claude-cli/2.1.234 (external, cli)' }
-  const out = applyCrsUnofficialPersona(body, { headers, mode: 'rewrite' })
-  assert.equal(out.system, CRS_OFFICIAL_SYSTEM)
   assert.equal(isOfficialClaudeCodeTraffic(headers, body), true)
+  const kept = applyCrsUnofficialPersona(body, { headers, mode: 'rewrite', officialClient: true })
+  assert.equal(kept.system, CRS_OFFICIAL_SYSTEM)
+  const out = applyCrsUnofficialPersona(body, { headers, mode: 'rewrite' })
+  assert.notEqual(out.system, CRS_OFFICIAL_SYSTEM)
 })
 
 const OMP_ROLE = `<system-conventions>
@@ -1164,7 +1170,7 @@ test('inbound mid-conversation role:system is kept', () => {
   assertParkedStanding(out, 'one')
 })
 
-test('vscode / cowork / desktop official family UA plus official system skips mimic', () => {
+test('vscode / cowork / desktop official family is cleaned unless passthrough is on', () => {
   const body = {
     system: CRS_OFFICIAL_SYSTEM,
     messages: [{ role: 'user', content: 'hi' }],
@@ -1184,12 +1190,19 @@ test('vscode / cowork / desktop official family UA plus official system skips mi
   for (const ua of uas) {
     const headers = { 'user-agent': ua }
     assert.equal(isOfficialClaudeCodeTraffic(headers, body), true, ua)
+    const kept = applyCrsUnofficialPersona(body, {
+      headers,
+      mode: 'rewrite',
+      park: true,
+      officialClient: true,
+    })
+    assert.equal(kept.system, CRS_OFFICIAL_SYSTEM, ua)
     const out = applyCrsUnofficialPersona(body, {
       headers,
       mode: 'rewrite',
       park: true,
     })
-    assert.equal(out.system, CRS_OFFICIAL_SYSTEM)
+    assert.notEqual(out.system, CRS_OFFICIAL_SYSTEM, ua)
   }
 })
 
@@ -1515,7 +1528,7 @@ test('Environment rejects casual paths and newline cwd injection', () => {
   assert.ok(firstUserContent(casual).endsWith(`${callerReminder('please look at /tmp/secret and then answer')}hi`))
 })
 
-test('zero inject writes only billing with prompt_version; caller system is not in system', () => {
+test('zero inject keeps caller system after billing with prompt_version', () => {
   const out = applyCrsUnofficialPersona(
     {
       system: '你是一个高速收费员。',
@@ -1528,14 +1541,14 @@ test('zero inject writes only billing with prompt_version; caller system is not 
       identity: { timezone: 'Asia/Shanghai' },
     },
   )
-  assert.equal(out.system.length, 1)
+  assert.equal(out.system.length, 2)
   assert.match(out.system[0].text, /^x-anthropic-billing-header: /)
   assert.match(out.system[0].text, /prompt_version=<You are Claude Code, Anthropic's official CLI for Claude\.>/)
   assert.ok(!/\n/.test(out.system[0].text))
   assert.equal(out.system[0].cache_control, undefined)
   assert.ok(!out.system.some((b) => b?.text === CRS_EMPTY_IDENTITY_TEXT))
   assert.ok(!JSON.stringify(out.system).includes('# Environment'))
-  assert.ok(!JSON.stringify(out.system).includes('你是一个高速收费员。'))
+  assert.deepEqual(out.system[1], { type: 'text', text: '你是一个高速收费员。' })
   assert.equal(firstUserContent(out), '你好呀。')
   assert.equal(
     out.messages.some((message) => message.role === 'system'),
@@ -1553,10 +1566,10 @@ test('zero inject no longer appends standing constraints even when enabled', () 
       },
       { mode: 'zero', routingFile },
     )
-    assert.equal(out.system.length, 1)
+    assert.equal(out.system.length, 2)
     assert.match(out.system[0].text, /prompt_version=</)
     assert.ok(!JSON.stringify(out).includes(DEFAULT_AGENT_STANDING.split('\n')[0]))
-    assert.ok(!JSON.stringify(out.system).includes(agent))
+    assert.deepEqual(out.system[1], { type: 'text', text: agent })
   })
 })
 
@@ -1603,20 +1616,21 @@ test('refreshOfficialSystemEnvironment leaves zero inject untouched: it has no E
   assert.ok(!JSON.stringify(refreshed).includes('Europe/London'))
 })
 
-test('zero env off still writes billing only', () => {
+test('zero env off keeps caller system without generating Environment', () => {
   withRoutingCompat({ persona_preset: 'zero', persona_env_presets: { zero: false } }, (routingFile) => {
     const out = applyCrsUnofficialPersona(
       { system: 'caller', messages: [{ role: 'user', content: 'hi' }] },
       { routingFile, identity: { timezone: 'Asia/Tokyo' } },
     )
-    assert.equal(out.system.length, 1)
+    assert.equal(out.system.length, 2)
+    assert.deepEqual(out.system[1], { type: 'text', text: 'caller' })
     assert.match(out.system[0].text, /prompt_version=</)
     assert.ok(!JSON.stringify(out).includes('# Environment'))
     assert.ok(!JSON.stringify(out).includes('Asia/Tokyo'))
   })
 })
 
-test('new official identity variant plus UA and user_id skips rewrite', () => {
+test('new official identity variant is cleaned unless passthrough is on', () => {
   const body = {
     system: "You are Claude Code, Anthropic's newest coding agent.",
     messages: [{ role: 'user', content: 'hi' }],
@@ -1630,16 +1644,23 @@ test('new official identity variant plus UA and user_id skips rewrite', () => {
   }
   const headers = { 'user-agent': 'claude-cli/2.1.300 (external, cli)' }
   assert.equal(isOfficialClaudeCodeTraffic(headers, body), true)
+  const kept = applyCrsUnofficialPersona(body, {
+    headers,
+    mode: 'rewrite',
+    park: true,
+    officialClient: true,
+  })
+  assert.equal(kept.system, body.system)
+  assert.equal(kept.messages[0].content, 'hi')
   const out = applyCrsUnofficialPersona(body, {
     headers,
     mode: 'rewrite',
     park: true,
   })
-  assert.equal(out.system, body.system)
-  assert.equal(out.messages[0].content, 'hi')
+  assert.notEqual(out.system, body.system)
 })
 
-test('official entrypoint without exact identity line still skips rewrite', () => {
+test('official entrypoint without exact identity line is cleaned unless passthrough is on', () => {
   const body = {
     system: 'cc_entrypoint=vscode\nFollow the workspace instructions.',
     messages: [{ role: 'user', content: 'hi' }],
@@ -1650,8 +1671,10 @@ test('official entrypoint without exact identity line still skips rewrite', () =
   }
   assert.equal(looksLikeOfficialClaudeSystem(body.system), true)
   assert.equal(isOfficialClaudeCodeTraffic(headers, body), true)
+  const kept = applyCrsUnofficialPersona(body, { headers, mode: 'rewrite', officialClient: true })
+  assert.equal(kept.system, body.system)
   const out = applyCrsUnofficialPersona(body, { headers, mode: 'rewrite' })
-  assert.equal(out.system, body.system)
+  assert.notEqual(out.system, body.system)
 })
 
 test('local-agent entrypoint still does not count as official even with identity variant', () => {
@@ -1758,7 +1781,7 @@ function officialChildMeta() {
   }
 }
 
-test('Explore / Compact / web-search child hops count as official and skip rewrite', () => {
+test('Explore / Compact / web-search child hops are cleaned unless passthrough is on', () => {
   const cases = [
     "You are a file search specialist for Claude Code, Anthropic's official CLI for Claude.",
     'You are a helpful AI assistant tasked with summarizing conversations.',
@@ -1779,15 +1802,21 @@ test('Explore / Compact / web-search child hops count as official and skip rewri
     assert.equal(hasOfficialClaudeChildPrompt(body.system), true, text)
     assert.equal(looksLikeOfficialClaudeSystem(body.system), true, text)
     assert.equal(isOfficialClaudeCodeTraffic(officialChildHeaders(), body), true, text)
+    const kept = applyCrsUnofficialPersona(body, {
+      headers: officialChildHeaders(),
+      mode: 'rewrite',
+      officialClient: true,
+    })
+    assert.equal(kept.system, body.system, text)
     const out = applyCrsUnofficialPersona(body, {
       headers: officialChildHeaders(),
       mode: 'rewrite',
     })
-    assert.equal(out.system, body.system)
+    assert.notEqual(out.system, body.system, text)
   }
 })
 
-test('Explore child hop without billing still skips rewrite', () => {
+test('Explore child hop without billing is cleaned unless passthrough is on', () => {
   const body = {
     system: [
       {
@@ -1799,12 +1828,19 @@ test('Explore child hop without billing still skips rewrite', () => {
     metadata: officialChildMeta(),
   }
   assert.equal(isOfficialClaudeCodeTraffic(officialChildHeaders(), body), true)
+  const kept = applyCrsUnofficialPersona(body, {
+    headers: officialChildHeaders(),
+    mode: 'rewrite',
+    park: true,
+    officialClient: true,
+  })
+  assert.equal(kept.system, body.system)
   const out = applyCrsUnofficialPersona(body, {
     headers: officialChildHeaders(),
     mode: 'rewrite',
     park: true,
   })
-  assert.equal(out.system, body.system)
+  assert.notEqual(out.system, body.system)
 })
 
 test('security monitor child hop is official', () => {
@@ -1818,4 +1854,34 @@ test('security monitor child hop is official', () => {
   }
   assert.equal(isOfficialClaudeSecurityMonitorPrompt(body.system), true)
   assert.equal(isOfficialClaudeCodeTraffic(officialChildHeaders(), body), true)
+})
+
+test('official prompt env message stays at a stable position across turns so the cache prefix survives', () => {
+  const opts = { mode: 'official_prompt', park: false }
+  const history = [
+    { role: 'user', content: 'first question' },
+    { role: 'assistant', content: 'first answer' },
+  ]
+  const turn1 = applyCrsUnofficialPersona(
+    { model: 'claude-opus-5-5', system: 'caller rules', messages: [...history, { role: 'user', content: 'second' }] },
+    opts,
+  )
+  const turn2 = applyCrsUnofficialPersona(
+    {
+      model: 'claude-opus-5-5',
+      system: 'caller rules',
+      messages: [
+        ...history,
+        { role: 'user', content: 'second' },
+        { role: 'assistant', content: 'second answer' },
+        { role: 'user', content: 'third' },
+      ],
+    },
+    opts,
+  )
+  const systems = (out) => out.messages.map((m, i) => (m.role === 'system' ? i : -1)).filter((i) => i >= 0)
+  assert.deepEqual(systems(turn1), systems(turn2))
+  // Everything sent on turn 1 is an unchanged prefix of turn 2.
+  assert.deepEqual(turn2.messages.slice(0, turn1.messages.length), turn1.messages)
+  assert.ok(systems(turn1).length > 0)
 })

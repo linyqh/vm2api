@@ -12,6 +12,9 @@ import {
   isUpstreamRefusal,
   refusalFingerprint,
   refusalGuardError,
+  refusalPreview,
+  refusalPromptSignature,
+  refusalStrictDocument,
 } from '../../src/lib/core/refusal-guard.mjs'
 import { detectDistill } from '../../src/lib/core/distill-detect.mjs'
 
@@ -48,6 +51,45 @@ test('envelope persistable JSON bodies keep distinct fingerprints', () => {
   assert.notEqual(a, b)
 })
 
+test('preview shows the latest user ask, not the leading system-reminder', () => {
+  const preview = refusalPreview({
+    model: 'claude-opus-5-5',
+    messages: [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: '<system-reminder>\nCodebase and user instructions\n</system-reminder>' },
+          { type: 'text', text: '轴是变径的，这和直径有什么关系' },
+        ],
+      },
+      { role: 'assistant', content: [{ type: 'text', text: '先看图纸' }] },
+      {
+        role: 'user',
+        content: [
+          { type: 'tool_result', content: 'file contents that must not become the fingerprint' },
+          { type: 'text', text: '<system-reminder>\nmemory\n</system-reminder>' },
+          { type: 'text', text: '另一端换成了6807VV轴承，这有什么作用？' },
+        ],
+      },
+    ],
+  })
+  assert.equal(preview, '另一端换成了6807VV轴承，这有什么作用？')
+  assert.equal(preview.includes('system-reminder'), false)
+  assert.equal(preview.includes('file contents'), false)
+})
+
+test('a shared reminder does not give a short ask a similarity signature', () => {
+  const shared = `<system-reminder>\n${'memory file '.repeat(80)}\n</system-reminder>`
+  const ask = (text) => ({
+    model: 'claude-opus-5-5',
+    messages: [{ role: 'user', content: [{ type: 'text', text: `${shared}\n${text}` }] }],
+  })
+  assert.equal(refusalPromptSignature(ask('短问题一')), null)
+  assert.equal(refusalPromptSignature(ask('完全不同的短问题二')), null)
+  assert.equal(refusalStrictDocument(ask('短问题一')).includes('memory file'), false)
+  assert.equal(refusalStrictDocument(ask('短问题一')).includes('短问题一'), true)
+})
+
 test('stop_reason=refusal and Usage Policy API Error are cacheable; distill is not', () => {
   assert.equal(
     isUpstreamRefusal({
@@ -77,6 +119,30 @@ test('stop_reason=refusal and Usage Policy API Error are cacheable; distill is n
     true,
   )
   assert.equal(isUpstreamRefusal({ body: { error: { code: 'distill_blocked', message: '不允许蒸馏' } } }), false)
+  assert.equal(
+    isUpstreamRefusal({
+      body: {
+        error: {
+          code: 'upstream_invalid_request',
+          upstream_code: 'cyber_policy',
+          message: 'blocked',
+        },
+      },
+    }),
+    true,
+  )
+  assert.equal(
+    isUpstreamRefusal({
+      status: 400,
+      body: {
+        error: {
+          code: 'upstream_invalid_request',
+          message: 'HTTP 400: Third-party apps now draw from your extra usage, not your plan limits.',
+        },
+      },
+    }),
+    false,
+  )
 })
 
 test('zero inject still allows distill skip while refusal fingerprint is independent', () => {

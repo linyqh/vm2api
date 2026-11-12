@@ -10,7 +10,7 @@ import {
   saveModelPolicy,
   seedDefaultPolicy,
 } from '../../src/lib/protocol/model-policy.mjs'
-import { ensureUnofficialEffortHigh } from '../../src/lib/protocol/thinking.mjs'
+import { ensureUnofficialEffortHigh, loggedReasoningEffort } from '../../src/lib/protocol/thinking.mjs'
 
 test('haiku 5.5 is in the panel seed and keeps forced tool choice', () => {
   const seed = seedDefaultPolicy()
@@ -96,6 +96,30 @@ test('a panel effort edit is what Node reads back', () => {
       messages: [{ role: 'user', content: 'pong' }],
     })
     assert.equal(body.output_config, undefined)
+  } finally {
+    closeDatabase()
+  }
+})
+
+test('logged effort uses the caller value, then the panel or catalog default', () => {
+  openDatabase({ dbPath: ':memory:' })
+  try {
+    saveModelPolicy(seedDefaultPolicy())
+    loadModelPolicy({ force: true })
+    assert.equal(loggedReasoningEffort({ model: 'claude-sonnet-5', output_config: { effort: 'max' } }), 'max')
+    assert.equal(loggedReasoningEffort({ model: 'claude-sonnet-5' }), 'high')
+    assert.equal(loggedReasoningEffort({ model: 'claude-sonnet-5-5' }), 'medium')
+    assert.equal(loggedReasoningEffort({ model: 'claude-opus-4-7' }), 'xhigh')
+    assert.equal(loggedReasoningEffort({ model: 'claude-haiku-4-5' }), null)
+    const seed = seedDefaultPolicy()
+    seed.models['claude-sonnet-5'].params.default_effort = 'low'
+    saveModelPolicy(seed)
+    loadModelPolicy({ force: true })
+    assert.equal(loggedReasoningEffort({ model: 'claude-sonnet-5' }), 'low')
+    seed.models['claude-sonnet-5'].params.default_effort = 'off'
+    saveModelPolicy(seed)
+    loadModelPolicy({ force: true })
+    assert.equal(loggedReasoningEffort({ model: 'claude-sonnet-5' }), null)
   } finally {
     closeDatabase()
   }

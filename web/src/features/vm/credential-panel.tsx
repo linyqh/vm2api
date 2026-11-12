@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import type { AuthScheme, Vm } from '@/types/panel-vm'
 import { Copy, ExternalLink } from 'lucide-react'
@@ -19,16 +19,8 @@ import {
   type ImportMethod,
 } from '@/lib/cred-type'
 import { importErrorMessage } from '@/lib/import-errors'
-import { loginAuthCode } from '@/lib/login-terminal'
 import { proxyNamedLabel } from '@/lib/vm-status'
 import { Button } from '@/components/ui/button'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import {
@@ -39,12 +31,11 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
-import { type LoginTerminalHandle, WsTerminal } from '@/components/ws-terminal'
 import { dashboardQueryOptions } from '@/features/overview/queries'
 import { AntigravityCredentialPanel } from '@/features/vm/antigravity-credential-panel'
+import { ClaudeLogin } from '@/features/vm/claude-login'
 import { CodexCredentialPanel } from '@/features/vm/codex-credential-panel'
 import { ConvertOauthToSetupButton } from '@/features/vm/convert-oauth-button'
-import { prepareLoginTerminal } from '@/features/vm/login-terminal-start'
 import { vmQueryOptions } from '@/features/vm/queries'
 
 export type CommitResult = {
@@ -181,10 +172,6 @@ function ClaudeCredentialPanel({
   const [code, setCode] = useState('')
   const [sessionKey, setSessionKey] = useState('')
   const [apiKey, setApiKey] = useState('')
-  const [loginOpen, setLoginOpen] = useState(false)
-  const [loginUrl, setLoginUrl] = useState('')
-  const [loginCode, setLoginCode] = useState('')
-  const loginTerm = useRef<LoginTerminalHandle>(null)
   const activeMethod = resolveImportMethod(kind, method)
   const sig = `${kind}:${activeMethod}`
   const linkReady = !!(link.sessionId && link.authUrl && link.sig === sig)
@@ -307,22 +294,7 @@ function ClaudeCredentialPanel({
     onError: (e: Error) => toast.error(importErrorMessage(e)),
   })
 
-  const openLogin = useMutation({
-    mutationFn: () => prepareLoginTerminal(vm),
-    onSuccess: () => {
-      setLoginUrl('')
-      setLoginCode('')
-      setLoginOpen(true)
-      void invalidate()
-    },
-    onError: (error: Error) => toast.error(importErrorMessage(error)),
-  })
-
-  const busy =
-    gen.isPending ||
-    exchange.isPending ||
-    importCred.isPending ||
-    openLogin.isPending
+  const busy = gen.isPending || exchange.isPending || importCred.isPending
   const proxyHint =
     link.proxyHint || (vm.proxy?.host ? proxyNamedLabel(vm.proxy) : '')
 
@@ -440,103 +412,13 @@ function ClaudeCredentialPanel({
           </Button>
         </div>
       ) : activeMethod === 'cc' ? (
-        <div className='space-y-2'>
-          <Hint>
-            未运行的槽位会先使用已绑定的出口开机，再打开终端启动 claude。
-            授权链接提取后显示在这里，复制后把授权码回填。
-          </Hint>
-          <Button
-            size='sm'
-            disabled={busy}
-            loading={openLogin.isPending}
-            onClick={() => openLogin.mutate()}
-          >
-            {openLogin.isPending
-              ? '正在准备登录终端…'
-              : vm.status?.toLowerCase() === 'running'
-                ? '打开官方登录终端'
-                : '启动并打开官方登录终端'}
-          </Button>
-          <Dialog open={loginOpen} onOpenChange={setLoginOpen}>
-            <DialogContent className='flex h-[min(760px,90vh)] max-w-4xl flex-col gap-3'>
-              <DialogHeader>
-                <DialogTitle>官方登录</DialogTitle>
-                <DialogDescription>
-                  终端里按两次回车确认主题。链接提取后可复制，授权码回填到终端。
-                </DialogDescription>
-              </DialogHeader>
-              <div className='space-y-2'>
-                <div className='flex flex-wrap items-center gap-2'>
-                  <Button
-                    size='sm'
-                    variant='outline'
-                    disabled={!loginUrl}
-                    onClick={() => {
-                      void navigator.clipboard
-                        ?.writeText(loginUrl)
-                        .then(() => toast.success('已复制授权链接'))
-                        .catch(() => toast.error('复制失败，请手动选中链接'))
-                    }}
-                  >
-                    <Copy className='size-3.5' aria-hidden='true' />
-                    复制链接
-                  </Button>
-                  {loginUrl ? (
-                    <a
-                      className='inline-flex items-center gap-1 text-xs underline'
-                      href={loginUrl}
-                      target='_blank'
-                      rel='noreferrer'
-                    >
-                      打开授权页
-                      <ExternalLink className='size-3' aria-hidden='true' />
-                    </a>
-                  ) : null}
-                </div>
-                <p className='text-xs break-all text-muted-foreground'>
-                  {loginUrl || '等待终端显示授权链接'}
-                </p>
-                <div className='space-y-1'>
-                  <Label htmlFor='login-auth-code'>授权码</Label>
-                  <Textarea
-                    id='login-auth-code'
-                    rows={2}
-                    value={loginCode}
-                    autoComplete='off'
-                    spellCheck={false}
-                    placeholder='完整授权码，含 # 后半段'
-                    onChange={(event) => setLoginCode(event.target.value)}
-                  />
-                </div>
-                <Button
-                  size='sm'
-                  disabled={!loginAuthCode(loginCode)}
-                  onClick={() => {
-                    loginTerm.current?.paste(loginAuthCode(loginCode))
-                    setLoginCode('')
-                  }}
-                >
-                  回填授权码
-                </Button>
-              </div>
-              <div className='min-h-0 flex-1'>
-                {loginOpen ? (
-                  <WsTerminal
-                    ref={loginTerm}
-                    ticketPath={`/api/panel/vms/${encodeURIComponent(vmId)}/shell-ticket`}
-                    socketPath={`/api/panel/vms/${encodeURIComponent(vmId)}/shell`}
-                    officialLogin
-                    onAuthUrl={setLoginUrl}
-                    onLogin={() => {
-                      void invalidate()
-                      toast.success('官方登录已写入槽凭证')
-                    }}
-                  />
-                ) : null}
-              </div>
-            </DialogContent>
-          </Dialog>
-        </div>
+        <ClaudeLogin
+          vm={vm}
+          disabled={busy}
+          onLogin={() => {
+            void invalidate()
+          }}
+        />
       ) : linkReady ? (
         <div className='space-y-2'>
           <div className='flex flex-wrap items-center gap-2'>

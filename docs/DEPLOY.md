@@ -34,7 +34,33 @@ KVM 槽需要宿主 `/dev/kvm` 可读写（控制面在容器内时，用一次 
 
 出现 `native stdin: Broken pipe` 时同时检查容器 OOM 事件与 CLI 子进程，不能只看 Rust PID 1 是否存活。CLI 退出或输出管道关闭后，内核必须清零 `cli_pid` / `ready_slots`、终止在途请求并拒绝新任务，由宿主 watchdog 恢复槽；不重放已发送的推理请求。
 
+CRAG V2 的资产、工作区和设备授权目录分别使用 Linux 私有 run 映射下的 `/run/kin/crag-native-assets`、`/run/kin/work`、`/run/kin/crag-license`；配置重写不能改回 DrvFS 家目录。目录归槽 UID 所有、权限 `0700`，设备文件/注册码为 `0600`。本机 Docker 创建 CRAG V2 容器时加载 `src/lib/vm/crag-v2-seccomp.json` 的默认拒绝策略，仅增加 `unshare(0x10020000)` 和 `mount` 标志 `0x44000` / `0x1000` / `0x1021` 所需例外；继续非 root、cap-drop ALL、no-new-privileges，不允许额外网络命名空间。创建/启动流程仅对缺少该策略的旧容器按需保留数据重建，已有精确策略的容器复用；单纯 Docker restart 不会更改 seccomp。不要用 privileged、cap-add SYS_ADMIN 或 seccomp=unconfined 替代。可用 `docker exec <槽容器> unshare --user --map-root-user --mount -- /home/kincli/.kin/crag-v2/claude-code-2.1.321/claude --version` 做无模型流量探针；仅看内核 PID 1 或空闲健康状态不足以证明 CLI 能启动。
+
 挂 `docker.sock`，`network_mode: host`。安装目录不再限定 `/opt/vm2api`：控制面自省 `docker inspect vm2api` 的 Mounts，把槽的 `-v` 源换算成宿主路径；也可用 `VM2API_HOST_ROOT` 显式指定。
+
+「内核」页拉取的二进制以独立缓存发布：默认内核使用 `share/wrap-cli-releases`，CRAG 使用 `share/crag/kernels/v2` 的 packages 子目录及原子 `current-<arch>.json` 指针。完成对应包校验后才切换，保留当前与上一快照；无指针时沿用出厂包，已有指针损坏时拒绝而不静默降级。只读出厂挂载无需改权限。镜像默认的 `KIN_KERNEL_BIN=<项目>/bin/kin-kernel` 支持更新，真正外部自定义路径覆盖仍固定，不会被拉取替换。CRAG 首次信任须由供应方配置完整官方出厂包和发行公钥，后续包必须使用相同发行公钥；发布源缺少授权归档时可继续安装本地有效包，但不能用 legacy ELF 代替。
+
+### CRAG V2 二进制更新
+
+CRAG 签名加密包的附件名为 `crag-v2-licensed-amd64.tar.gz`，包含原版 Claude Code 2.1.321。若 `deploy/payload.json` 固定了 `crag_release`，不指定 tag 时从对应 vm2api Release 拉取配套包；旧版本及显式指定的其他 tag 仍走供应仓 `dofastted/claude-code`。`manifest.version` 的 `v2` 是协议族，实际发行版本见缓存指针的 `release.tag`。原生进程使用非 bare 的 CC TUI。
+
+已有可信出厂包后，可在服务器独立更新，不升级或重启控制面：
+
+```bash
+sudo bash /opt/vm2api/deploy/install.sh crag-update --crag-version v2.0.1
+# 省略 --crag-version：拉取应用固定的配套包，未固定时拉供应仓最新版
+sudo bash /opt/vm2api/deploy/install.sh crag-update
+```
+
+需要包含 `scripts/update-crag.mjs` 的消费端源码/镜像；只下载一个新版 shell 到旧镜像不足以补齐 Node 更新器。支持已有 Docker 控制面和主机 Node 部署；读取进程环境或 `.env` 的 `VM2API_API_KEY` / `KIN_API_KEY`。无 `.env` 的主机 systemd 部署可由 root 从既有 `vm2api.service` 进程环境读取 key/port，不复制或打印完整环境；也可用进程环境 `PORT` 指定本地控制面端口。普通 `install` / `upgrade` 发现可信 CRAG 出厂包时也执行该步骤；`--no-start` / `--no-sync-wrap` 跳过，显式 `crag-update --no-start` 报错。
+
+更新顺序：供应仓完整包下载和原信任锚签名/成员 SHA/ELF 校验 → 原子切换下载指针 → 全槽清点 → 检查已有 CRAG V2 槽 → 有变化时以唯一标记暂停调度并排空在途请求 → 确认原生 `active_requests`、`queued`、`continuations` 全为 0 → 受管同步/必要时重载对应槽 → 核验实际运行 memfd SHA 与签名 payload 承诺一致。安装目录哈希相同不能视为已更新运行进程。
+
+不改变内核选择：CRAG V2 槽更新运行内核；已停止槽只更新磁盘，不开机；非 CRAG 本地槽若留有 `crag-v2` 缓存，仅原子更新该目录，不碰 wrapper、配置和进程；无副本的槽、Codex 槽不安装 CRAG。非 CRAG 集群槽标为 skip，不宣称替换其远端文件；当前物化器不支持的集群/KVM CRAG V2 目标在下载/停调度前失败。报告逐槽列出 `sync` / `cache` / `skip`。
+
+下载或信任校验失败不覆盖旧包、不停槽；未完成工具续接时拒绝强制重启。更新锁为 `share/crag/kernels/v2/.update-lock`，并发更新失败；强杀后须先确认无更新进程再清理锁。调度 hold 使用本次唯一 `crag_update_*` 标记，正常退出时只恢复自己的 hold；断电/强杀不承诺自动恢复。失败返回非零，不伪装成功。回滚用保留的前一完整包，仍须验证原发行公钥、空闲/续接状态并显式重载；禁止轮换授权身份、用 legacy ELF 降级或仅改指针后宣称已回滚。
+
+新重装接口在替换文件前停止对应服务，设置 Docker restart policy 为 no 并持久化 stopped/调度关闭，完成后不会自动开机。显式启动再恢复正常策略；重装不删除容器、家目录、凭据、指纹或工作区。
 
 ## 安装
 

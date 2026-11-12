@@ -121,7 +121,7 @@ test('official client same-object skip hides nothing', () => {
   assert.equal(personaHideInputTokens(body, after), 0)
 })
 
-test('official Claude Code traffic hides nothing and keeps inbound system', () => {
+test('official Claude Code traffic keeps inbound system only when passthrough is on', () => {
   const body = {
     system: CRS_OFFICIAL_SYSTEM,
     messages: [{ role: 'user', content: 'hello' }],
@@ -129,9 +129,11 @@ test('official Claude Code traffic hides nothing and keeps inbound system', () =
   }
   const headers = { 'user-agent': 'claude-cli/2.1.241 (external, cli)' }
   assert.equal(isOfficialClaudeCodeTraffic(headers, body), true)
+  const kept = applyCrsUnofficialPersona(body, { headers, mode: 'rewrite', park: true, officialClient: true })
+  assert.equal(kept.system, body.system)
+  assert.equal(personaHideForUnofficial(body, kept, { officialClient: true }), 0)
   const after = applyCrsUnofficialPersona(body, { headers, mode: 'rewrite', park: true })
-  assert.equal(after.system, body.system)
-  assert.equal(personaHideForUnofficial(body, after, { officialClient: true }), 0)
+  assert.notEqual(after.system, body.system)
 })
 
 test('none mode hides nothing', () => {
@@ -155,14 +157,15 @@ test('official_prompt does not start usage hide, even with standing and env', ()
   }
 })
 
-test('zero inject hides only the billing block it writes; caller system is not injected', () => {
+test('zero inject hides only billing and excludes the preserved caller system', () => {
   const before = { system: '你是一个高速收费员。', messages: helloBody.messages }
   const after = applyCrsUnofficialPersona(before, { mode: 'zero', identity: { timezone: 'Asia/Tokyo' } })
   const hide = personaHideInputTokens(before, after)
   const billing = String(after.system[0].text || '')
   assert.ok(billing.startsWith('x-anthropic-billing-header:'))
   assert.match(billing, /prompt_version=<You are Claude Code, Anthropic's official CLI for Claude\.>/)
-  assert.equal(after.system.length, 1)
+  assert.equal(after.system.length, 2)
+  assert.deepEqual(after.system[1], { type: 'text', text: before.system })
   assert.equal(hide.official, estimateClaudeInputTokens(billing))
   assert.equal(hide.overlay || 0, 0)
   assert.equal(Number(hide), hide.official + (hide.overlay || 0))

@@ -20,6 +20,8 @@ import { extractOpenaiUsage } from '../../src/lib/protocol/openai-usage.mjs'
 import { callRustKernel, rustKernelHealth } from '../../src/lib/transport/rust-kernel-client.mjs'
 import { callCodexKernel, streamCodexKernel } from '../../src/lib/transport/codex-kernel-client.mjs'
 import { forwardApi, readApiJson } from '../../src/lib/transport/api-kernel-client.mjs'
+import { normalizeRedaction } from '../../src/lib/redaction/policy.mjs'
+import { publishRedactionForTests } from '../../src/lib/redaction/runtime.mjs'
 
 test('restoreUncommittedHop keeps a structured upstream code', () => {
   const restored = restoreUncommittedHop({
@@ -140,6 +142,39 @@ test('setup-token worker envelope is inference-only', () => {
   assert.match(String(out.headers['anthropic-beta'] || ''), /oauth-2025-04-20/)
 })
 
+test('worker canonicalizes passthrough bodies before either kernel', () => {
+  const body = {
+    model: 'claude-sonnet-5',
+    settings: { theme: 'dark' },
+    response_format: { type: 'json_object' },
+    messages: [
+      {
+        role: 'user',
+        content: [{ type: 'text', text: 'hello', annotations: [{ type: 'client-only' }] }],
+      },
+    ],
+    crag_prompt: { mode: 'append', text: 'caller tail' },
+  }
+  for (const cragPrint of [false, true]) {
+    const out = finalizeWorkerPayload({
+      body,
+      reqHeaders: {},
+      exec: {
+        homeDir: '',
+        vm: { claude: { mode: 'setup-token', scope: 'user:inference' } },
+        workerStatus: { runtime_variant: 'crag-v2', capabilities: ['prompt_append'] },
+      },
+      identity: null,
+      cliHop: true,
+      cragPrint,
+    })
+    assert.equal(out.body.settings, undefined)
+    assert.deepEqual(out.body.output_config?.format, { type: 'json_schema', schema: { type: 'object' } })
+    assert.deepEqual(out.body.messages[0].content, [{ type: 'text', text: 'hello' }])
+    assert.deepEqual(out.body.crag_prompt, cragPrint ? body.crag_prompt : undefined)
+  }
+})
+
 test('cli-hop envelope keeps role=system turns that the VM betas do not declare', () => {
   const body = {
     model: 'claude-opus-5-5',
@@ -222,6 +257,118 @@ test('setup-token cli-hop summarizes hidden thinking by default and keeps update
   })
   assert.equal(passed.body.thinking.display, 'updates')
   assert.ok(passed.body.betas.includes('thinking-display-updates-2026-08-18'))
+})
+
+test('cli-hop appends inline-tools when a message carries a tool_definition', () => {
+  const block = {
+    type: 'tool_addition',
+    tool: {
+      type: 'tool_definition',
+      definition: { name: 'lookup', description: 'lookup', input_schema: { type: 'object' } },
+    },
+  }
+  const out = finalizeWorkerPayload({
+    body: {
+      model: 'claude-opus-5-5',
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'system', content: [{ type: 'text', text: 'note' }, block] },
+      ],
+    },
+    reqHeaders: { 'anthropic-beta': 'inline-tools-2026-09-15' },
+    exec: { homeDir: '', vm: { claude: { mode: 'setup-token', scope: 'user:inference' } } },
+    identity: null,
+    cliHop: true,
+  })
+  assert.ok(out.body.betas.includes('inline-tools-2026-09-15'))
+  assert.equal(out.body.messages[1].content[1].tool.type, 'tool_definition')
+  const plain = finalizeWorkerPayload({
+    body: { model: 'claude-opus-5-5', messages: [{ role: 'user', content: 'hi' }] },
+    reqHeaders: { 'anthropic-beta': 'inline-tools-2026-09-15' },
+    exec: { homeDir: '', vm: { claude: { mode: 'setup-token', scope: 'user:inference' } } },
+    identity: null,
+    cliHop: true,
+  })
+  assert.ok(!plain.body.betas.includes('inline-tools-2026-09-15'))
+})
+
+test('CRAG v2 receives the preset model boundary only from a worker that consumes it', () => {
+  const body = { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] }
+  const reqHeaders = {}
+  const vm = { dataplane: 'crag', crag_kernel_version: 'v2', claude: { mode: 'setup-token', scope: 'user:inference' } }
+  const crag = finalizeWorkerPayload({
+    body,
+    reqHeaders,
+    exec: {
+      homeDir: '',
+      vm,
+      workerStatus: { runtime_variant: 'crag-v2', capabilities: ['linux_tui_pty'] },
+    },
+    identity: null,
+  })
+  assert.equal(crag.body.crag_model.id, 'claude-haiku-4-5-20251001')
+  assert.equal(crag.body.crag_model.capabilities.supports_context_management, false)
+  assert.equal(crag.body.crag_model.capabilities.supports_effort, false)
+  assert.equal(crag.body.crag_model.params.max_tokens_default, 8192)
+  assert.equal(crag.body.crag_model.params.max_tokens_cap, 64000)
+  assert.ok(crag.body.crag_model.betas.drop.includes('context-management-2025-06-27'))
+  const forwarded = finalizeWorkerPayload({
+    body: { ...body, crag_prompt: { mode: 'append', text: 'caller' }, crag_model: { id: 'leaked' } },
+    reqHeaders,
+    exec: { homeDir: '', vm, workerStatus: { runtime_variant: 'crag-v2', execution_mode: 'crag_slots' } },
+    identity: null,
+  })
+  assert.equal(forwarded.body.crag_model, undefined)
+  assert.equal(forwarded.body.crag_prompt, undefined)
+  const wrap = finalizeWorkerPayload({
+    body,
+    reqHeaders,
+    exec: { homeDir: '', vm: { dataplane: 'wrap', claude: { mode: 'setup-token', scope: 'user:inference' } } },
+    identity: null,
+  })
+  assert.equal(wrap.body.crag_model, undefined)
+})
+
+test('a wrap VM does not inherit a global CRAG v2 route', () => {
+  const body = {
+    model: 'claude-haiku-4-5',
+    crag_prompt: { mode: 'append', text: 'caller' },
+    messages: [{ role: 'user', content: 'hi' }],
+  }
+  const wrap = finalizeWorkerPayload({
+    body,
+    reqHeaders: {},
+    exec: { homeDir: '', vm: { dataplane: 'wrap' } },
+    routing: { inference: { dataplane: 'crag', crag_kernel_version: 'v2' } },
+    identity: null,
+  })
+  assert.equal(wrap.body.crag_model, undefined)
+  assert.equal(wrap.body.crag_prompt, undefined)
+  const forced = finalizeWorkerPayload({
+    body,
+    reqHeaders: {},
+    exec: {
+      homeDir: '',
+      vm: { dataplane: 'wrap' },
+      workerStatus: { runtime_variant: 'crag-v2', capabilities: ['linux_tui_pty'] },
+    },
+    identity: null,
+    cragPrint: false,
+  })
+  assert.equal(forced.body.crag_model, undefined)
+  // A live native worker can override stale VM metadata, but model support is not prompt support.
+  const modelOnly = finalizeWorkerPayload({
+    body,
+    reqHeaders: {},
+    exec: {
+      homeDir: '',
+      vm: { dataplane: 'wrap' },
+      workerStatus: { runtime_variant: 'crag-v2', capabilities: ['model_directive'] },
+    },
+    identity: null,
+  })
+  assert.equal(modelOnly.body.crag_model.id, 'claude-haiku-4-5-20251001')
+  assert.equal(Object.hasOwn(modelOnly.body, 'crag_prompt'), false)
 })
 
 const unix = process.platform !== 'win32'
@@ -309,6 +456,145 @@ unixTest('callGoWorker sends envelope over authenticated Unix socket', async () 
     assert.equal(result.body.content[0].text, 'ok')
   } finally {
     await fx.close()
+  }
+})
+
+unixTest('callGoWorker puts caller cwd only in an authorized native Unix socket envelope', async () => {
+  const posted = []
+  const fx = await fixture(async (req, res) => {
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    posted.push({
+      method: req.method,
+      url: req.url,
+      token: req.headers['x-kin-internal-token'],
+      envelope: JSON.parse(Buffer.concat(chunks).toString('utf8')),
+    })
+    res.writeHead(200, { 'content-type': 'application/json', 'x-terminal-state': 'verified' })
+    res.end(JSON.stringify({ type: 'message', role: 'assistant', content: [{ type: 'text', text: 'ok' }] }))
+  })
+  const callerCwd = '/synthetic/work space/项目'
+  const body = {
+    model: 'claude-haiku-4-5',
+    messages: [{ role: 'user', content: 'hi' }],
+    crag_prompt: { mode: 'append', text: 'caller guidance' },
+    caller_cwd: '/synthetic/forged-body-value',
+  }
+  try {
+    for (const [name, variant, capabilities, cwd, cragPrint, expectCwd, expectPrompt] of [
+      ['authorized', 'crag-v2', ['caller_cwd', 'prompt_append'], callerCwd, null, true, true],
+      ['cwd only', 'crag-v2', ['caller_cwd'], callerCwd, null, true, false],
+      ['append only', 'crag-v2', ['prompt_append'], callerCwd, null, false, true],
+      ['not native', 'cli-node', ['caller_cwd', 'prompt_append'], callerCwd, null, false, false],
+      ['print disabled', 'crag-v2', ['caller_cwd', 'prompt_append'], callerCwd, false, false, false],
+      ['no trusted cwd', 'crag-v2', ['caller_cwd', 'prompt_append'], null, null, false, true],
+    ]) {
+      const result = await callGoWorker({
+        exec: { ...fx.exec, workerStatus: { runtime_variant: variant, capabilities } },
+        body,
+        callerCwd: cwd,
+        cragPrint,
+        timeoutMs: 3000,
+      })
+      assert.equal(result.ok, true, name)
+      assert.equal(posted.length, 1, name)
+      const { method, url, token, envelope } = posted.pop()
+      assert.deepEqual({ method, url, token }, { method: 'POST', url: '/internal/v1/messages', token: 'internal-test' })
+      assert.equal(Object.hasOwn(envelope, 'caller_cwd'), expectCwd, name)
+      if (expectCwd) assert.equal(envelope.caller_cwd, callerCwd, name)
+      assert.equal(Object.hasOwn(envelope.body, 'caller_cwd'), false, name)
+      assert.equal(JSON.stringify(envelope.body).includes(callerCwd), false, name)
+      assert.equal(JSON.stringify(envelope).includes(body.caller_cwd), false, name)
+      assert.deepEqual(envelope.body.crag_prompt, expectPrompt ? body.crag_prompt : undefined, name)
+      assert.equal(Object.hasOwn(envelope.body, 'crag_model'), false, name)
+    }
+  } finally {
+    await fx.close()
+  }
+})
+
+unixTest('redaction masks caller cwd and omits it when the masked value is no longer absolute', async (t) => {
+  const rawCwd = '/synthetic/private-workspace'
+  const posted = []
+  const fx = await fixture(async (req, res) => {
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    posted.push(JSON.parse(Buffer.concat(chunks).toString('utf8')))
+    res.writeHead(200, { 'content-type': 'application/json', 'x-terminal-state': 'verified' })
+    res.end(JSON.stringify({ type: 'message', role: 'assistant', content: [] }))
+  })
+  t.after(async () => {
+    publishRedactionForTests(null)
+    await fx.close()
+  })
+  const policy = normalizeRedaction({ enabled: true, secrets: true, personal: false })
+  const exec = { ...fx.exec, workerStatus: { runtime_variant: 'crag-v2', capabilities: ['caller_cwd'] } }
+  const body = { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: rawCwd }] }
+  for (const replacement of ['/synthetic/{{R_PATH_fixture}}', '{{R_PATH_fixture}}']) {
+    publishRedactionForTests({
+      enabled: true,
+      ready: true,
+      policy,
+      client: {
+        async mask({ body }) {
+          return { body: body.replaceAll(rawCwd, replacement) }
+        },
+        async restore({ body }) {
+          return { body }
+        },
+      },
+    })
+    const result = await callGoWorker({
+      exec,
+      body,
+      callerCwd: rawCwd,
+      routing: { redaction: policy },
+      redactionPrincipal: 'fixture-principal',
+      timeoutMs: 3000,
+    })
+    assert.equal(result.ok, true)
+    assert.equal(posted.length, 1)
+    const envelope = posted.pop()
+    assert.equal(JSON.stringify(envelope).includes(rawCwd), false)
+    assert.ok(JSON.stringify(envelope.body.messages).includes(replacement))
+    assert.equal(envelope.caller_cwd, replacement.startsWith('/') ? replacement : undefined)
+  }
+})
+
+unixTest('prebuilt call and stream envelopes cannot carry caller cwd', async (t) => {
+  const posted = []
+  const fx = await fixture(async (req, res) => {
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    const envelope = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+    posted.push(envelope)
+    if (envelope.stream) {
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'x-terminal-state': 'verified' })
+      writeData(res, { type: 'message_start', message: { id: 'msg_prebuilt' } })
+      writeData(res, { type: 'message_stop' })
+      res.end()
+      return
+    }
+    res.writeHead(200, { 'content-type': 'application/json', 'x-terminal-state': 'verified' })
+    res.end(JSON.stringify({ type: 'message', role: 'assistant', content: [] }))
+  })
+  t.after(() => fx.close())
+  const callerCwd = '/synthetic/untrusted-prebuilt'
+  const body = { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] }
+  for (const [send, stream] of [
+    [callGoWorker, false],
+    [streamGoWorker, true],
+  ]) {
+    const result = await send({
+      exec: { ...fx.exec, workerStatus: { runtime_variant: 'crag-v2', capabilities: ['caller_cwd'] } },
+      envelope: { body: { ...body, caller_cwd: callerCwd }, caller_cwd: callerCwd, stream },
+      timeoutMs: 3000,
+    })
+    assert.equal(result.ok, true)
+    assert.equal(posted.length, 1)
+    const sent = posted.pop()
+    assert.equal(Object.hasOwn(sent, 'caller_cwd'), false)
+    assert.deepEqual(sent.body, body)
   }
 })
 
@@ -533,6 +819,40 @@ unixTest('final headers survive an upstream error without becoming a downstream 
     assert.equal(result.ok, false)
     assert.equal(result.committed, false)
     assert.deepEqual(snapshots, [{ 'x-stainless-retry-count': '1' }])
+  } finally {
+    await fx.close()
+  }
+})
+
+unixTest('a reported final body is capped at 10000 tokens and stays off the caller stream', async () => {
+  const fx = await fixture((req, res) => {
+    req.resume()
+    res.setHeader('content-type', 'text/event-stream')
+    const body = '汉'.repeat(10_050)
+    res.write(
+      `event: kin_outbound_headers\ndata: ${JSON.stringify({
+        type: 'kin_outbound_headers',
+        headers: { 'user-agent': 'claude-cli/2.1.317 (external, cli)', authorization: 'Bearer secret' },
+        body,
+        body_truncated: false,
+      })}\n\n`,
+    )
+    res.end('event: message_stop\ndata: {"type":"message_stop"}\n\n')
+  })
+  try {
+    const lines = []
+    const snapshots = []
+    const result = await streamGoWorker({
+      exec: fx.exec,
+      body: { model: 'claude-test', messages: [{ role: 'user', content: 'hi' }] },
+      onOutboundHeaders: (headers, extra) => snapshots.push({ headers, extra }),
+      onEvent: (line) => lines.push(line),
+    })
+    assert.equal(result.ok, true)
+    assert.equal(snapshots[0].headers['user-agent'], 'claude-cli/2.1.317 (external, cli)')
+    assert.equal(snapshots[0].extra.body.length, 10_000)
+    assert.equal(snapshots[0].extra.body_truncated, true)
+    assert.doesNotMatch(lines.join('\n'), /kin_outbound_headers|2\.1\.317/)
   } finally {
     await fx.close()
   }

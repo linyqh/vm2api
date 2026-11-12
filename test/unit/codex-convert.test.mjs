@@ -147,6 +147,21 @@ test('legacy fast service tier is sent as priority to Codex', () => {
   assert.equal(converted.body.service_tier, 'priority')
 })
 
+test('chat and completions conversion preserve service_tier', () => {
+  const chat = toCodexResponses('openai.chat', {
+    model: 'gpt-6-luna',
+    messages: [{ role: 'user', content: 'hello' }],
+    service_tier: 'priority',
+  })
+  const completions = toCodexResponses('openai.completions', {
+    model: 'gpt-6-luna',
+    prompt: 'hello',
+    service_tier: 'flex',
+  })
+  assert.equal(chat.body.service_tier, 'priority')
+  assert.equal(completions.body.service_tier, 'flex')
+})
+
 test('Codex hop drops max_output_tokens and keeps reasoning effort', () => {
   const converted = toCodexResponses('openai.responses', {
     model: 'gpt-5.5',
@@ -158,6 +173,104 @@ test('Codex hop drops max_output_tokens and keeps reasoning effort', () => {
   assert.equal(converted.body.max_output_tokens, undefined)
   assert.equal(converted.body.temperature, undefined)
   assert.equal(converted.body.reasoning.effort, 'high')
+})
+
+test('new GPT family requests keep ultra reasoning through each public dialect', () => {
+  for (const [protocol, body] of [
+    ['openai.responses', { model: 'gpt-6.2-astra', input: 'hello', reasoning: { effort: 'ultra' } }],
+    [
+      'openai.chat',
+      { model: 'gpt-6.2-sol', messages: [{ role: 'user', content: 'hello' }], reasoning_effort: 'ultra' },
+    ],
+    ['openai.completions', { model: 'gpt-6.2-sol', prompt: 'hello', reasoning_effort: 'ultra' }],
+  ]) {
+    const converted = toCodexResponses(protocol, body)
+    assert.equal(converted.ok, true)
+    assert.equal(converted.body.model, body.model)
+    assert.equal(converted.body.reasoning.effort, 'ultra')
+  }
+})
+
+test('anthropic base64 image converts to input_image data url', () => {
+  const converted = toCodexResponses(
+    'anthropic.messages',
+    {
+      model: 'gpt-6.1-sol',
+      messages: [
+        {
+          role: 'user',
+          content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'aaaa' } }],
+        },
+      ],
+    },
+    { anthropic_to_codex: true },
+  )
+  assert.equal(converted.ok, true)
+  assert.deepEqual(converted.body.input[0].content, [{ type: 'input_image', image_url: 'data:image/png;base64,aaaa' }])
+})
+
+test('anthropic url image converts to input_image', () => {
+  const converted = toCodexResponses(
+    'anthropic.messages',
+    {
+      model: 'gpt-6.1-sol',
+      messages: [
+        {
+          role: 'user',
+          content: [{ type: 'image', source: { type: 'url', url: 'https://example.com/pic.png' } }],
+        },
+      ],
+    },
+    { anthropic_to_codex: true },
+  )
+  assert.equal(converted.ok, true)
+  assert.deepEqual(converted.body.input[0].content, [{ type: 'input_image', image_url: 'https://example.com/pic.png' }])
+})
+
+test('anthropic mixed text and images preserve block order', () => {
+  const converted = toCodexResponses(
+    'anthropic.messages',
+    {
+      model: 'gpt-6.1-sol',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'first' },
+            { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: 'b64a' } },
+            { type: 'text', text: 'second' },
+            { type: 'image', source: { type: 'url', url: 'https://example.com/b.png' } },
+          ],
+        },
+      ],
+    },
+    { anthropic_to_codex: true },
+  )
+  assert.deepEqual(converted.body.input[0].content, [
+    { type: 'input_text', text: 'first' },
+    { type: 'input_image', image_url: 'data:image/jpeg;base64,b64a' },
+    { type: 'input_text', text: 'second' },
+    { type: 'input_image', image_url: 'https://example.com/b.png' },
+  ])
+})
+
+test('chat image_url still converts after anthropic image handling', () => {
+  const body = chatToCodexResponses({
+    model: 'gpt-5.5',
+    messages: [
+      {
+        role: 'user',
+        content: [
+          { type: 'image_url', image_url: 'https://openai.example/x.png' },
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,bbbb' } },
+        ],
+      },
+    ],
+  })
+  assert.deepEqual(body.input[0].content, [
+    { type: 'input_image', image_url: 'https://openai.example/x.png' },
+    { type: 'input_image', image_url: 'data:image/png;base64,bbbb' },
+  ])
 })
 
 test('anthropic convert stays off by default', () => {
@@ -173,6 +286,141 @@ test('anthropic convert stays off by default', () => {
     { anthropic_to_codex: true },
   )
   assert.equal(allowed.ok, true)
+})
+
+test('anthropic array system becomes a developer message', () => {
+  const pine = 'You must reply with exactly the single word PINEAPPLE and nothing else.'
+  const converted = toCodexResponses(
+    'anthropic.messages',
+    {
+      model: 'gpt-6.1-sol',
+      system: [
+        { type: 'text', text: 'keep-a', cache_control: { type: 'ephemeral' } },
+        { type: 'text', text: pine },
+      ],
+      messages: [{ role: 'user', content: 'Say hello.' }],
+    },
+    { anthropic_to_codex: true },
+  )
+  assert.equal(converted.ok, true)
+  assert.equal(converted.body.input[0].role, 'developer')
+  assert.deepEqual(
+    converted.body.input[0].content.map((part) => part.text),
+    ['keep-a', pine],
+  )
+  assert.equal(JSON.stringify(converted.body.input[0]).includes('cache_control'), false)
+  const asString = toCodexResponses(
+    'anthropic.messages',
+    {
+      model: 'gpt-6.1-sol',
+      system: pine,
+      messages: [{ role: 'user', content: 'Say hello.' }],
+    },
+    { anthropic_to_codex: true },
+  )
+  assert.equal(asString.body.input[0].content[0].text, pine)
+  const empty = toCodexResponses(
+    'anthropic.messages',
+    {
+      model: 'gpt-6.1-sol',
+      system: '',
+      messages: [{ role: 'user', content: 'Say hello.' }],
+    },
+    { anthropic_to_codex: true },
+  )
+  assert.equal(
+    empty.body.input.some((item) => item.role === 'developer'),
+    false,
+  )
+})
+
+for (const stream of [false, true]) {
+  for (const asBlocks of [false, true]) {
+    test(`anthropic tool history survives conversion (stream=${stream}, blocks=${asBlocks})`, () => {
+      const value = 'TOOL_HISTORY_PROBE'
+      const body = {
+        model: 'gpt-6.1-sol',
+        stream,
+        messages: [
+          { role: 'user', content: 'Read the probe.' },
+          {
+            role: 'assistant',
+            content: [{ type: 'tool_use', id: 'call_probe', name: 'read_probe', input: { path: 'a"b', n: 2 } }],
+          },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'call_probe',
+                content: asBlocks ? [{ type: 'text', text: value }] : value,
+              },
+            ],
+          },
+        ],
+      }
+      const original = structuredClone(body)
+      const converted = toCodexResponses('anthropic.messages', body, { anthropic_to_codex: true })
+      assert.equal(converted.ok, true)
+      assert.equal(converted.body.stream, stream)
+      assert.deepEqual(converted.body.input.slice(1), [
+        { type: 'function_call', call_id: 'call_probe', name: 'read_probe', arguments: '{"path":"a\\"b","n":2}' },
+        { type: 'function_call_output', call_id: 'call_probe', output: value },
+      ])
+      assert.deepEqual(body, original)
+    })
+  }
+}
+
+test('anthropic mixed text and multiple tools retain block order', () => {
+  const converted = toCodexResponses(
+    'anthropic.messages',
+    {
+      model: 'gpt-6.1-sol',
+      system: [{ type: 'text', text: 'Keep system.' }],
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'text', text: 'before' },
+            { type: 'tool_use', id: 'call_a', name: 'a', input: {} },
+            { type: 'text', text: 'between' },
+            { type: 'tool_use', id: 'call_b', name: 'b', input: { nested: [true] } },
+            { type: 'text', text: 'after' },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_a',
+              content: [
+                { type: 'text', text: 'first' },
+                { type: 'text', text: 'second' },
+              ],
+            },
+            { type: 'text', text: 'between results' },
+            { type: 'tool_result', tool_use_id: 'call_b', content: '', is_error: true },
+            { type: 'text', text: 'finish' },
+          ],
+        },
+      ],
+    },
+    { anthropic_to_codex: true },
+  )
+  assert.deepEqual(converted.body.input, [
+    { type: 'message', role: 'developer', content: [{ type: 'input_text', text: 'Keep system.' }] },
+    { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'before' }] },
+    { type: 'function_call', call_id: 'call_a', name: 'a', arguments: '{}' },
+    { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'between' }] },
+    { type: 'function_call', call_id: 'call_b', name: 'b', arguments: '{"nested":[true]}' },
+    { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'after' }] },
+    { type: 'function_call_output', call_id: 'call_a', output: 'first\nsecond' },
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'between results' }] },
+    { type: 'function_call_output', call_id: 'call_b', output: '' },
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'finish' }] },
+  ])
 })
 
 test('responses SSE maps to chat chunks', () => {

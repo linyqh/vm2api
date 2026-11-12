@@ -114,15 +114,25 @@ export function slotAccountLabel(
   return id || fallback?.emptyLabel || '未绑定账号'
 }
 
-/** `vm-01` without an email is unbound. A custom slot id is the name and stays visible. */
+/** `vm-01` with only its creation number is unbound. A distinct display name stays visible. */
 export function slotNameLabel(vm?: Partial<Vm>): string {
-  const name = String(vm?.name || vm?.id || '').trim()
+  const id = String(vm?.id || '').trim()
+  const rawName = String(vm?.name || '').trim()
   const email = String(vm?.email || '').trim()
+  const nameNum = slotNumber(rawName)
+  const idNum = slotNumber(id)
+  const sameNumber = nameNum != null && idNum != null && nameNum === idNum
   if (isAntigravityVm(vm as Vm | undefined) && hasSlotCredential(vm))
-    return name || '已登录官方客户端'
-  if (email || (name && !/^vm-\d+$/i.test(String(vm?.id || '').trim())))
-    return name || '未绑定账号'
+    return rawName || id || '已登录官方客户端'
+  if (rawName && rawName !== id && !sameNumber) return rawName
+  const name = rawName || id
+  if (email || (name && !/^vm-\d+$/i.test(id))) return name || '未绑定账号'
   return '未绑定账号'
+}
+
+function slotNumber(value: string): number | null {
+  const matched = value.match(/^vm-(\d+)$/i) || value.match(/^0*(\d+)$/)
+  return matched ? Number(matched[1]) : null
 }
 
 /** 卡片 / 表格用：本地段优先，域名过长只留尾标。完整地址走 title。 */

@@ -46,7 +46,7 @@ export const PERSONA_PRESET_OPTIONS: [PersonaPreset, string][] = [
   ['official_full', '官方完整提示词'],
   ['zero', '0注入'],
   ['custom', '自定义'],
-  ['official_303', '官方 2.1.303（按模型）'],
+  ['official_303', '官方 2.1.321（按模型）'],
 ]
 export const OVERLAY_PRESET_OPTIONS: [OverlayPreset, string][] = [
   ['off', '关闭'],
@@ -185,10 +185,10 @@ export const DEFAULT_PERSONA_TEMPLATES: Record<PersonaPreset, PersonaBlock[]> =
       },
       {
         id: 'caller_system',
-        note: '第5段可选。只放顶层 system。空则丢弃',
+        note: '第三方 system。不进顶层 system，包成 <system-reminder> 放在第一条 user 最前面',
         drop_if_empty: true,
         type: 'text',
-        text: '{{caller_system}}',
+        text: '<system-reminder>\n{{caller_system}}\n</system-reminder>\n',
       },
     ],
     official_full: [
@@ -249,7 +249,7 @@ export const DEFAULT_PERSONA_TEMPLATES: Record<PersonaPreset, PersonaBlock[]> =
     zero: [
       {
         id: 'billing',
-        note: '0注入只留计费头，官方身份句放在 prompt_version',
+        note: '0注入计费头，官方身份句放在 prompt_version；调用方 system 另按原块保留',
         type: 'text',
         text: '{{billing_semi}} prompt_version=<{{identity}}>',
       },
@@ -697,6 +697,57 @@ export function presetSeed<K extends string>(
   return own && own.length ? own : defaults['official' as K]
 }
 
+/** Mirror the gateway's narrowly scoped migration of the saved 2.1.303 official default. */
+export function migrateLegacyOfficialTemplate(
+  preset: PersonaPreset,
+  blocks: readonly RawBlock[]
+): RawBlock[] {
+  if (preset !== 'official') return blocks as RawBlock[]
+  const legacy: RawBlock[] = [
+    ...DEFAULT_PERSONA_TEMPLATES.official
+      .filter((block) =>
+        [
+          'billing',
+          'identity',
+          'harness',
+          'dynamic_boundary',
+          'guidance',
+        ].includes(String(block.id))
+      )
+      .map((block) =>
+        block.id === 'identity' ? { ...block, text: '{{identity_cli}}' } : block
+      ),
+    ...['env', 'env_timezone', 'env_locale'].map((id) => ({
+      id,
+      role: 'system',
+      drop_if_empty: true,
+      type: 'text',
+      text: `{{${id === 'env' ? 'env_303' : id}}}`,
+    })),
+  ]
+  const shape = (value: RawBlock) => {
+    if (!value || typeof value !== 'object') return value
+    const { note: _note, ...block } = value
+    return block
+  }
+  const stable = (value: unknown) =>
+    JSON.stringify(value, (_key, item) =>
+      item && typeof item === 'object' && !Array.isArray(item)
+        ? Object.fromEntries(
+            Object.entries(item).sort(([a], [b]) => a.localeCompare(b))
+          )
+        : item
+    )
+  if (stable(blocks.map(shape)) !== stable(legacy.map(shape)))
+    return blocks as RawBlock[]
+  return [
+    ...blocks,
+    DEFAULT_PERSONA_TEMPLATES.official.find(
+      (block) => block.id === 'caller_system'
+    )!,
+  ]
+}
+
 /**
  * 草稿与内置预设逐字节相同就存 `[]`，让后端继续用它自己的预设，
  * 这样以后预设改进还能自动到达生产。只有真编辑过才落成显式块列表。
@@ -951,7 +1002,8 @@ function withStandingSlot(
  */
 export function previewSystemBlocks(
   blocks: readonly RawBlock[],
-  vars: Record<string, string>
+  vars: Record<string, string>,
+  { preserveCallerSystem = false } = {}
 ): SystemPreviewBlock[] {
   const source = withStandingSlot(blocks, vars.agent_standing || '')
   const out: SystemPreviewBlock[] = []
@@ -978,6 +1030,22 @@ export function previewSystemBlocks(
       ttl: typeof cc.ttl === 'string' ? cc.ttl : '',
       scope: typeof cc.scope === 'string' ? cc.scope : '',
       placeholder: blank || text === EMPTY_BLOCK_TEXT,
+    })
+  }
+  if (
+    preserveCallerSystem &&
+    vars.caller_system?.trim() &&
+    !blocks.some((block) =>
+      extractTemplateVars(block.text).includes('caller_system')
+    )
+  ) {
+    out.push({
+      id: 'caller_system',
+      text: vars.caller_system,
+      hide: false,
+      ttl: '',
+      scope: '',
+      placeholder: false,
     })
   }
   return out
