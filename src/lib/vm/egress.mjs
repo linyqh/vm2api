@@ -6,10 +6,12 @@
  * redirected SOCKS bridge.
  */
 import { execFileSync, spawn } from 'node:child_process'
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { getDb, isDbOpen } from '../db/database.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
+import { toHostPath } from './host-path.mjs'
 import { socksProxyUrl } from './socks-address.mjs'
 import { assertProxyAllowed, proxyBlockedReason } from './proxy-policy.mjs'
 
@@ -480,6 +482,286 @@ function sleepMsSync(ms) {
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
+const DOCKER_SOCK = '/var/run/docker.sock'
+const EGRESS_CONTAINER_CFG_DIR = '/etc/kin-egress'
+const EGRESS_CONTAINER_BIN_DIR = '/opt/kin-egress-bin'
+
+/**
+ * Where a control-plane kin-egress runs.
+ *
+ * `process`: a detached child of this Node process. Inside the vm2api container
+ * that child still lives in the container's cgroup, so every `docker restart
+ * vm2api` (deploy, upgrade, crash) killed every helper. Each SOCKS slot then had
+ * no DNS and no TCP until a probe or the watchdog respawned it, and requests on
+ * those slots failed with EAI_AGAIN.
+ *
+ * `container`: each helper is its own host-network container with a restart
+ * policy, so it outlives control-plane restarts and the existing reuse path
+ * keeps it. Chosen automatically when the control plane runs in Docker (the
+ * compose file sets VM2API_CONTAINER_NAME and mounts the socket);
+ * KIN_EGRESS_RUNTIME=process|container overrides.
+ */
+export function egressRuntime(env = process.env, sockExists = () => fs.existsSync(DOCKER_SOCK)) {
+  const forced = String(env?.KIN_EGRESS_RUNTIME || '')
+    .trim()
+    .toLowerCase()
+  if (forced === 'container' || forced === 'process') return forced
+  return String(env?.VM2API_CONTAINER_NAME || '').trim() && sockExists() ? 'container' : 'process'
+}
+
+/** Control-plane helper container; `kin-egress-<key>` is taken by pre-1.3.88 node helpers. */
+export function egressContainerName(proxyId) {
+  return `kin-cp-egress-${proxyKey(proxyId)}`
+}
+
+/**
+ * docker run argv for one helper. The digest covers everything that needs a new
+ * container: config body, mounts and the binary on disk (an upgrade swaps it).
+ * The image only supplies a root filesystem for the static binary, so it stays
+ * out of the digest: a control-plane image bump must not cut every slot's exit.
+ * `platform` pins the native image: the ARM64 control plane exports
+ * DOCKER_DEFAULT_PLATFORM=linux/amd64 for slots, which `docker run` would inherit.
+ */
+export function egressContainerSpec({
+  proxyId,
+  body,
+  hostDir,
+  hostBinDir,
+  binName,
+  image,
+  binFingerprint = '',
+  platform = nativeDockerPlatform(),
+}) {
+  const name = egressContainerName(proxyId)
+  // Proxy URL, DNS and policy reload via SIGHUP; only fields that need a new
+  // container are hashed. The container name already pins proxy_id.
+  const digest = crypto
+    .createHash('sha256')
+    .update(['egress-v2', egressRebuildKey(body), hostDir, hostBinDir, binName, binFingerprint].map(String).join('\0'))
+    .digest('hex')
+    .slice(0, 16)
+  const args = [
+    'run',
+    '-d',
+    '--name',
+    name,
+    '--network',
+    'host',
+    '--restart',
+    'unless-stopped',
+    '--read-only',
+    '--cap-drop',
+    'ALL',
+    '--security-opt',
+    'no-new-privileges',
+    // Same uid as the control plane that wrote the 0600 config; no capabilities.
+    '--user',
+    '0:0',
+    '--log-driver',
+    'local',
+    '--log-opt',
+    'max-size=10m',
+    '--label',
+    'kin.egress=1',
+    '--label',
+    'kin.egress.local=1',
+    '--label',
+    `kin.egress.proxy=${proxyId}`,
+    '--label',
+    `kin.egress.cfg=${digest}`,
+    '--label',
+    `kin.egress.bin=${binFingerprint}`,
+    '--label',
+    'kin.egress.reload=hup',
+    ...(platform ? ['--platform', platform] : []),
+    '-v',
+    `${hostDir}:${EGRESS_CONTAINER_CFG_DIR}:ro`,
+    '-v',
+    `${hostBinDir}:${EGRESS_CONTAINER_BIN_DIR}:ro`,
+    '--entrypoint',
+    `${EGRESS_CONTAINER_BIN_DIR}/${binName}`,
+    image,
+    '-config',
+    `${EGRESS_CONTAINER_CFG_DIR}/egress.json`,
+  ]
+  return { name, digest, args }
+}
+
+/** Config fields that a running helper cannot take by SIGHUP. */
+export function egressRebuildKey(body) {
+  try {
+    const cfg = typeof body === 'string' ? JSON.parse(body) : body
+    return [cfg?.proxy_id || '', cfg?.listen_tcp || '', cfg?.listen_dns || ''].join('\0')
+  } catch {
+    return String(body)
+  }
+}
+
+/** Atomically replace a 0600 config file. */
+function writeConfigAtomic(file, body) {
+  const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`
+  fs.writeFileSync(tmp, body, { mode: 0o600 })
+  fs.renameSync(tmp, file)
+}
+
+/** Docker platform of this control plane; the helper image and binary are native to it. */
+export function nativeDockerPlatform(arch = process.arch) {
+  const name = { x64: 'amd64', arm64: 'arm64' }[arch]
+  return name ? `linux/${name}` : ''
+}
+
+const binFingerprintCache = new Map()
+
+/**
+ * Content hash of the helper binary. The entrypoint re-copies bin/ on every start,
+ * so size and mtime change on a plain restart; only the bytes mean an upgrade.
+ * Cached per stat so the per-probe inspect path hashes once per binary swap.
+ */
+export function egressBinFingerprint(bin) {
+  let st
+  try {
+    st = fs.statSync(bin)
+  } catch {
+    return ''
+  }
+  const key = `${st.dev}:${st.ino}:${st.size}:${st.mtimeMs}`
+  const cached = binFingerprintCache.get(bin)
+  if (cached?.key === key) return cached.value
+  let value
+  try {
+    value = crypto.createHash('sha256').update(fs.readFileSync(bin)).digest('hex').slice(0, 16)
+  } catch {
+    return ''
+  }
+  binFingerprintCache.set(bin, { key, value })
+  return value
+}
+
+/** null when the container does not exist. */
+export function inspectEgressContainer(name, runDocker = docker) {
+  const format =
+    '{{.State.Running}}|{{.State.Restarting}}|{{.State.Pid}}|{{index .Config.Labels "kin.egress.cfg"}}|{{index .Config.Labels "kin.egress.bin"}}|{{index .Config.Labels "kin.egress.reload"}}'
+  const r = runDocker(['inspect', '-f', format, name])
+  if (!r.ok) return null
+  const [running, restarting, pid, digest, bin, reload] = String(r.stdout || '')
+    .trim()
+    .split('|')
+  return {
+    name,
+    running: running === 'true',
+    restarting: restarting === 'true',
+    pid: Number(pid) || 0,
+    digest: String(digest || '').trim(),
+    bin: String(bin || '').trim(),
+    reload: String(reload || '').trim(),
+  }
+}
+
+/**
+ * The process runtime cannot see a helper container's PID (separate PID namespace on the host network),
+ * so a `kin-cp-egress-*` left by the container runtime would hold the ports with an old config. Remove it
+ * first; no docker CLI/socket means no such container.
+ */
+function removeLeftoverEgressContainer(proxyId, runDocker) {
+  const name = egressContainerName(proxyId)
+  if (!inspectEgressContainer(name, runDocker)) return { ok: true, removed: false }
+  const removed = runDocker(['rm', '-f', name])
+  if (!removed.ok && !/no such container/i.test(removed.stderr || '')) {
+    return { ok: false, error: `egress_container_remove_failed: ${removed.stderr || 'docker rm failed'}` }
+  }
+  return { ok: true, removed: true }
+}
+
+/** A crash loop reports Running too; only a settled helper counts. */
+function egressContainerHealthy(info) {
+  return !!(info?.running && !info.restarting)
+}
+
+let selfImageCache = ''
+
+function selfImage(runDocker, env = process.env) {
+  if (selfImageCache) return selfImageCache
+  const name = String(env?.VM2API_CONTAINER_NAME || '').trim() || 'vm2api'
+  const r = runDocker(['inspect', '-f', '{{.Image}}', name])
+  if (r.ok && r.stdout) selfImageCache = String(r.stdout).trim()
+  return selfImageCache
+}
+
+async function startEgressContainer({
+  projectRoot,
+  proxyId,
+  cfg,
+  tcpPort,
+  dnsPort,
+  listenHost,
+  bin,
+  runDocker,
+  hostPath,
+  image,
+}) {
+  const dir = egressRunDir(projectRoot, proxyId)
+  const cfgPath = path.join(dir, 'egress.json')
+  const binFingerprint = egressBinFingerprint(bin)
+  if (!binFingerprint) return { ok: false, error: `kin-egress binary not found: ${bin}` }
+  const imageRef = image || selfImage(runDocker)
+  if (!imageRef) return { ok: false, error: 'egress_image_unknown' }
+  const body = `${JSON.stringify(cfg, null, 2)}\n`
+  const spec = egressContainerSpec({
+    proxyId,
+    body,
+    hostDir: hostPath(dir),
+    hostBinDir: hostPath(path.dirname(bin)),
+    binName: path.basename(bin),
+    image: imageRef,
+    binFingerprint,
+  })
+  const done = (reused, reloaded = false) => ({
+    ok: true,
+    pid: 0,
+    reused,
+    reloaded,
+    configPath: cfgPath,
+    container: spec.name,
+    listen_tcp: cfg.listen_tcp,
+  })
+  const existing = inspectEgressContainer(spec.name, runDocker)
+  if (
+    egressContainerHealthy(existing) &&
+    existing.digest === spec.digest &&
+    existing.reload === 'hup' &&
+    fs.existsSync(cfgPath)
+  ) {
+    if (fs.readFileSync(cfgPath, 'utf8') === body) return done(true)
+    // Proxy/DNS/policy change: keep the container and its established connections.
+    writeConfigAtomic(cfgPath, body)
+    const hup = runDocker(['kill', '--signal', 'HUP', spec.name])
+    if (hup.ok) return done(true, true)
+    // Fall through and rebuild if the signal could not be delivered.
+  }
+  // A helper spawned by an older control plane (process runtime) still holds the ports.
+  for (const pid of egressPidsForProxyConfig(projectRoot, proxyId)) {
+    const stopped = await stopOwnedEgress(pid)
+    if (!stopped.ok) return { ok: false, error: stopped.error, pid }
+  }
+  fs.rmSync(path.join(dir, 'egress.pid'), { force: true })
+  if (existing) {
+    const removed = runDocker(['rm', '-f', spec.name])
+    if (!removed.ok && !/no such container/i.test(removed.stderr || '')) {
+      return { ok: false, error: `egress_container_remove_failed: ${removed.stderr || 'docker rm failed'}` }
+    }
+  }
+  for (const port of [tcpPort, dnsPort]) {
+    if (!(port > 0)) continue
+    const free = await waitPortReleased(listenHost, port)
+    if (!free.ok) return { ok: false, error: free.error, port }
+  }
+  fs.writeFileSync(cfgPath, body, { mode: 0o600 })
+  const created = runDocker(spec.args, 60_000)
+  if (!created.ok) return { ok: false, error: `egress_container_failed: ${created.stderr || 'docker run failed'}` }
+  // Readiness is the caller's waitListen; this process cannot see the helper's PID, so none is returned.
+  return done(false)
+}
+
 export async function startEgressProcess({
   projectRoot,
   proxyId,
@@ -491,6 +773,10 @@ export async function startEgressProcess({
   dnsUpstream = '',
   dnsEmptyTypes = [],
   domainForward = false,
+  runtime = egressRuntime(),
+  runDocker = docker,
+  hostPath = (p) => toHostPath(p, { projectRoot }),
+  image = '',
 }) {
   const blocked = proxyBlockedReason({ url: proxyUrl })
   if (blocked) return { ok: false, error: blocked }
@@ -499,8 +785,29 @@ export async function startEgressProcess({
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
   const pidFile = path.join(dir, 'egress.pid')
   const cfgPath = path.join(dir, 'egress.json')
+  // Fingerprint of the binary the running helper was started from; only a
+  // helper started by this version (which handles SIGHUP) writes it.
+  const binFpFile = path.join(dir, 'egress.binfp')
   const listenTcp = `${listenHost}:${tcpPort}`
   const listenDns = `${listenHost}:${dnsPort}`
+  if (runtime === 'container') {
+    const cfg = { proxy_id: proxyId, proxy_url: proxyUrl, listen_tcp: listenTcp, listen_dns: listenDns }
+    if (dnsUpstream) cfg.dns_upstream = dnsUpstream
+    if (dnsEmptyTypes.length) cfg.dns_empty_types = dnsEmptyTypes
+    if (domainForward) cfg.domain_forward = true
+    return startEgressContainer({
+      projectRoot,
+      proxyId,
+      cfg,
+      tcpPort,
+      dnsPort,
+      listenHost,
+      bin,
+      runDocker,
+      hostPath,
+      image,
+    })
+  }
   const existing = readPid(pidFile)
   const configMatches = ownsEgressProcess(existing, cfgPath)
   if (configMatches) {
@@ -517,8 +824,31 @@ export async function startEgressProcess({
       ) {
         return { ok: true, pid: existing, reused: true, configPath: cfgPath }
       }
+      // Same listeners and a reload-capable binary: swap proxy/DNS/policy by SIGHUP.
+      const binFp = egressBinFingerprint(bin)
+      let runningFp = ''
+      try {
+        runningFp = fs.readFileSync(binFpFile, 'utf8').trim()
+      } catch {}
+      if (
+        old.listen_tcp === listenTcp &&
+        old.listen_dns === listenDns &&
+        binFp &&
+        runningFp === binFp &&
+        staleEgressPids(cfgPath, existing).length === 0
+      ) {
+        const cfg = { proxy_id: proxyId, proxy_url: proxyUrl, listen_tcp: listenTcp, listen_dns: listenDns }
+        if (dnsUpstream) cfg.dns_upstream = dnsUpstream
+        if (dnsEmptyTypes.length) cfg.dns_empty_types = dnsEmptyTypes
+        if (domainForward) cfg.domain_forward = true
+        writeConfigAtomic(cfgPath, JSON.stringify(cfg, null, 2) + '\n')
+        process.kill(existing, 'SIGHUP')
+        return { ok: true, pid: existing, reused: true, reloaded: true, configPath: cfgPath }
+      }
     } catch {}
   }
+  const leftover = removeLeftoverEgressContainer(proxyId, runDocker)
+  if (!leftover.ok) return { ok: false, error: leftover.error }
   const portOwner = listenerPid(tcpPort)
   if (portOwner && !ownsEgressProcess(portOwner, cfgPath, { allowDeleted: true })) {
     return { ok: false, error: 'egress_port_busy', pid: portOwner }
@@ -557,13 +887,23 @@ export async function startEgressProcess({
   const realPid = tcpPort > 0 ? await waitForListenerPid(listenHost, tcpPort) : spawned.pid
   if (!realPid) return { ok: false, error: `kin-egress ${listenTcp} did not listen` }
   fs.writeFileSync(pidFile, String(realPid) + '\n', { mode: 0o600 })
+  fs.writeFileSync(binFpFile, egressBinFingerprint(bin) + '\n', { mode: 0o600 })
   return { ok: true, pid: realPid, reused: false, configPath: cfgPath, listen_tcp: listenTcp }
 }
 
-export function stopEgressProcess(projectRoot, proxyId) {
+export function stopEgressProcess(projectRoot, proxyId, { runtime = egressRuntime(), runDocker = docker } = {}) {
   const dir = egressRunDir(projectRoot, proxyId)
   const pidFile = path.join(dir, 'egress.pid')
   const cfgPath = path.join(dir, 'egress.json')
+  if (runtime === 'container') {
+    const removed = runDocker(['rm', '-f', egressContainerName(proxyId)])
+    if (!removed.ok && !/no such container/i.test(removed.stderr || ''))
+      return { ok: false, error: 'egress_stop_failed' }
+    // Fall through: a process-runtime helper from an older control plane may still run.
+  } else {
+    const leftover = removeLeftoverEgressContainer(proxyId, runDocker)
+    if (!leftover.ok) return { ok: false, error: 'egress_stop_failed' }
+  }
   const pids = [...new Set(egressPidsForProxyConfig(projectRoot, proxyId))]
   const pending = []
   for (const pid of pids) {
@@ -586,7 +926,22 @@ async function stopOwnedEgress(pid) {
   return waitEgressExit(pid)
 }
 
-export function inspectEgressProcess(projectRoot, proxyId) {
+export function inspectEgressProcess(
+  projectRoot,
+  proxyId,
+  { runtime = egressRuntime(), runDocker = docker, bin = EGRESS_BIN } = {},
+) {
+  if (runtime === 'container') {
+    const container = egressContainerName(proxyId)
+    const info = inspectEgressContainer(container, runDocker)
+    if (!egressContainerHealthy(info)) return { ok: false, pid: info?.pid || null, reason: 'not_running', container }
+    // A surviving helper keeps executing the replaced inode; report it down so probe and watchdog repair it,
+    // as the process runtime does for a deleted executable.
+    const current = egressBinFingerprint(bin)
+    if (info.bin && current && info.bin !== current)
+      return { ok: false, pid: info.pid, reason: 'stale_binary', container }
+    return { ok: true, pid: info.pid, listen_tcp: readEgressListenTcp(projectRoot, proxyId), container }
+  }
   const dir = egressRunDir(projectRoot, proxyId)
   const pid = readPid(path.join(dir, 'egress.pid'))
   if (!ownsEgressProcess(pid, path.join(dir, 'egress.json'))) {
@@ -863,6 +1218,7 @@ export async function startProxyEgress(
     dnsUpstream,
     dnsEmptyTypes,
     domainForward: proxy?.domain_forward === true,
+    runDocker,
     ...(bin ? { bin } : {}),
   })
   if (!started.ok) return started

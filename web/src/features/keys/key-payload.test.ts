@@ -25,6 +25,29 @@ describe('API key limit payload', () => {
     ).toMatchObject({ group_type: 'antigravity', allowed_vms: ['vm-01'] })
   })
 
+  it('saves Gemini as admin-only OAuth without a VM scope', () => {
+    const gemini = {
+      ...draft,
+      category: 'oauth',
+      group_type: 'gemini',
+      vm_pool_id: '',
+    } as const
+    for (const mode of ['create', 'edit'] as const) {
+      expect(keyLimitsPayload(gemini, mode)).toMatchObject({
+        group_type: 'gemini',
+        category: 'oauth',
+        allowed_vms: [],
+        vm_pool_id: null,
+      })
+    }
+    expect(() =>
+      keyLimitsPayload(gemini, 'create', { isAdmin: false })
+    ).toThrow('只允许管理员')
+    expect(() =>
+      keyLimitsPayload({ ...gemini, category: 'api' }, 'create')
+    ).toThrow('宿主机 OAuth')
+  })
+
   it('keeps request and USD quotas separate', () => {
     expect(keyLimitsPayload(draft, 'create')).toEqual({
       name: 'ops',

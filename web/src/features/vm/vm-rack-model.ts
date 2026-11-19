@@ -2,7 +2,7 @@ import type { UsageAccountRow } from '@/types/panel-usage'
 import type { Vm } from '@/types/panel-vm'
 import { usedPctOf } from '@/lib/format'
 import { windowProbed } from '@/lib/pool-quota'
-import { hasSlotCredential, isAntigravityVm } from '@/lib/vm-kind'
+import { hasSlotCredential, isAntigravityVm, isCodexVm } from '@/lib/vm-kind'
 import { fleetGroup, type FleetGroup } from '@/lib/vm-status'
 import { vmCostLedger, type VmLedgerRow } from '@/lib/vm-usage'
 import { fableRow } from '@/features/vm/usage-meter'
@@ -98,7 +98,7 @@ export type WindowReadout = {
   reset: unknown
 }
 
-/** 5H → 7D → Fable。Fable 只在 Max 且有读数或明确态时出现。 */
+/** 5H → 7D → Fable；无读数的 Fable 窗口展示探测状态。 */
 export function vmWindows(vm: Vm): WindowReadout[] {
   const probed = (w: '5h' | '7d') =>
     vm.has_token && windowProbed(vm, w) ? usedPctOf(vm, w) : null
@@ -221,6 +221,7 @@ export function rackTotals(
     seatsMax: 0,
     ledger: [],
   }
+  const seenAccounts = new Set<string>()
   for (const vm of vms) {
     t.groups[fleetGroup(vm)] += 1
     if (vm.seats_max != null) {
@@ -228,11 +229,17 @@ export function rackTotals(
       t.seatsMax += Number(vm.seats_max) || 0
     }
     const rows = vmCostLedger(vm, accounts)
+    const accountKey = isCodexVm(vm)
+      ? `openai:${vm.org_uuid || vm.id}`
+      : vm.account_uuid || vm.id
+    const countTotal = !vm.lifetime_usage || !seenAccounts.has(accountKey)
+    if (vm.lifetime_usage) seenAccounts.add(accountKey)
     t.ledger = t.ledger.length
       ? t.ledger.map((r, i) => ({
           ...r,
-          cost: r.cost + rows[i].cost,
-          tokens: r.tokens + rows[i].tokens,
+          cost: r.cost + (r.key === 'total' && !countTotal ? 0 : rows[i].cost),
+          tokens:
+            r.tokens + (r.key === 'total' && !countTotal ? 0 : rows[i].tokens),
         }))
       : rows
   }

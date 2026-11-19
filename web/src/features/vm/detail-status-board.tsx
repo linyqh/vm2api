@@ -35,6 +35,7 @@ import {
 } from '@/lib/wrap-health'
 import { SlotIdentity } from '@/components/platform-chip'
 import { StatusMark } from '@/components/status-mark'
+import { ActiveUsageAction } from '@/features/vm/active-usage-action'
 import { AntigravityQuotaWindows } from '@/features/vm/antigravity-quota'
 import { ClaudeResetActions } from '@/features/vm/claude-reset-actions'
 import { CodexKernelHealthFields } from '@/features/vm/codex-kernel-health-card'
@@ -65,7 +66,6 @@ type Props = {
   dash: { data: Dashboard | undefined }
   u5: number
   u7: number
-  tierKey: string
   now: number
   cost: VmCostSummary
   split: WeeklySplitSummary | null
@@ -195,7 +195,6 @@ export function VmStatusBoard(props: Props) {
     dash,
     u5,
     u7,
-    tierKey,
     now,
     cost,
     split,
@@ -229,7 +228,7 @@ export function VmStatusBoard(props: Props) {
   }
   const verdict = slotVerdict(vm, kernel, proxy)
   const proxyH = proxyHealthOf(vm, proxy)
-  const fable = fableCardInfo(vm, tierKey, fableCap(dash.data))
+  const fable = fableCardInfo(vm, fableCap(dash.data))
   const reset5 = acc.reset_5h ?? vm.reset_5h
   const reset7 = acc.reset_7d ?? vm.reset_7d
   const cost5 = money(acc.window_5h_cost ?? vm.window_5h_cost ?? cost.w)
@@ -416,7 +415,19 @@ export function VmStatusBoard(props: Props) {
                     />
                   </div>
                 ) : null}
-                <ClaudeResetActions vm={vm} now={now} />
+                <ActiveUsageAction vm={vm} />
+                <ClaudeResetActions
+                  vm={vm}
+                  now={now}
+                  usage={{
+                    fiveHour: u5,
+                    sevenDay: u7,
+                    fable: fable.usedPct,
+                    sevenDayGate: vm.quota_policy
+                      ? vm.quota_policy.limit_7d * 100
+                      : null,
+                  }}
+                />
               </>
             )}
           </div>

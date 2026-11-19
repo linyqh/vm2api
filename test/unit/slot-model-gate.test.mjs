@@ -6,6 +6,7 @@ import path from 'node:path'
 import {
   modelMatchesAllowlist,
   parseAllowedModelsPatch,
+  resolveSlotTier,
   slotAllowsModel,
   normalizeAllowedModels,
 } from '../../src/lib/pool/slot-model-gate.mjs'
@@ -172,4 +173,47 @@ test('Claude slot rejects GPT models', () => {
   })
   assert.equal(hit.ok, false)
   assert.equal(hit.reason, 'claude_model_required')
+})
+
+test('slot scheduling tier honors Pro rate veto and profile precedence', () => {
+  const account = { unified: { usage_has_fable: true, utilization_7d_oi: 0, status_7d_oi: 'allowed' } }
+  const vm = { claude: { account_tier: 'max', account_tier_source: 'usage', rate_limit_tier: 'default_claude_ai' } }
+  assert.equal(resolveSlotTier(vm, account), 'pro')
+  assert.equal(resolveSlotTier({ claude: { rate_limit_tier: 'default_claude_max_5x' } }), 'pro')
+  assert.equal(
+    resolveSlotTier(
+      {
+        claude: { account_tier: 'max', account_tier_source: 'usage', rate_limit_tier: 'default_claude_max_5x' },
+      },
+      account,
+    ),
+    'max',
+  )
+  assert.equal(
+    resolveSlotTier(
+      {
+        claude: { account_tier: 'max', account_tier_source: 'profile', rate_limit_tier: 'default_claude_ai' },
+      },
+      account,
+    ),
+    'max',
+  )
+  assert.equal(
+    resolveSlotTier(vm, {
+      unified: { ...account.unified, account_tier: 'max', account_tier_source: 'profile' },
+    }),
+    'max',
+  )
+})
+
+test('fableRequiresMax keeps Fable off pro slots and leaves other models alone', () => {
+  const pro = { claude: { account_tier: 'pro', account_tier_source: 'profile' }, policy: {} }
+  const max = { claude: { account_tier: 'max', account_tier_source: 'profile' }, policy: {} }
+  assert.deepEqual(slotAllowsModel({ vm: pro, model: 'claude-fable-5-2' }), { ok: true })
+  assert.deepEqual(slotAllowsModel({ vm: pro, model: 'claude-fable-5-2', fableRequiresMax: true }), {
+    ok: false,
+    reason: 'fable_requires_max',
+  })
+  assert.deepEqual(slotAllowsModel({ vm: pro, model: 'claude-sonnet-5', fableRequiresMax: true }), { ok: true })
+  assert.deepEqual(slotAllowsModel({ vm: max, model: 'claude-fable-5-2', fableRequiresMax: true }), { ok: true })
 })

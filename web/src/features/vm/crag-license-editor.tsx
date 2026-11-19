@@ -1,4 +1,6 @@
-import { useId, useState } from 'react'
+import { useId } from 'react'
+import { Link } from '@tanstack/react-router'
+import { VIEW_TITLES } from '@/config/nav'
 import type { CragLicenseResponse, CragLicenseStatus } from '@/types/panel-vm'
 import { toast } from 'sonner'
 import { isApiError } from '@/lib/api'
@@ -6,10 +8,22 @@ import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Textarea } from '@/components/ui/textarea'
+import { CragHostSubscription } from './crag-host-subscription'
+import { cragSubscriptionErrors } from './crag-subscription-errors'
 
+/**
+ * 错误码 → 文案，一码一句。宿主订阅（按槽位计）的错误码来自
+ * `cragSubscriptionErrors`，这里只写本槽授权与设备授权独有的码。
+ *
+ * 三类兑换冲突必须可区分：
+ * - `host_redeem_conflict`：订阅兑换码已在别的宿主机兑换
+ * - `license_redeem_conflict`：设备兑换码已绑定另一台设备
+ * - `payload_key_conflict`：内核版本（CRAG 包）冲突
+ */
 const licenseMessages: Record<string, string> = {
+  ...cragSubscriptionErrors,
   license_required:
-    '尚未授权。可粘贴一张离线通用码解锁全部槽位和机器，或复制机器码申请在线设备授权。',
+    '尚未授权。可绑定宿主订阅（占用槽位），或使用设备兑换码、离线通用码授权本槽。',
   license_expired: '授权已到期。请向授权方申请续期，并在下方替换注册码。',
   license_not_yet_valid:
     '授权尚未生效。请核对服务器 UTC 时间和生效时间；如签发时间有误，请联系授权方重新签发。',
@@ -17,8 +31,24 @@ const licenseMessages: Record<string, string> = {
     '注册码无法通过校验，可能不完整、已被修改或签发密钥不匹配。请重新复制完整注册码，或联系授权方重新签发。',
   license_binding_mismatch:
     '注册码不属于本槽或当前机器。请使用下方机器码申请匹配的注册码。',
+  license_crag_host_over_quota:
+    '使用中的槽位超过充值可用槽位，本槽已暂停调度。请继续充值，或停止其他正在运行的 CRAG 槽。',
   license_unconfigured:
     '服务器尚未配置可信授权公钥或加密 CRAG 包。请联系管理员安装受信任的完整软件包后重试。',
+  license_redeem_unavailable:
+    '设备兑换码无效、已过期或已使用。若兑换时连接中断，请联系签发方核对兑换记录。',
+  license_redeem_conflict:
+    '此设备兑换码已绑定另一台设备，不能用于本槽。请回到原槽使用。',
+  license_redeem_target_changed:
+    '激活期间目标槽、设备或授权发生变化，未覆盖现有授权。请联系管理员核对本次签发。',
+  license_redeem_subscription:
+    '本槽已在使用宿主订阅，不需要设备兑换码。请在下方「宿主订阅」管理绑定。',
+  license_redeem_service:
+    '未确认联网激活。请在同一槽使用原码重试；若提示已使用，请联系签发方核对兑换记录。',
+  license_redeem_origin: '请在当前面板页提交兑换，不要从其他站点发起。',
+  issuer_mismatch: '授权服务不认可目标内核的发行方，本次未兑换。',
+  crag_v2_unsupported_placement:
+    '此槽不支持该授权方式。设备兑换码需要本机 Linux Docker 槽。',
 }
 
 const statusLabels: Record<CragLicenseStatus['status'], string> = {
@@ -48,6 +78,14 @@ export function cragLicenseErrorMessage(error: unknown) {
   return '无法完成授权请求。请检查连接和服务器配置后重试；仍然失败时请联系管理员。'
 }
 
+export function CragShopLink() {
+  return (
+    <Button variant='outline' size='sm' asChild>
+      <Link to='/crag-subscription'>{VIEW_TITLES['crag-subscription']}</Link>
+    </Button>
+  )
+}
+
 function utcTimestamp(seconds?: number) {
   if (seconds == null || !Number.isFinite(seconds)) return '—'
   const date = new Date(seconds * 1000)
@@ -55,19 +93,12 @@ function utcTimestamp(seconds?: number) {
   return date.toISOString().replace('T', ' ').replace('.000Z', ' UTC')
 }
 
-function codeMode(code: string) {
-  const value = code.trim()
-  if (value.startsWith('CRAGU1.')) return 'offline' as const
-  if (value.startsWith('CRAGL1.')) return 'online' as const
-  return null
-}
-
 export function CragLicenseSummary({
   license,
 }: {
   license: CragLicenseStatus
 }) {
-  const term = { '1m': '1 个月', '6m': '6 个月', '1y': '1 年' }
+  const term = { '1m': '1 个月', '3m': '3 个月', '6m': '6 个月', '1y': '1 年' }
   return (
     <dl className='grid min-w-0 gap-3 text-sm sm:grid-cols-2'>
       <div>
@@ -80,7 +111,11 @@ export function CragLicenseSummary({
         <div>
           <dt className='text-xs text-muted-foreground'>授权方式</dt>
           <dd className='mt-1'>
-            {license.kind === 'offline' ? '离线通用码' : '在线设备授权'}
+            {license.scope === 'host'
+              ? `宿主订阅 · 绑定编号 ${license.seat ?? '—'}`
+              : license.kind === 'offline'
+                ? '设备授权 · 离线通用码'
+                : '设备授权 · 在线兑换'}
           </dd>
         </div>
       ) : null}
@@ -107,26 +142,18 @@ export function CragLicenseSummary({
 }
 
 export function CragLicenseEditor({
+  vmId,
   data,
   loading,
   loadError,
-  activationError,
-  registrationCode,
-  activating,
-  onChange,
   onRefresh,
-  onActivate,
   onClose,
 }: {
+  vmId: string
   data?: CragLicenseResponse
   loading: boolean
   loadError: unknown
-  activationError: unknown
-  registrationCode: string
-  activating: boolean
-  onChange: (code: string) => void
   onRefresh: () => void
-  onActivate: () => void
   onClose: () => void
 }) {
   const formId = useId()
@@ -137,11 +164,7 @@ export function CragLicenseEditor({
         licenseMessages[statusCodes[license.status]] ||
         '授权状态未知。请刷新状态，并联系管理员检查授权配置。'
       : null
-  const busy = loading || activating
-  const detected = codeMode(registrationCode)
-  const [chosen, setChosen] = useState<'offline' | 'online' | null>(null)
-  const mode =
-    detected ?? chosen ?? (license?.kind === 'online' ? 'online' : 'offline')
+  const busy = loading
 
   return (
     <section
@@ -152,6 +175,7 @@ export function CragLicenseEditor({
       <div className='flex flex-wrap items-center justify-between gap-2'>
         <h4 className='text-sm font-medium'>本槽 CRAG 授权</h4>
         <div className='flex gap-2'>
+          <CragShopLink />
           <Button
             type='button'
             variant='ghost'
@@ -193,121 +217,81 @@ export function CragLicenseEditor({
           {statusMessage}
         </p>
       ) : null}
-      <div className='flex flex-wrap gap-2' role='group' aria-label='授权方式'>
-        <Button
-          type='button'
-          variant={mode === 'offline' ? 'default' : 'outline'}
-          disabled={busy}
-          aria-pressed={mode === 'offline'}
-          onClick={() => setChosen('offline')}
+      <CragHostSubscription vmId={vmId} />
+      {data?.machine_code ? (
+        <section
+          className='min-w-0 space-y-2 border-t pt-4'
+          aria-labelledby={`${formId}-device-heading`}
         >
-          离线码
-        </Button>
-        <Button
-          type='button'
-          variant={mode === 'online' ? 'default' : 'outline'}
-          disabled={busy}
-          aria-pressed={mode === 'online'}
-          onClick={() => {
-            setChosen('online')
-            if (!data?.machine_code) onRefresh()
-          }}
-        >
-          在线授权
-        </Button>
-      </div>
-      {mode === 'online' && data?.machine_code ? (
-        <div className='space-y-2'>
-          <div className='flex flex-wrap items-center justify-between gap-2'>
-            <Label htmlFor={`${formId}-machine`}>本槽机器码</Label>
-            <Button
-              type='button'
-              variant='outline'
-              disabled={busy}
-              onClick={async () => {
-                try {
-                  await navigator.clipboard.writeText(data.machine_code)
-                  toast.success('机器码已复制')
-                } catch {
-                  toast.error('复制失败，请选中机器码后手动复制')
-                }
-              }}
+          <h4 id={`${formId}-device-heading`} className='text-sm font-medium'>
+            设备授权（按机器码）
+          </h4>
+          <p className='text-sm text-muted-foreground'>
+            设备注册码只绑定本槽机器码与匹配的内核版本，不占用宿主订阅的槽位。
+          </p>
+          <details className='space-y-2'>
+            <summary className='cursor-pointer text-sm'>
+              签发设备注册码所需的机器码
+            </summary>
+            <div className='flex flex-wrap items-center justify-between gap-2'>
+              <Label htmlFor={`${formId}-machine`}>本槽机器码</Label>
+              <Button
+                type='button'
+                variant='outline'
+                disabled={busy}
+                onClick={async () => {
+                  try {
+                    const challenge = data.payload_key_id
+                      ? JSON.stringify({
+                          machine_code: data.machine_code,
+                          payload_key_id: data.payload_key_id,
+                        })
+                      : data.machine_code
+                    await navigator.clipboard.writeText(challenge)
+                    toast.success(
+                      data.payload_key_id
+                        ? '机器码和目标载荷已复制'
+                        : '机器码已复制'
+                    )
+                  } catch {
+                    toast.error('复制失败，请选中机器码后手动复制')
+                  }
+                }}
+              >
+                复制机器码
+              </Button>
+            </div>
+            <Textarea
+              id={`${formId}-machine`}
+              readOnly
+              rows={3}
+              value={
+                data.payload_key_id
+                  ? JSON.stringify(
+                      {
+                        machine_code: data.machine_code,
+                        payload_key_id: data.payload_key_id,
+                      },
+                      null,
+                      2
+                    )
+                  : data.machine_code
+              }
+              spellCheck={false}
+              onFocus={(event) => event.currentTarget.select()}
+              className='max-h-36 resize-y font-mono text-sm break-all'
+              aria-describedby={`${formId}-machine-help`}
+            />
+            <p
+              id={`${formId}-machine-help`}
+              className='text-xs leading-relaxed text-muted-foreground'
             >
-              复制机器码
-            </Button>
-          </div>
-          <Textarea
-            id={`${formId}-machine`}
-            readOnly
-            rows={3}
-            value={data.machine_code}
-            spellCheck={false}
-            onFocus={(event) => event.currentTarget.select()}
-            className='max-h-36 resize-y font-mono text-sm break-all'
-            aria-describedby={`${formId}-machine-help`}
-          />
-          <p
-            id={`${formId}-machine-help`}
-            className='text-xs leading-relaxed text-muted-foreground'
-          >
-            将机器码交给授权方换取在线设备码。该码只属于本槽；期限由签名确定，不能在此修改。
-          </p>
-        </div>
+              将完整机器码交给授权方；若显示载荷
+              ID，请一并复制。注册码只对本槽和匹配的内核版本有效。
+            </p>
+          </details>
+        </section>
       ) : null}
-      <form
-        className='space-y-3'
-        onSubmit={(event) => {
-          event.preventDefault()
-          if (!busy && registrationCode.trim() && data && !loadError)
-            onActivate()
-        }}
-      >
-        <div className='space-y-2'>
-          <Label htmlFor={`${formId}-registration`}>
-            {mode === 'offline' ? '离线通用码' : '在线设备授权码'}
-          </Label>
-          <Textarea
-            id={`${formId}-registration`}
-            rows={4}
-            value={registrationCode}
-            onChange={(event) => onChange(event.target.value)}
-            disabled={busy || !data || !!loadError}
-            autoComplete='off'
-            autoCapitalize='none'
-            spellCheck={false}
-            className='max-h-48 resize-y font-mono text-sm break-all'
-            aria-invalid={!!activationError}
-            aria-describedby={`${formId}-registration-help${activationError ? ` ${formId}-error` : ''}`}
-          />
-          <p
-            id={`${formId}-registration-help`}
-            className='text-xs leading-relaxed text-muted-foreground'
-          >
-            {mode === 'offline'
-              ? '粘贴一张 CRAGU1。不需要机器码，也不按槽或机器核销。校验通过后，同一授权同步到全部槽位。'
-              : '粘贴与上方机器码对应的 CRAGL1。不属于本槽的码会被拒绝，已有授权不会被破坏。'}
-          </p>
-        </div>
-        {activationError ? (
-          <p
-            id={`${formId}-error`}
-            role='alert'
-            className='text-sm text-destructive'
-          >
-            {cragLicenseErrorMessage(activationError)}
-          </p>
-        ) : null}
-        <Button
-          type='submit'
-          disabled={busy || !registrationCode.trim() || !data || !!loadError}
-        >
-          {activating
-            ? '正在校验并激活…'
-            : license?.valid
-              ? '校验并替换授权'
-              : '校验并激活'}
-        </Button>
-      </form>
     </section>
   )
 }

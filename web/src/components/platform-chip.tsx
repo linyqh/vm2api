@@ -20,10 +20,10 @@ export function PlatformChip({
   className,
 }: {
   vm?: Vm
-  kind?: VmKind
+  kind?: VmKind | 'gemini'
   className?: string
 }) {
-  const resolved = kind ?? (vm ? vmKindOf(vm) : 'claude')
+  const resolved = kind ?? (vm?.gemini ? 'gemini' : vmKindOf(vm))
   const gpt = resolved === 'codex'
   return (
     <span
@@ -39,7 +39,7 @@ export function PlatformChip({
         className
       )}
     >
-      {platformLabelOf(resolved)}
+      {resolved === 'gemini' ? 'Gemini' : platformLabelOf(resolved)}
     </span>
   )
 }

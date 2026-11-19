@@ -21,19 +21,22 @@ import { stopAntigravityAuthLogin } from '../oauth/antigravity-auth-login.mjs'
 import { runtimeKind, isKvmRuntime } from './runtime-kind.mjs'
 import { getVm, listVms, isCodexVm, persistVmRuntime } from './vm-registry.mjs'
 import { isAntigravityVm, isClaudeVm } from './vm-kind.mjs'
-import { resolveInferenceEngine, resolveKernelDataplane } from './slot-engine.mjs'
+import { resolveCragKernelVersion, resolveInferenceEngine, resolveKernelDataplane } from './slot-engine.mjs'
 import {
   containerHasKernelMount,
   containerName,
   inspectContainer,
+  inspectInstalledCragEntry,
   startVmRuntime,
   reloadSlotWorker,
+  resolveSlotRouting,
 } from './vm-runtime.mjs'
 import { inspectWrapCliDir, materializeSlotDataplane, materializeWrapCli, wrapCliHomeDir } from './wrap-cli-runtime.mjs'
 import { isLocalEgressProxy } from './egress.mjs'
 import { vmNodeId } from '../cluster/placement.mjs'
 import { hostProxyUrlForVm, slotHost } from './slot-host.mjs'
 import { checkCragLicense } from './crag-license.mjs'
+import { withCragRuntimeAdmission } from './slot-runtime-admission.mjs'
 
 export { runtimeKind }
 
@@ -59,6 +62,16 @@ function persistNodeRuntime(vm, projectRoot, boot) {
 }
 
 export async function startSlotReady(vm, projectRoot, opts = {}) {
+  const routing = resolveSlotRouting(projectRoot, opts.routing)
+  return withCragRuntimeAdmission(
+    vm,
+    projectRoot,
+    { routing, action: 'start', bindSubscription: opts.bindSubscription === true },
+    () => startSlotReadyAdmitted(vm, projectRoot, { ...opts, routing }),
+  )
+}
+
+async function startSlotReadyAdmitted(vm, projectRoot, opts) {
   if (isAntigravityVm(vm)) {
     const support = antigravityRuntimeSupport(vm)
     if (!support.ok) return support
@@ -67,18 +80,16 @@ export async function startSlotReady(vm, projectRoot, opts = {}) {
     const bridge = await ensureSlotInferenceRuntime(vm, projectRoot, opts)
     return { ...boot, engine: 'antigravity', antigravity: bridge, antigravity_ready: bridge.ok === true }
   }
-  if (isCodexVm(vm)) {
-    if (!slotHost(vm).supports('codex')) return unsupportedOnHost('codex')
-    const boot = await (opts.ops?.startSlot || startSlot)(vm, projectRoot, opts)
-    if (!boot?.ok) return boot
-    persistNodeRuntime(vm, projectRoot, boot)
+  const codex = isCodexVm(vm)
+  if (codex && !slotHost(vm).supports('codex')) return unsupportedOnHost('codex')
+  const boot = await (opts.ops?.startSlot || startSlot)(vm, projectRoot, opts)
+  if (!boot?.ok) return boot
+  persistNodeRuntime(vm, projectRoot, boot)
+  if (codex) {
     const kernel = await ensureSlotInferenceRuntime(vm, projectRoot, opts)
     if (!kernel.ok) return kernel
     return { ok: true, engine: 'codex', docker: boot, kernel }
   }
-  const boot = await startSlot(vm, projectRoot, opts)
-  if (!boot?.ok) return boot
-  persistNodeRuntime(vm, projectRoot, boot)
   return attachInferenceRuntime(boot, vm, projectRoot, opts)
 }
 
@@ -89,9 +100,9 @@ export async function stopSlot(vm) {
 }
 
 /** Destroy the slot container. Used only by explicit reset / delete. */
-export async function destroySlot(vm) {
+export async function destroySlot(vm, opts) {
   if (isAntigravityVm(vm)) await stopAntigravityAuthLogin(vm.id)
-  return slotHost(vm).destroy(vm)
+  return slotHost(vm).destroy(vm, opts)
 }
 
 /** Reload guest worker so a new bind-mounted / virtiofs binary is picked up. Recreate only when the bound egress network moved; otherwise never docker rm. */
@@ -104,6 +115,13 @@ export async function reloadSlot(vm, projectRoot, opts = {}) {
 }
 
 export async function reloadSlotReady(vm, projectRoot, opts = {}) {
+  const routing = resolveSlotRouting(projectRoot, opts.routing)
+  return withCragRuntimeAdmission(vm, projectRoot, { routing, action: 'reload' }, () =>
+    reloadSlotReadyAdmitted(vm, projectRoot, { ...opts, routing }),
+  )
+}
+
+async function reloadSlotReadyAdmitted(vm, projectRoot, opts) {
   const boot = await (opts.ops?.reloadSlot || reloadSlot)(vm, projectRoot, opts)
   if (!boot?.ok) return boot
   persistVmRuntime(projectRoot, vm.id, boot.runtime)
@@ -149,7 +167,14 @@ function wrapUsesSlotKernel(wrap) {
 }
 
 export async function ensureSlotInferenceRuntime(vm, projectRoot, opts = {}) {
-  const routing = opts.routing || {}
+  const routing = resolveSlotRouting(projectRoot, opts.routing)
+  return withCragRuntimeAdmission(vm, projectRoot, { routing, action: 'start' }, () =>
+    ensureSlotInferenceRuntimeAdmitted(vm, projectRoot, { ...opts, routing }),
+  )
+}
+
+async function ensureSlotInferenceRuntimeAdmitted(vm, projectRoot, opts) {
+  const { routing } = opts
   if (isAntigravityVm(vm)) {
     const result = await (opts.ops?.ensureAntigravityBridge || ensureAntigravityBridge)({ projectRoot, vm, routing })
     return { ...result, engine: 'antigravity' }
@@ -197,7 +222,9 @@ export async function ensureSlotInferenceRuntime(vm, projectRoot, opts = {}) {
     const dest = wrapCliHomeDir(projectRoot, vm.id)
     const dataplane = resolveKernelDataplane(vm, routing) || 'wrap'
     let wrap = dataplane === 'crag' ? null : inspectWrapCliDir(dest)
-    if (!wrap?.ok) {
+    if (dataplane === 'crag' && (opts.useInstalledCrag === true || vm.kernel_installation?.kernel === 'crag')) {
+      wrap = inspectInstalledCragEntry(projectRoot, vm)
+    } else if (!wrap?.ok) {
       wrap =
         dataplane === 'crag'
           ? materializeSlotDataplane(projectRoot, vm, dataplane, { routing })
@@ -231,6 +258,7 @@ export async function ensureSlotInferenceRuntime(vm, projectRoot, opts = {}) {
   const rust = await start(exec, {
     timeoutMs: opts.timeoutMs,
     allowMissingCredential: opts.allowMissingCredential === true,
+    ...(opts.prepareGuestAppArmor === true ? { prepareGuestAppArmor: true } : {}),
   })
   if (!rust?.ok) {
     return {
@@ -244,7 +272,13 @@ export async function ensureSlotInferenceRuntime(vm, projectRoot, opts = {}) {
 }
 
 async function attachInferenceRuntime(boot, vm, projectRoot, opts = {}) {
-  const rust = await ensureSlotInferenceRuntime(vm, projectRoot, opts)
+  // Old overlays can auto-start a healthy core before their first native Claude launch fails.
+  const prepareGuestAppArmor =
+    isKvmRuntime(vm) &&
+    ['started', 'created'].includes(boot.action) &&
+    resolveKernelDataplane(vm, opts.routing || {}) === 'crag' &&
+    resolveCragKernelVersion(vm, opts.routing || {}) === 'v2'
+  const rust = await ensureSlotInferenceRuntime(vm, projectRoot, { ...opts, prepareGuestAppArmor })
   if (isAntigravityVm(vm))
     return { ...boot, engine: 'antigravity', antigravity: rust, antigravity_ready: rust.ok === true }
   const engine = resolveInferenceEngine(vm, opts.routing || {})
@@ -304,7 +338,13 @@ export async function switchSlotInferenceEngine(vm, projectRoot, engine, { timeo
   if (engine !== 'rust') {
     return { ok: false, code: 'invalid_inference_engine', error: 'inference engine must be rust' }
   }
+  const routing = resolveSlotRouting(projectRoot, ops.routing)
+  return withCragRuntimeAdmission(vm, projectRoot, { routing, action: 'switch' }, () =>
+    switchSlotInferenceEngineAdmitted(vm, projectRoot, engine, { timeoutMs, ops: { ...ops, routing } }),
+  )
+}
 
+async function switchSlotInferenceEngineAdmitted(vm, projectRoot, engine, { timeoutMs, ops }) {
   const inspect = ops.inspectContainer || inspectContainer
   const hasKernelMount = ops.containerHasKernelMount || containerHasKernelMount
   const start = ops.startVmRuntime || startVmRuntime
@@ -314,10 +354,16 @@ export async function switchSlotInferenceEngine(vm, projectRoot, engine, { timeo
   let wrap = null
   if (engine === 'rust') {
     const dataplane = resolveKernelDataplane(vm, ops.routing) || 'wrap'
-    wrap =
-      dataplane === 'crag'
-        ? materializeSlotDataplane(projectRoot, vm, dataplane, { routing: ops.routing })
-        : (ops.materializeWrapCli || materializeWrapCli)(projectRoot, vm)
+    if (dataplane === 'crag' && vm.kernel_installation?.kernel === 'crag') {
+      const licensed = checkCragLicense(projectRoot, vm, ops.routing)
+      if (!licensed.ok) return licensed
+      wrap = inspectInstalledCragEntry(projectRoot, vm)
+    } else {
+      wrap =
+        dataplane === 'crag'
+          ? materializeSlotDataplane(projectRoot, vm, dataplane, { routing: ops.routing })
+          : (ops.materializeWrapCli || materializeWrapCli)(projectRoot, vm)
+    }
     if (!wrap?.ok) {
       return {
         ok: false,

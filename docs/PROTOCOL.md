@@ -41,7 +41,7 @@
 | `persona_preset` | `official_full` | 使用独立的完整官方模板；`official` 保留原有官方提示词 |
 | `overlay_preset` | `off` | 不向首条 user 注入 overlay |
 | `persona_park` | `false` | 与 `overlay_preset=off` 对齐 |
-| `cache_ttl` | `1h` | Node 重写时新增点的缺省 TTL；`x-kin-cache-ttl` 参与首次会话选择，不覆盖 native 透传 caller / 模板显式 TTL |
+| `cache_ttl` | `1h` | 平台新增 marker 的缺省 TTL；`x-kin-cache-ttl` 参与首次会话选择。调用方合法 `1h`、`5m`、`1h → 5m` 及省略 TTL 均保留，不按菜单值统一改写 |
 
 **official / official_full 模板**统一采用 2.1.303 OAuth 抓包中的 harness + guidance；顶层 `system` 只装提示词与调用方 `caller_system`。Environment 放入 `messages[].role=system`，不打缓存点，不混入顶层提示词。身份和 billing 入口跟随 `cc_entrypoint`。所有档位均使用 2.1.303，不再提供单独的 `official_303` 选项；旧值读写时归一为 `official_full`，旧开关和模板迁移到完整版，已有明确的完整版配置优先。
 
@@ -82,6 +82,8 @@ system提示词页有两套。cli-node 仍用上面的模板。CRAG 一套只认
 
 槽位显式 `zero` 覆盖成 replace。`official` / `official_full` / `official_303` 在这条 print 上都收成 append 尾巴；只要 identity 没有旗标，自定义模板不贴进去。print 不传 `--tools ""` 和 `--no-chrome`，内置工具和 Chrome 保持官方默认。thinking、temperature、betas、system 上的 `cache_control` 协议层可以收到，helper 不转发。今天进官方 CLI 的是 `--model`、64 KiB append/replace 文本、preload 的 `max_tokens` / `effort` / 已有 cache marker 的 ttl，以及调用方工具变成 MCP。
 
+官方 Claude Code 的 `agent_summary` 旁路只按当前完整摘要指令识别，沿用独立执行会话、席位与父会话粘性隔离。CRAG 的工具续接按工具 ID 认领，换 session ID 不会隔离继承的 `tool_result`：print 入核前，仅将已识别摘要的末条 user 消息中的工具结果展开为只读标签和原始内容块，保留正文、图片、错误标记、缓存断点及尾随 system 提示。历史工具调用/结果对与正常主请求保持原样；不靠匹配工具输出里的 `tool_result replayed` 文本触发清洗，不吞真实重放错误、不重发已消费结果。
+
 
 面板预览表达 Node 给出的模板内容；cli-hop 最终线序以上述 CLI-owned 前缀为准，不把 Node 对象预览当成最终 wire 抓包。更新 CLI 二进制后需要替换槽内副本并重启相应 kernel/CLI；配置热读不能让旧进程自动加载新 ELF。删除旧环境文本后首次前缀会冷写，后续 cache_read 数值须实测，不能保证必然不低于旧值。0注入 + 常驻约束关闭 + 无调用方 agent 的真实模型可见输出须单独验收。
 
@@ -103,7 +105,7 @@ DSH 在压缩压力下会把旧工具结果改为前4096码点、固定middle-pr
 
 ## thinking 与 max_tokens
 
-`max_tokens` **就是** thinking 预算（thinking + 可见输出共享）。缺失时用该模型目录的 `max_tokens_default`，目录没有时用 4096。调用方有值且低于 `compatibility.min_max_tokens` 时默认抬到该值，模式「不改」则不抬。仅当超过模型 `max_tokens_cap` 时 `applyMaxTokensCap` 下调。
+`max_tokens` **就是** thinking 预算（thinking + 可见输出共享）。前置协议清洗时缺失值用该模型目录的 `max_tokens_default`，目录没有时用 4096。调用方有值且低于 `compatibility.min_max_tokens` 时默认抬到该值，模式「不改」则不抬；超过模型 `max_tokens_cap` 时下调。CRAG print 绕过普通出站准备，因此协议清洗阶段也必须应用模型上限。
 
 | 模型 | thinking |
 |------|----------|
@@ -114,6 +116,13 @@ DSH 在压缩压力下会把旧工具结果改为前4096码点、固定middle-pr
 非官方缺省还可补 `output_config.effort=high`，**不覆盖**已有 thinking / max_tokens。最新 main 在 unofficial 缺 `thinking.display` 时补 `omitted`。
 
 虚拟机测试未传 `max_tokens` 时用模型策略 `max_tokens_default`，再不行用 64（健康探测 hello 同口径）。
+
+连接测试及真实健康探针显式选择 thinking：允许关闭的模型发送 `{"type":"disabled"}`，要求 adaptive 的模型仍发送 adaptive。普通入站只有 Haiku 4.5 的小预算单次探针（原始 `max_tokens` 为 1–64 的整数、单条最多 64 字符的纯文本 user、无 system/tools/显式 thinking，且非官方透传）补 disabled；输出下限与模型 cap 沿用现有配置，不扩大预算、不改普通会话或调用方显式思考选择。
+
+显式携带既有 `x-kin-health-real` 标记的真实健康请求，在同样的 Haiku 4.5、1–64 token、单 user、无 system/tools/显式 thinking 条件下补 disabled，不以诊断标记的正文长度排除；没有此标记的普通长正文保持原行为。
+
+CRAG 需配套原生 helper 将显式 disabled 送到官方 Claude 的最终 fetch 边界；旧签名内核可能忽略该字段。修改 Node 或只热写配置不等于已更新运行中的 CRAG；新内核需要按现有签名交付与排空安装流程生效，不能用全局 `CLAUDE_CODE_MAX_OUTPUT_TOKENS` 覆盖所有模型来替代。
+
 
 ## beta 与 1M
 
@@ -141,6 +150,12 @@ Rikka / 客户端 `search_web`、`scrape_web` **不是** Anthropic 自带搜索�
 
 ## 清洗与整流
 
+Claude 后端先转换 Messages、Chat Completions 或 Responses 的结构，再清洗工具与历史，最后按目标运行时能力组装。混用 OpenAI function 与 Claude 托管工具时保留后者的版本和参数；已声明原生搜索时不会用 OpenAI 搜索别名生成的默认工具替换它。根级组合 schema 只在能无损转换时改写，否则按工具字段返回 400，不会放宽原约束。
+
+`/v1/messages` 可转换混入的 Chat `tool_calls` 和 `role: tool` 历史，原生块不经 Chat 解析器。`/v1/responses` 可从 `input[].additional_tools` 读取 Codex 动态工具声明，沿用命名空间和响应名称映射；相同声明去重，冲突按原字段返回 400。Responses 中交错的并行工具历史只在调用组尚未结束、没有消息或缓存边界时归并；缺失或孤立结果不在入口伪造。
+
+CRAG 声明 `provider_managed_tools_v1` 且支持对应工具时使用独立的 provider-compat 执行路径。该路径传结构化 `system`，不传 `crag_prompt`，包括 `zero` 人设；不支持时不删除调用方的托管工具，返回可定位的能力错误。普通 CRAG 与 cli-node 的出站路径不变。
+
 `sanitizeInboundBody` / `request-rectifier`：
 
 - 非法 Anthropic `role` 按 Sub2API 清洗
@@ -167,11 +182,13 @@ Rikka / 客户端 `search_web`、`scrape_web` **不是** Anthropic 自带搜索�
 
 HTTP hop 与 cli-hop（`prepareCliHopBody`）共用内容预过滤，但缓存职责不同。cli-hop 首跳保留签名可用的 thinking 指纹，没有可用签名的删掉；签名修复重试才清除其余块。官方家族开启 `official_cc_passthrough` 时，Node 保留 system/tools/messages 的 caller marker、显式 TTL、缺失 TTL 和位置，不添点、不裁剪；超过四点、thinking marker、非法 TTL 或 5m（含缺失）后出现 1h，在调度前返回 `400 invalid_cache_control`。
 
-关闭透传或非官方请求仍走 Node rewrite：清除 caller marker，生成最后消息及 `messages.length>=4` 时倒数第二 user 的点，TTL 用入站会话 pin 值。应用 persona 后，模板显式 TTL 保留，只补自产缺失 TTL；超额时优先删 tools、system 尾部的自产点。非法模板返回 request-scoped 400，零上游执行，不换号、不冷却。
+关闭透传或非官方请求仍按所选人设组装。保留的 caller marker 不再统一改写 TTL：显式 `1h` 保留 `1h`，显式 `5m` 保留 `5m`，合法的 `1h → 5m` 各自保留；省略 TTL 的已有 marker 保持省略，语义为隐式 `5m`。HTTP hop 的 `preserve_client=true` 也保留已有 message marker；无 message marker 时，才按配置补最后消息及 `messages.length>=4` 时倒数第二 user 的点。
 
-识别为官方 Claude Code 家族但未开 `official_cc_passthrough` 时，请求与第三方一样先剥离成标准 Anthropic 结构，再按槽位档重写 system；识别本身不再保留入站 system。凡经重写的入站（官方家族与第三方客户端一样），不写 `ttl` 的 marker 都表示未选择，渲染前按会话 pin 值补齐（调用方显式 `5m` / `1h` 保留，前面已有 5m 时补 5m），cli-hop、HTTP hop 与 API 直连一致。只有协议页打开透传，官方家族才跳过剥离与重写，按前文 `official_cc_passthrough` 的规则处理。入站请求头不能跳过剥离。
+平台新增的缺省 marker 使用入站会话 pin 值（菜单选 `5m` 且请求没有另选时，新增点使用 `5m`），不覆盖 caller 或模板显式 TTL。按 `tools → system → messages → 顶层自动缓存` 检查顺序；Node 整流只把非法 TTL 修正为本次缺省值，并把 `5m`（含省略 TTL）之后非法出现的 `1h` 降为 `5m`，此前合法 marker 不动。模板自产点仍遵守剩余预算；非法模板返回 request-scoped 400，零上游执行，不换号、不冷却。
 
-native CLI `2.1.296` 保留带 billing 的 wire system（含官方 CLI / 子代理布局）、wire tools 和 wire messages，不自动给最后一个 tool 加点；caller tool 的缺失 TTL 也保持缺失。仅对 CLI 自有 marker 补 TTL，优先请求显式 TTL（混合时 5m）→ slot `kernel.json.default_cache_ttl` → 1h，并按保留内容占用后的剩余预算裁剪。Rust kernel 不增删 marker、不重打 last、不自动降级 TTL。Node native envelope 不用菜单 TTL 重分类上游 usage，日志/计费保留真实 5m/1h 分桶。Node 对象不等于最终 wire；HTTP hop 原有独立缓存整流不变。
+识别为官方 Claude Code 家族但未开 `official_cc_passthrough` 时，请求与第三方一样先剥离成标准 Anthropic 结构，再按槽位档重写 system；识别本身不再保留入站 system。人设组装保留下来的 caller marker 适用上述 TTL 规则，不再把缺失 TTL 当作菜单选择后补齐。只有协议页打开透传，官方家族才跳过剥离与重写，按前文 `official_cc_passthrough` 的规则处理。入站请求头不能跳过剥离。
+
+native CLI 对已有缓存 marker 的 wire system 直接保留块边界、显式 TTL 和省略 TTL，wire tools / messages 同样保留。仅对 CLI 自有 marker 补 TTL，优先请求显式 TTL（混合时 5m）→ slot `kernel.json.default_cache_ttl` → 1h，并按保留内容占用后的剩余预算裁剪。Rust kernel 不增删 marker、不重打 last、不自动降级 TTL。HTTP hop 与 native envelope 的日志/计费保留上游真实 5m/1h 分桶；仅缺少分桶的用量或 message_delta 超过既有分桶的增量使用缺省 TTL 归类。Node 对象不等于最终 wire，源码验证也不等于已发布或部署新 CLI 二进制。
 
 长度够的签名原样转发，由 Anthropic 验。5.5 的非 dummy 签名在非保留路径原样转发，不按 24 字符预过滤；保留路径仍要求不少于 24。签名是 opaque 加密内容，当前模型 / 账户 / 会话前缀不匹配时可能被丢弃或返回 400 `Invalid \`signature\` in \`thinking\` block`。网关不伪造真实签名，也不给缺签名的块补空字段。切换账号时不改写已有签名；`cli-node` 仍按现有登录 / fallback 逻辑清理签名块。
 
@@ -181,9 +198,9 @@ native CLI `2.1.296` 保留带 billing 的 wire system（含官方 CLI / 子代�
 
 ## Codex 模型与运行环境
 
-Codex 目录客户端 `auto` 跟随官方 npm 发布；网络不可用且没有缓存时使用已核实的 `0.167.1`。推理 UA 单独配置，新安装的默认画像同步到该版本，不覆盖已部署机自定义 UA。内核保留所选画像的 originator/version，忽略下游伪造的身份与设备证明头。
+Codex 目录客户端 `auto` 跟随官方 npm 发布；网络不可用且没有缓存时使用已核实的 `0.169.0`。推理 UA 单独配置，新安装的默认画像同步到该版本，不覆盖已部署机自定义 UA。内核保留所选画像的 originator/version，忽略下游伪造的身份与设备证明头。
 
-GPT 模型以账号返回的 `/backend-api/codex/models` 为准，6.2 等新增 ID 不在网关改名，也不按型号猜测能力、可用性或价格。同步发现的新 ID 沿用默认关闭，管理员启用后才调度。静态回退目录补齐官方参考目录中的 `gpt-6-astra`、`gpt-6.1-sol`、`gpt-6.1-terra` 与 `gpt-5.6-sol/terra/luna`。Responses、Chat 和 Completions 的 `ultra` 推理档位原样保留；Completions 也保留显式 `reasoning` / `reasoning_effort`。槽位测试、定时计划和日志支持该档位，具体模型是否接受由上游判断。
+GPT 模型以账号返回的 `/backend-api/codex/models` 为准，新增 ID 不在网关改名，也不按型号猜测能力、可用性或价格。静态回退目录补齐官方参考目录中的 `gpt-6.2-astra`、`gpt-6.2-sol`、`gpt-6-astra`、`gpt-6.1-sol`、`gpt-6.1-terra` 与 `gpt-5.6-sol/terra/luna`，这些 ID 默认启用，账号目录确认后立即可调度；回退目录之外、同步新发现的陌生 ID 仍默认关闭，管理员启用后才调度。回退目录的新增代次由 `gpt_model_policy.seed_version` 守护，对已同步过的实例一次性补齐，不整体合并回退目录，以免复活上游已下线的旧型号。6.2 两款尚无官方公布价目，内置价表不臆造，其用量按未计价处理。Responses、Chat 和 Completions 的 `ultra` 推理档位原样保留；Completions 也保留显式 `reasoning` / `reasoning_effort`。槽位测试、定时计划和日志支持该档位，具体模型是否接受由上游判断。
 
 `codex.analytics.enabled` 仍默认关闭。启用后的 `codex_thread_initialized` 使用当前槽内采集的系统、系统版本和架构，不读取内核所在控制面宿主。先执行槽位 `collect-identity`；数据不完整时不发送，不伪造环境或 CLI 工具事件。字段、队列和隐私边界见 [面板 API · OpenAI 传输与隐私](PANEL_API.md#openai-传输与隐私)。
 

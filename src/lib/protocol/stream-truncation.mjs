@@ -8,7 +8,7 @@
  * A thinking block cut mid-way cannot be closed (it needs a signature).
  */
 
-import { mapUpstreamError, rewritePoolErrorForClient } from '../core/errors.mjs'
+import { ErrorCode, mapUpstreamError, rewritePoolErrorForClient } from '../core/errors.mjs'
 import { semanticStatusForStreamError } from './stream-error-status.mjs'
 
 const CLOSABLE_BLOCKS = new Set(['text', 'tool_use'])
@@ -119,6 +119,10 @@ export function createAnthropicStreamTracker() {
     hasStarted() {
       return started
     },
+    /** Type of the content block still open when the stream ended, or null. */
+    openBlockType() {
+      return open?.type || null
+    },
     isFinished() {
       return finished
     },
@@ -140,9 +144,32 @@ export function createAnthropicStreamTracker() {
   }
 }
 
+/**
+ * A started stream that cannot be closed as max_tokens (thinking block open,
+ * or a timeout) would otherwise just drop the connection. Send a retryable
+ * rate_limit_error (429) instead; the real cause stays in the request log.
+ */
+export function buildRetryableTruncationError() {
+  return buildAnthropicSseError({
+    type: 'rate_limit_error',
+    message: 'Upstream stream was interrupted mid-response; please retry',
+  })
+}
+
+/** Why a started stream could not be closed, for the log. */
+export function truncationReason(result, tracker) {
+  if (!isRecoverableTruncation(result)) return 'timeout'
+  if (tracker?.openBlockType() === 'thinking') return 'thinking_open'
+  return 'other'
+}
+
 /** A timeout would just stall again if the client retries. An upstream error event already reached the client. */
 export function isRecoverableTruncation(result) {
+  // A negotiated provider handoff must supply its own terminal proof.
+  // Closing a failed handoff as max_tokens would manufacture a success.
+  if (result?.nativeHandoff === true) return false
   const error = result?.body?.error
+  if (error?.code === ErrorCode.CLUSTER_DELIVERY_UNCONFIRMED) return false
   if (!error) return true
   return !/timeout/i.test(`${error.code || ''} ${error.type || ''} ${error.message || ''}`)
 }

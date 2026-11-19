@@ -510,9 +510,24 @@ export function scopePlatformOf(account = {}) {
   return 'claude'
 }
 
+/** Profile and OAuth subscription drive review scope; usage only fills missing metadata. */
+function claudeSubscriptionPlan(account = {}) {
+  const tier = scopeText(account.account_tier)
+  if (account.account_tier_source === 'profile' && (tier === 'max' || tier === 'pro')) return tier
+  let plan = scopeText(account.subscription_type)
+  if (
+    (!plan || plan === 'free' || plan === 'pro') &&
+    /(?:^|_)claude_max(?:_|$)/.test(scopeText(account.rate_limit_tier))
+  )
+    plan = 'max'
+  return plan === 'max' || plan === 'pro' ? plan : null
+}
+
 export function scopePlanOf(account = {}) {
   if (scopePlatformOf(account) === 'antigravity') return PLAN_TYPE_NONE
   if (scopePlatformOf(account) === 'gpt') return gptPlanBucket(account.plan_type)
+  const plan = claudeSubscriptionPlan(account)
+  if (plan) return plan
   const hasUsage =
     account.usage_has_fable != null ||
     account.utilization_7d_oi != null ||
@@ -567,9 +582,8 @@ function compareScopeKeys(left, right) {
 }
 
 /**
- * The same key the panel chip uses. Claude Max/Pro follows `inferClaudeTier`
- * (usage Fable wins over a stored or defaulted Pro). `quota` is the account
- * unified record when the caller has it; summaries often lack it.
+ * The same subscription precedence as the panel chip, with usage as a legacy fallback.
+ * `quota` is the account unified record when available; summaries often lack it.
  */
 export function scopeAccountFromVm(vm = {}, quota = null) {
   if (!vm || typeof vm !== 'object') return null
@@ -587,11 +601,20 @@ export function scopeAccountFromVm(vm = {}, quota = null) {
   const attached = vm.quota && typeof vm.quota === 'object' ? vm.quota.unified || vm.quota : {}
   const passed = quota && typeof quota === 'object' ? quota.unified || quota : {}
   const q = { ...attached, ...passed }
-  const storedTier = scopeText(vm.claude?.account_tier || q.account_tier || vm.account_tier)
+  // Keep each tier paired with its source, and do not mask a verified quota profile
+  // with a legacy usage tier from the slot file.
+  const profile = [vm.claude, q, vm].find(
+    (record) => record?.account_tier_source === 'profile' && ['pro', 'max'].includes(scopeText(record.account_tier)),
+  )
+  const tierFrom = profile || (vm.claude?.account_tier ? vm.claude : q.account_tier ? q : vm)
+  const storedTier = scopeText(tierFrom.account_tier)
   const view = {
     has_token: !!(vm.has_token || vm.has_access || hasAccessPresence(vm.claude || {})),
     has_access: !!(vm.has_access || vm.claude?.has_access || vm.has_token || hasAccessPresence(vm.claude || {})),
     account_tier: storedTier === 'codex' ? null : storedTier || null,
+    account_tier_source: tierFrom.account_tier_source || null,
+    subscription_type: vm.claude?.subscription_type || vm.subscription_type || null,
+    rate_limit_tier: vm.claude?.rate_limit_tier || vm.rate_limit_tier || q.rate_limit_tier || null,
     usage_has_fable: q.usage_has_fable ?? vm.usage_has_fable ?? null,
     utilization_7d_oi: q.utilization_7d_oi ?? vm.utilization_7d_oi ?? null,
     reset_7d_oi: q.reset_7d_oi || vm.reset_7d_oi || null,
@@ -607,6 +630,10 @@ export function scopeAccountFromVm(vm = {}, quota = null) {
     platform,
     plan_type: platform === 'gpt' ? vm.plan_type || vm.codex?.plan_type || null : null,
     account_tier: tier === 'max' || tier === 'pro' ? tier : null,
+    // Preserve the metadata so scopeKeyOf re-derives the same subscription plan.
+    account_tier_source: view.account_tier_source,
+    subscription_type: view.subscription_type,
+    rate_limit_tier: view.rate_limit_tier,
     has_token: view.has_token,
     usage_has_fable: view.usage_has_fable,
     utilization_7d_oi: view.utilization_7d_oi,
@@ -1129,8 +1156,8 @@ const OFFICIAL_PROMPT_CHUNKS = [
   .sort((a, b) => b.length - a.length)
 
 /** Drop whitelisted official prompt text. Caller text around it stays auditable. */
-export function stripOfficialPromptWhitelist(text) {
-  let rest = cleanUserAsk(text)
+export function stripOfficialPromptWhitelist(text, keepReminders = false) {
+  let rest = keepReminders ? text : cleanUserAsk(text)
   if (OFFICIAL_PROMPT_EXACT.has(rest.trim())) return ''
   rest = rest.replace(/^[ \t]*x-anthropic-billing-header:[^\n]*$/gim, '')
   for (const chunk of OFFICIAL_PROMPT_CHUNKS) {
@@ -1157,15 +1184,15 @@ function pushPromptContent(raw, content) {
 }
 
 /** Caller prompt fields. Official template bodies are removed before return. */
-function promptPieces(src) {
+function promptPieces(src, keepReminders) {
   if (!src || typeof src !== 'object') return []
   const raw = []
   pushPromptContent(raw, src.system)
-  if (typeof src.instructions === 'string') raw.push(src.instructions)
-  if (typeof src.developer === 'string') raw.push(src.developer)
+  pushPromptContent(raw, src.instructions)
+  pushPromptContent(raw, src.developer)
   const messages = Array.isArray(src.messages) ? src.messages : []
   for (const message of messages) {
-    if (String(message?.role || '').toLowerCase() !== 'system') continue
+    if (!['system', 'developer'].includes(String(message?.role || '').toLowerCase())) continue
     pushPromptContent(raw, message.content)
   }
   const input = Array.isArray(src.input) ? src.input : []
@@ -1174,11 +1201,15 @@ function promptPieces(src) {
     if (role !== 'system' && role !== 'developer') continue
     pushPromptContent(raw, item.content ?? item.text)
   }
-  return raw.map(stripOfficialPromptWhitelist).filter(Boolean)
+  return raw.map((text) => stripOfficialPromptWhitelist(text, keepReminders)).filter(Boolean)
 }
 
 /** Hard regex sees user turns and caller prompts. Official prompts and tool results are not scanned. */
-export function jevDocument(inbound, body = inbound, { interceptSession = null, ctx = null } = {}) {
+export function jevDocument(
+  inbound,
+  body = inbound,
+  { interceptSession = null, ctx = null, keepPromptReminders = false } = {},
+) {
   const users = refusalUserDocument(inbound, body, {
     includeToolResults: false,
     clean: cleanUserAsk,
@@ -1187,15 +1218,15 @@ export function jevDocument(inbound, body = inbound, { interceptSession = null, 
   })
   const seen = new Set()
   const prompts = []
-  for (const src of [inbound, body]) {
-    for (const piece of promptPieces(src)) {
+  for (const src of inbound === body ? [inbound] : [inbound, body]) {
+    for (const piece of promptPieces(src, keepPromptReminders)) {
       const norm = normalizeText(piece)
       if (!norm || seen.has(norm)) continue
       seen.add(norm)
       prompts.push(norm)
     }
   }
-  return [users, prompts.join('\n')].filter(Boolean).join('\n')
+  return [users, cleanUserAsk(inbound?.prompt), prompts.join('\n')].filter(Boolean).join('\n')
 }
 
 /** User text only. System prompts, env blocks, and tool payloads are not the ask. */
@@ -1204,7 +1235,27 @@ function jevModelContentText(content) {
   if (Array.isArray(content)) return content.map(jevModelContentText).filter(Boolean).join('\n')
   if (!content || typeof content !== 'object') return ''
   const type = String(content.type || '')
-  if (type === 'tool_result' || type === 'function_call_output' || type.endsWith('_tool_result')) return ''
+  if (['document', 'input_file', 'file'].includes(type)) {
+    const file = content.source || content.file || content
+    if (file.type === 'content') return jevModelContentText(file.content)
+    if (file.type === 'text' || typeof file.text === 'string') return cleanUserAsk(file.data ?? file.text)
+    const data = file.data ?? file.file_data
+    if (typeof data !== 'string') return ''
+    const inline = /^data:(text\/[\w.+-]+|application\/(?:json|xml))(?:;charset=utf-8)?;base64,/i.exec(data)
+    const media = file.media_type || file.mime_type || ''
+    const encoded = inline
+      ? data.slice(inline[0].length)
+      : /^(?:text\/|application\/(?:json|xml)$)/i.test(media)
+        ? data
+        : ''
+    if (!encoded || encoded.length > 86_000 || !/^[\da-z+/]+={0,2}$/i.test(encoded)) return ''
+    try {
+      return cleanUserAsk(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.from(encoded, 'base64')))
+    } catch {
+      return ''
+    }
+  }
+  if (type && !['text', 'input_text', 'message'].includes(type)) return ''
   if (typeof content.text === 'string') return cleanUserAsk(content.text)
   if (typeof content.content === 'string') return cleanUserAsk(content.content)
   if (Array.isArray(content.content)) return jevModelContentText(content.content)
@@ -1220,11 +1271,6 @@ export function jevCurrentAsk(document) {
   return block.replace(/^\[user (?:message|input) \d+\]\n/, '').trim()
 }
 
-/**
- * Caller prompts plus user turns. 官方提示词 and 官方完整提示词 are omitted.
- * The current ask stays the last user turn when one exists. Assistant and tool
- * turns stay out.
- */
 function buildJevModelParts(inbound, body = inbound, { interceptSession = null, ctx = null } = {}) {
   const seen = new Set(interceptSession?.modelSeen || [])
   const parts =
@@ -1246,11 +1292,7 @@ function buildJevModelParts(inbound, body = inbound, { interceptSession = null, 
     parts.push(`[${source}]\n${norm}`)
   }
   for (const src of [inbound, body]) {
-    if (!messageStart) {
-      promptPieces(src).forEach((piece, index) => {
-        push(`system prompt ${index + 1}`, piece)
-      })
-    }
+    if (typeof src?.prompt === 'string') push('user input 1', cleanUserAsk(src.prompt))
     const messages = Array.isArray(src?.messages) ? src.messages : []
     messages.slice(messageStart).forEach((message, offset) => {
       const index = messageStart + offset
@@ -1265,6 +1307,7 @@ function buildJevModelParts(inbound, body = inbound, { interceptSession = null, 
         push(`user input ${index + 1}`, cleanUserAsk(item))
         return
       }
+      if (item?.type && !['message', 'input_text', 'input_file', 'file', 'document'].includes(item.type)) return
       const role = String(item?.role || 'user').toLowerCase()
       if (role !== 'user' && role !== '') return
       push(`user input ${index + 1}`, jevModelContentText(item?.content ?? item))
@@ -1337,20 +1380,28 @@ export function parsePolicyDecision(payload, cfg = {}) {
   const custom = storedSafetyInstruction(cfg.safety_instruction)
   const ids = custom ? [...asked, 'custom'] : asked
   const hits = []
-  let saw = false
+  const scores = []
+  const readScore = (answer) => {
+    const value = answer?.noul
+    if (typeof value !== 'number' && (typeof value !== 'string' || !value.trim())) return null
+    const score = Number(value)
+    return Number.isFinite(score) && score >= 0 && score <= 1 ? score : null
+  }
   for (const id of ids) {
-    const score = Number(answers[id]?.noul)
-    if (!Number.isFinite(score)) continue
-    saw = true
+    const score = readScore(answers[id])
+    if (score === null) continue
+    scores.push(score)
     if (scoreBlocks(score, cfg)) hits.push({ category: id, score })
   }
-  if (!saw) {
-    const score = Number(answers.safety?.noul)
-    if (!Number.isFinite(score)) return null
-    const hits = scoreBlocks(score, cfg) ? [{ category: 'safety', score }] : []
-    return { hits: dropLoneNearMiss(hits, cfg) }
+  if (!scores.length) {
+    const score = readScore(answers.safety)
+    if (score === null) return null
+    scores.push(score)
+    if (scoreBlocks(score, cfg)) hits.push({ category: 'safety', score })
   }
-  return { hits: dropLoneNearMiss(hits, cfg) }
+  const score = cfg.block_if_below === false ? Math.max(...scores) : Math.min(...scores)
+  const margin = cfg.block_if_below === false ? policyLine(cfg) - score : score - policyLine(cfg)
+  return { hits: dropLoneNearMiss(hits, cfg), score, margin: Math.max(0, margin) }
 }
 
 function noulQuestion(instructions) {
@@ -2025,7 +2076,7 @@ export async function classifyJev(text, cfg, fetchImpl = globalThis.fetch, now =
       attemptUsage.usage = responsePayload?.usage
       attemptUsage.response_model = responsePayload?.model
       const decision = parsePolicyDecision(responsePayload, config)
-      if (!decision) return { action: 'pass', reason: 'invalid', state: document }
+      if (!decision) return unavailable(config, '审核评分无效')
       attemptUsage.outcome = 'success'
       const verdict = decision.hits.length
         ? {
@@ -2034,7 +2085,7 @@ export async function classifyJev(text, cfg, fetchImpl = globalThis.fetch, now =
             categories: decision.hits.map((hit) => hit.category),
             state: document,
           }
-        : { action: 'pass', reason: 'safe', state: document }
+        : { action: 'pass', reason: 'safe', state: document, score: decision.score, margin: decision.margin }
       if (windowMs > 0) verdictCache.set(key, { verdict, at: now })
       return verdict
     } catch {

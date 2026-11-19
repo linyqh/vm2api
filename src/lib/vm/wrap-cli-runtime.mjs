@@ -16,9 +16,11 @@ import os from 'node:os'
 import path from 'node:path'
 import { kernelBinPath } from '../transport/rust-kernel-supervisor.mjs'
 import { isCodexVm } from './vm-kind.mjs'
+import { isKvmRuntime } from './runtime-kind.mjs'
 import { nativeCliForVm, NATIVE_CLI_FILES } from './native-cli.mjs'
 import { resolveKernelDataplane } from './slot-engine.mjs'
 import { checkCragLicense, decodeLicenseBytes } from './crag-license.mjs'
+import { isValidVmId } from './vm-file.mjs'
 
 export const WRAP_CLI_BIN = 'cli-node'
 export const CC_NODE_BIN = 'cc-node'
@@ -111,6 +113,30 @@ export function cragV2PackageRoot(projectRoot, arch = cragV2Arch()) {
   }
   const staged = path.join(base, arch)
   return isFile(path.join(staged, 'manifest.json')) ? staged : ''
+}
+
+export function matchesCragIssuer(projectRoot, issuerId, pem) {
+  const arch = cragV2Arch()
+  const factory =
+    String(process.env.KIN_CRAG_V2_ROOT || '').trim() || path.join(projectRoot, 'share/crag/kernels/v2', arch)
+  try {
+    const key = crypto.createPublicKey(fs.readFileSync(path.join(factory, 'crag-license-public.pem')))
+    const der = key.export({ format: 'der', type: 'spki' })
+    return (
+      key.asymmetricKeyType === 'ed25519' &&
+      crypto.createHash('sha256').update(der.subarray(-32)).digest('hex') === issuerId
+    )
+  } catch (error) {
+    if (error.code !== 'ENOENT') return false
+  }
+  try {
+    const release = JSON.parse(fs.readFileSync(path.join(projectRoot, 'deploy/payload.json'), 'utf8'))
+    const relative = `share/crag/kernels/v2/${arch}/crag-license-public.pem`
+    const pins = release.files.filter((file) => file?.path === relative)
+    return pins.length === 1 && pins[0].sha256 === crypto.createHash('sha256').update(pem).digest('hex')
+  } catch {
+    return false
+  }
 }
 
 export function cragV2KernelWrapperScript() {
@@ -418,10 +444,11 @@ function publishCragTree(src, dest) {
   }
 }
 
-function cragV2WouldChange(src, destDir) {
+function cragV2WouldChange(src, destDir, select = true) {
   const destRoot = path.join(destDir, CRAG_V2_DIR)
   if (!filesEqual(path.join(src, 'manifest.json'), path.join(destRoot, 'manifest.json'))) return true
   if (verifyCragV2Tree(destRoot, { allowPreviousClaude: true }).ok !== true) return true
+  if (!select) return false
   try {
     const wrapper = fs.lstatSync(path.join(destDir, WRAP_KERNEL_WRAPPER))
     if (!wrapper.isFile() || !(wrapper.mode & 0o111)) return true
@@ -449,7 +476,7 @@ function writeCragV2Wrapper(destDir) {
   }
 }
 
-export function materializeCragV2(projectRoot, vm, { uid = null, gid = null } = {}) {
+export function materializeCragV2(projectRoot, vm, { uid = null, gid = null, select = true } = {}) {
   if (!projectRoot || !vm?.id) {
     return { ok: false, code: 'vm_required', error: 'projectRoot and vm id required' }
   }
@@ -470,8 +497,18 @@ export function materializeCragV2(projectRoot, vm, { uid = null, gid = null } = 
   }
   const verified = verifyCragV2Tree(src)
   if (!verified.ok) return verified
-  const licensed = checkCragLicense(projectRoot, { ...vm, dataplane: 'crag', crag_kernel_version: 'v2' })
-  if (!licensed.ok) return licensed
+  // Preinstallation only copies encrypted distribution files; runtime admission
+  // and the encrypted native binary itself enforce licensing on start. Keep refusing
+  // an explicit payload-key downgrade/mismatch against an already installed license.
+  if (select) {
+    const licensed = checkCragLicense(
+      projectRoot,
+      { ...vm, dataplane: 'crag', crag_kernel_version: 'v2' },
+      {},
+      { preferInstalled: false },
+    )
+    if (!licensed.ok && licensed.code === 'license_payload_key_mismatch') return licensed
+  }
   // The node receives this tree, including native Claude Code, through the CRAG package push.
   if (clusterDockerSlot(vm)) {
     return {
@@ -492,7 +529,7 @@ export function materializeCragV2(projectRoot, vm, { uid = null, gid = null } = 
   }
   const dest = wrapCliHomeDir(projectRoot, vm.id)
   fs.mkdirSync(dest, { recursive: true })
-  if (!cragV2WouldChange(src, dest)) {
+  if (!cragV2WouldChange(src, dest, select)) {
     try {
       fs.chmodSync(path.join(dest, CRAG_V2_DIR), 0o755)
     } catch {}
@@ -514,7 +551,7 @@ export function materializeCragV2(projectRoot, vm, { uid = null, gid = null } = 
   const tree = stageCragV2Tree(src, path.join(dest, CRAG_V2_DIR))
   if (!tree.ok) return tree
   try {
-    writeCragV2Wrapper(dest)
+    if (select) writeCragV2Wrapper(dest)
   } catch (error) {
     tree.rollback()
     return { ok: false, code: 'crag_v2_stage_failed', error: String(error?.message || error) }
@@ -529,7 +566,7 @@ export function materializeCragV2(projectRoot, vm, { uid = null, gid = null } = 
     kernel_version: 'v2',
     runtime_variant: 'crag-v2',
     changed: true,
-    kernel_changed: true,
+    kernel_changed: select,
     glibc_shim: false,
     wrapper: isFile(path.join(dest, WRAP_KERNEL_WRAPPER)),
     kernel_bin: isFile(path.join(dest, CRAG_V2_DIR, CRAG_V2_ENTRY)),
@@ -567,6 +604,12 @@ export function wrapCliTemplateDir(projectRoot) {
 export function wrapCliHomeDir(projectRoot, vmId) {
   if (!projectRoot || !vmId) return ''
   return path.join(projectRoot, 'vms', vmId, 'cli-home', '.kin')
+}
+
+export function installedCragV2Root(projectRoot, vm) {
+  if (!projectRoot || !isValidVmId(vm?.id) || vm.node_id) return undefined
+  const installed = path.join(wrapCliHomeDir(projectRoot, vm.id), CRAG_V2_DIR)
+  return fs.lstatSync(installed, { throwIfNoEntry: false }) ? installed : undefined
 }
 
 function isFile(p) {
@@ -883,6 +926,10 @@ export function materializeWrapCli(projectRoot, vm, { uid = null, gid = null, na
   if (!status.ok) return status
   const native = nativeCliForVm(vm, src, nativeCliOptions)
   if (native && !native.ok) return native
+  if (isKvmRuntime(vm) && !isCodexVm(vm) && !clusterDockerSlot(vm)) {
+    const crag = materializeCragV2(projectRoot, vm, { uid, gid, select: false })
+    if (!crag.ok) return crag
+  }
   const dest = wrapCliHomeDir(projectRoot, vm.id)
   fs.mkdirSync(dest, { recursive: true })
   const kernelChanged = installKernelPayload(src, dest, projectRoot)

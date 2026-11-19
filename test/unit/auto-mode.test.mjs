@@ -1,5 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { classifierFixture } from '../fixtures/auto-mode.mjs'
 import {
   prepareCliHopBody,
@@ -182,7 +183,7 @@ test('phrase, same-name tool, short budget or public context cannot set purpose'
     assert.equal(classifyClaudeRequestPurpose(input, { officialTraffic: true }), null)
 })
 
-for (const model of ['claude-sonnet-5', 'claude-sonnet-5-5', 'claude-opus-5.5'])
+for (const model of ['claude-sonnet-5-5', 'claude-opus-5.5'])
   test(`${model} XML headroom is bounded and applied once`, () => {
     const input = classifierFixture({ model })
     const body = prepareClassifierBody(input)
@@ -200,6 +201,15 @@ for (const model of ['claude-sonnet-5', 'claude-sonnet-5-5', 'claude-opus-5.5'])
       (e) => e.status === 400 && e.body.error.code === 'classifier_model_incompatible',
     )
   })
+
+test('optional-thinking classifiers preserve an explicit disabled budget and forced tool selection', () => {
+  const input = classifierFixture({ model: 'claude-sonnet-5', format: 'tool' })
+  const body = prepareClassifierBody(input)
+  assert.deepEqual(body.thinking, input.thinking)
+  assert.equal(body.max_tokens, input.max_tokens)
+  assert.deepEqual(body.tool_choice, input.tool_choice)
+  assert.equal(body.temperature, input.temperature)
+})
 
 test('unknown capabilities fail explicitly and never substitute a model', () => {
   assert.throws(
@@ -251,4 +261,22 @@ test('classifier incompatibilities preserve code and remain request scoped', () 
     assert.equal(policy.action, 'stop')
     assert.equal(policy.cooldownUntil, null)
   }
+})
+
+test('classifier error diagnostics retain provider refusal details without changing the error response', () => {
+  const { mapProtocolClientError } = createHandleProtocol({})
+  const details = { type: 'refusal', category: 'reasoning_extraction', explanation: 'Synthetic refusal.' }
+  const result = {
+    status: 502,
+    stopReason: 'refusal',
+    stopDetails: details,
+    body: { type: 'error', error: { type: 'api_error', message: 'native request completed without response content' } },
+  }
+  const logBag = { classifier: { purpose: 'auto_mode_classifier', stage: 'xml_s2' } }
+  const mapped = mapProtocolClientError(result, logBag, 'upstream_error')
+  assert.equal(mapped.status, 502)
+  assert.equal(logBag.classifier.error.stop_reason, 'refusal')
+  assert.deepEqual(logBag.classifier.error.stop_details, details)
+  assert.equal(logBag.classifier.error.status, 502)
+  assert.equal(mapped.body.error.stop_details, undefined)
 })

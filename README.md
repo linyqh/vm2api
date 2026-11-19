@@ -29,9 +29,9 @@
 <details>
 <summary>点击展开赞助商说明 · Click to expand</summary>
 
-<a href="https://proxylane.dev/zh-cn/isp-proxies?utm_source=vm2api&utm_medium=affiliate&utm_campaign=vm2api_sponsor_202610&utm_content=github_readme"><img src="docs/images/sponsor-proxylane.png" alt="ProxyLane（赞助商）" width="100%" /></a>
+<a href="https://proxylane.dev/go/vm2api-gh"><img src="docs/images/sponsor-proxylane.png" alt="ProxyLane（赞助商）" width="100%" /></a>
 
-**赞助商（ProxyLane）**：AI 账号专用的原生静态住宅 IP，Scamalytics 低欺诈评分，每个 IP 独享，不限流量，$3.90 起。一个槽位绑一个 IP：把 SOCKS5 `host:port:user:pass` 粘贴到「代理池」→「添加代理」即可。首次购买优惠码 `VM2API30` 享 7 折。详见 [ProxyLane](https://proxylane.dev/zh-cn/isp-proxies?utm_source=vm2api&utm_medium=affiliate&utm_campaign=vm2api_sponsor_202610&utm_content=github_readme)。
+**赞助商（ProxyLane）**：Claude Max 专用的原生静态住宅 IP：从未用于注册 Claude 账号，严格筛选 IP 与网段，Scamalytics 低欺诈评分，一个号一个独享 IP，不限流量，$7.90 起。一个槽位绑一个 IP：把 SOCKS5 `host:port:user:pass` 粘贴到「代理池」→「添加代理」即可。首次购买优惠码 `VM2API30` 享 7 折（有效期到 12 月 31 日）。详见 [ProxyLane](https://proxylane.dev/go/vm2api-gh)。
 
 </details>
 
@@ -48,6 +48,7 @@
 - [干净度基准（Benchmarks）](#-干净度基准评测benchmarks)
 - [部署安装](#部署安装)
 - [接口与协议兼容](#-接口与协议兼容)
+- [开发验证与 CI](#开发验证与-ci)
 - [问题反馈](#-问题反馈--issue-reporting)
 
 ---
@@ -75,7 +76,7 @@
 对照 **1.4.053**（`main` 当前版本）。下列为 1.4.038–1.4.053 已上线、调用方或管理员能直接感知的变化摘要；完整条目见 [CHANGELOG.md](CHANGELOG.md)，操作说明见 [入门文档](https://vm2api.fkcodex.com/zh/)。下文升级概述不能替代逐版说明，**具体以各版本 CHANGELOG 的升级注意为准**。
 
 - **内容脱敏（可选）**：设置 →「脱敏」页（`/console/#/settings/redaction`）可配置凭据、个人信息与自定义规则；默认关闭。启用需本机 `bin/kin-redact`，helper 未就绪时不能保存为开启，请求也不会回落明文。
-- **API 直连**：管理台 API 配置统一到 `#/api`；`api` 类密钥按端点协议调度上游，不经 OAuth / Codex 槽位。Anthropic 端点可单独开关「风控前置审查」。
+- **API 直连**：在 `#/api` 为渠道「获取模型」，已保存且未改配置的渠道会立即写入模型列表，新建或修改的渠道需点「保存」。生成密钥时选择「API 直连」和具体渠道；此密钥的 `/v1/models` 和推理都只用所选渠道，不经 OAuth / Codex 槽位。已有未绑定密钥沿用原协议范围，可编辑后绑定。Anthropic 端点可单独开关「风控前置审查」。
 - **协议与计费**：官方 Claude Code 透传、缓存断点 TTL 与 `max_tokens` 默认值（如 Haiku 5.5 为 100K）与面板一致；GPT Image 模型可在 Chat / Responses 路径出图；第三方计费限制类上游错误写入拒答缓存（`refusal_guard`）。
 - **封控与配额**：决策模型支持多组 URL / Key；托管密钥可 `GET /v1/me/quota` 与 `GET /v1/me/usage`；租户可看用量统计，虚拟机只读（无代理与重新授权）。
 - **面板与运维**：按角色隐藏无权页面；槽位官方登录执行 `claude auth login`；平滑停机时 `/health` 返回 503 `shutting_down`；控制面升级多为更新镜像并重启（多数版本不必 `wrap-cli/sync` 或换 payload，勿覆盖 `routing.json`、`vms/`、`data/`、`.env`）。
@@ -109,17 +110,9 @@
 
 ### 3️⃣ 封控拦截与风险审计
 
-进槽之前，`/v1` 和 `count_tokens` 先过管理台「风险审计」（`/console/#/risk`）。命中即返回错误，不选槽、不打上游。顺序不能调：
+推理出站前检查设备／会话封禁、禁用工具、系统提示词改写（可关闭）、蒸馏、硬正则和拒答缓存。通过硬规则后，Jev 只审核用户会话和可解析的内联文件文本，并在常规放行、指定账号池／渠道、指定模型和拒绝之间选择。没有身份字段的第三方请求不因此被封禁。
 
-| 顺序 | 关 | 拦住什么 | 结果 |
-|:---|:---|:---|:---|
-| 1 | 蒸馏 | 收割模板、题目指纹、套取思维链的结构。OpenAI 平台模型不扫。默认再跳过官方 Claude Code 和 0 注入。 | 403，封 device |
-| 2 | 硬正则 | 色情、破解、破限和自定义正则。蒸馏类正则跟蒸馏总开关：关掉硬正则仍拦这些短语，关掉蒸馏才放行；官方客户端和 0 注入仍扫，OpenAI 不扫。 | 403 |
-| 3 | 拒答缓存 | 上游已经拒过的精确正文、近似正文，以及被封的 device。硬正则和决策模型自己的拦截不写入这张缓存。 | 400，不可重试，不是登录失效 |
-| 4 | 决策模型 | 安全模型逐题打分，低于阈值才拦。打分失败默认放行，并在「放行出站」里标出来。 | 403 |
-| 5 | 放行出站 | 前面都没拦。上游自己的拒答单独列出，用来看漏拦。 | 进入槽位 |
-
-每关可看今日命中和拦截流水。点开一条对正文；误伤就收这道关，不要删槽。判定记在请求日志里。这一版之前的旧日志没有判定，显示为「未经关卡」。
+「风险审计」（`/console/#/risk`）展示封禁原因和原请求、上游 HTTP 400，以及实际降级出站次数。默认设备封禁阶梯为 10 分钟、24 小时、永久；违规会话持续封锁。普通上游 400 不计违规。
 
 细则：[docs/RISK.md](docs/RISK.md)。
 
@@ -130,6 +123,7 @@
 
 ### 5️⃣ 前置协议清洗与多协议统一结构化
 - **入站多协议通吃**：客户端可以使用 Anthropic 原生协议（`/v1/messages`）、OpenAI 标准格式（`/v1/chat/completions`）或新版 `/v1/responses` 格式发起请求。
+- **Codex 调用 Claude**：在 `/v1/responses` 指定允许的 Claude 模型。控制面先把指令、消息和工具调用/结果转为结构化 Messages，再交给选中的 Claude 内核。HTTP 续接需重发完整 `input` 历史；WebSocket 可引用同连接的 `previous_response_id`。无法转换的字段或不完整的工具历史在本地报错，上游计费拒绝仍按实际结果返回。
 - **深度清洗与官方对齐**：控制面在毫秒级内完成协议清洗与规范化，纠正非法角色、清理脏工具参数、补齐结构化要求，最终向 VM 内部官方进程交付符合官方客户端完全规范的纯净载荷。
 
 ---
@@ -252,6 +246,8 @@ vm2api 内置全栈自适应网关，原生支持以下所有主流生态：
 | `/v1/models` | 标准模型列表 API | 订阅密钥按 `group_type` 过滤（`openai` / `anthropic` / `all`）；`api` 类密钥按所配端点协议列出上游模型 |
 | `/v1/images/*` | OpenAI Images API | GPT Image 系列；亦可通过 Chat / Responses 图像桥接调用 |
 
+Gemini 的无 VM 导入是默认关闭的宿主机候选，尚未开放对外推理或收费。见 [Gemini 宿主机候选](docs/gemini-host.md)。
+
 ---
 
 <br/>
@@ -269,6 +265,7 @@ vm2api 内置全栈自适应网关，原生支持以下所有主流生态：
 - [Screenshots](#screenshots)
 - [Cleanliness Benchmarks](#-cleanliness-benchmarks)
 - [Deployment](#deployment)
+- [Development checks](#开发验证与-ci)
 - [Issue reporting](#-问题反馈--issue-reporting)
 
 ---
@@ -328,17 +325,9 @@ Nine pillars for anti-ban emulation and production operations:
 
 ### 3️⃣ Pre-hop risk gates
 
-`/v1` and `count_tokens` pass the console **Risk** page (`/console/#/risk`) before any slot is chosen. A hit returns an error and does not spend upstream quota. The order is fixed:
+Before inference egress, hard rules check device and session bans, blocked tools, system-prompt rewrites, distillation, regex rules, and cached refusals. Jev reviews only user turns and readable inline file text, then can allow the standard route, narrow it to a configured pool or channel, select a configured model, or reject the request.
 
-| Order | Gate | What it stops | Result |
-|:---|:---|:---|:---|
-| 1 | Distill | Harvest templates, problem fingerprints, and chain-of-thought extraction shapes. OpenAI platform models are skipped. Official Claude Code and zero-injection are skipped by default. | 403, and the device is banned |
-| 2 | Hard regex | NSFW, cracking, jailbreak, and custom patterns. Distill-category patterns follow the distill switch, not the hard-regex switch, and still scan official clients and zero-injection. OpenAI platform models skip that category. | 403 |
-| 3 | Refusal cache | Exact text, similar text, and devices the upstream has already refused. Hard-regex and decision-model blocks are not stored here. | 400, non-retryable, not a login failure |
-| 4 | Decision model | A safety model scores the text and blocks only below the threshold. If scoring fails, the request is allowed by default and marked on the pass column. | 403 |
-| 5 | Passed egress | Everything the gates allowed. The upstream's own refusals are listed separately, so a miss is visible. | Enters a slot |
-
-Open a hit and read the body. A false positive means tighten that gate, not delete the slot. Requests from before this recording show as unchecked. Full rules: [docs/RISK.md](docs/RISK.md).
+The **Risk** page (`/console/#/risk`) links bans to their source logs and lists upstream HTTP 400s and actual downgraded requests separately. The default device ban ladder is 10 minutes, 24 hours, then permanent. Ordinary upstream 400s do not count as violations. Full rules: [docs/RISK.md](docs/RISK.md).
 
 ### 4️⃣ Completely Isolated Network (1 VM = 1 Egress)
 - **Zero Cross-Account Contamination**: Every VM slot is strictly bound to its own dedicated SOCKS5 proxy or local egress gateway. 
@@ -412,6 +401,43 @@ After deployment, access:
 - **API Endpoint**: `POST http://<YOUR_IP>:8787/v1/messages`
 
 See [docs/DEPLOY.md](docs/DEPLOY.md) for panel one-click updates and compose workflows.
+
+---
+
+## VM 账号用量
+
+VM 页「总计」按当前账号累计本平台已记录的官方价费用和 token（含缓存）。同一账号迁槽不会清零，日志清理会保留账号汇总，5H／7D 仍按原窗口统计。部署前已删除的明细、以及只记录了槽位而没有账号 ID 的历史用量（包括旧 OpenAI 记录），无法归属到具体账号，不并入总计。
+
+## 开发验证与 CI
+
+分支、工作树与发版流程见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)：日常开发合入 `dev`，`main` 只用于发布。CI 配置以 [`.github/workflows/test.yml`](.github/workflows/test.yml) 为准，使用 Node.js 22、pnpm 10 和 Go 1.25。日常验证优先运行本次改动涉及的核心测试或指定测试文件，完整回归按需运行。
+
+先按需安装依赖：后端 `npm ci`，前端 `pnpm -C web install --frozen-lockfile`。以下命令均在仓库根目录执行：
+
+| 目的                        | 命令                                                          |
+| --------------------------- | ------------------------------------------------------------- |
+| 后端核心集（12 个测试文件） | `npm run test:ci`                                             |
+| 前端核心集（6 个测试文件）  | `pnpm -C web test:ci`                                         |
+| 指定后端测试文件            | `npm run test:unit -- api-keys`（也接受 `api-keys.test.mjs`） |
+| 指定前端测试文件            | `pnpm -C web exec vitest run src/lib/session.test.ts`         |
+| 后端全量单测                | `npm run test:unit`                                           |
+| 前端全量单测                | `pnpm -C web test`                                            |
+| 前端类型检查与生产构建      | `pnpm -C web build`                                           |
+
+日常 CI 的业务结果统一为 `ci`，`changes` 负责识别改动目录：
+
+- 后端改动运行语法检查和核心集，追加本次新增或修改的后端单测文件；前端改动运行核心集、追加新增或修改的前端测试文件，并执行类型检查与生产构建。本地 `test:ci` 命令只运行固定核心集。
+- `worker/`、`api-kernel/` 或 `redact/` 改动会运行这三个 Go 模块的 `go test ./...`；打包相关改动才下载和校验完整 pinned payload、执行 native CLI 打包单测。日常 CI 选中 `oauth-binary.test.mjs` 时，单独准备并校验其依赖的 `kin-oauth-auth`。
+- 纯文档或 `VERSION` 改动只做目录识别与状态收尾，不安装依赖、不运行业务测试。
+- 全仓格式检查与 ARM 镜像构建不作为日常 CI 的必过条件。格式工具和仅处理改动文件的方法见 [docs/FORMAT.md](docs/FORMAT.md)。
+
+需要更广的验证时，在 GitHub Actions 的 `ci` 工作流选择 **Run workflow**：`full=true` 运行后端、前端全量单测、三个 Go 模块测试、payload/打包检查和全仓格式检查；`arm64=true` 独立启用原生 ARM 镜像构建及离线 smoke 测试，`full` 不会自动开启 ARM 检查。两项默认均为 `false`。
+
+`test:unit`、`test:ci` 和 `test:e2e` 逐个文件起独立进程组运行，单个文件超过 5 分钟或常驻内存超过 4096 MB（仅 Linux）即被 SIGKILL 并记为失败，避免卡在原生代码里的测试耗尽宿主内存。可用 `VM2API_TEST_FILE_TIMEOUT_MS`、`VM2API_TEST_FILE_MAX_RSS_MB` 调整，设为 `0` 关闭对应限制。
+
+原有 `npm test` / `npm run test:all` 仍执行后端全量单测和 `worker` race 测试，不包含前端、`api-kernel`、`redact` 或 E2E。CI 绿灯只表示该次实际执行的检查通过；日常 CI 不代表全量、ARM 或生产验证已经完成。
+
+Daily CI runs core tests plus added or modified test files for affected components. Full regression and formatting checks are available with `full=true`; native ARM packaging is enabled separately with `arm64=true`.
 
 ---
 

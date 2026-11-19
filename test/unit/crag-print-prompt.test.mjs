@@ -8,6 +8,7 @@ import {
   callerCwdDeclaration,
   callerSystemTail,
   cragV2KernelActive,
+  foldHistorySystemMessages,
   prepareCragPrintBody,
   projectCallerSystem,
   readSlotKernelConfig,
@@ -15,14 +16,88 @@ import {
   trackCallerSystemBlock,
 } from '../../src/lib/protocol/crag-print-prompt.mjs'
 import { sanitizeAnthropicBody } from '../../src/lib/protocol/sanitize.mjs'
+import { prepareCragRequest } from '../../src/lib/protocol/kernel-request.mjs'
+import { agentBody } from '../fixtures/agent-summary.mjs'
 
 const billing = 'x-anthropic-billing-header: cc_version=2.1.317'
+
+test('CRAG boundary validates while reusing typed history and normalizes noncanonical history', () => {
+  const result = { type: 'tool_result', tool_use_id: 'toolu_read', content: 'result' }
+  const body = {
+    model: 'claude-sonnet-5-5',
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'Read this' }] },
+      { role: 'assistant', content: [{ type: 'tool_use', name: 'read', id: 'toolu_read', input: {} }] },
+      { role: 'user', content: [result] },
+    ],
+  }
+  assert.equal(prepareCragRequest(body).messages, body.messages)
+  result.content = [{ type: 'text', text: 'result', annotations: [] }]
+  assert.deepEqual(prepareCragRequest(body).messages[2].content[0].content, [{ type: 'text', text: 'result' }])
+  result.content = [{ type: 'text', text: 123 }]
+  assert.throws(
+    () => prepareCragRequest(body),
+    (error) => error.body?.error?.param === 'messages[2].content[0].content[0].text',
+  )
+})
 const identity = 'You are Claude Code, an agent.'
 const harness = 'You are an agent working with the user.'
 const guidance = 'Bias toward working.'
 
 const cwdTag = (cwd) => `<cwd>\n${cwd}\n</cwd>`
 const callerCwdFromSystem = (system) => callerCwdDeclaration(system)?.cwd ?? null
+
+test('CRAG provider compatibility keeps the caller system and requires advertised tool support', () => {
+  const body = {
+    model: 'claude-sonnet-5-5',
+    system: [{ type: 'text', text: 'Policy', cache_control: { type: 'ephemeral' } }],
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'Sample' }] }],
+    tools: [
+      ...Array.from({ length: 47 }, (_, index) => ({ name: `client_${index}`, input_schema: { type: 'object' } })),
+      { type: 'web_search_20250305', name: 'web_search', max_uses: 2 },
+    ],
+  }
+  const legacy = ['generation_controls_v3', 'prompt_replace', 'prompt_append']
+  const capabilities = [...legacy, 'provider_managed_tools_v1']
+  for (const preset of ['zero', 'official_full']) {
+    const projected = prepareCragPrintBody(body, { preset, capabilities })
+    const request = prepareCragRequest(projected, { capabilities })
+    assert.deepEqual(request.system, body.system)
+    assert.deepEqual(request.tools, body.tools)
+    assert.equal(request.crag_prompt, undefined)
+  }
+  assert.throws(() => prepareCragRequest(body, { capabilities: legacy }), {
+    message: /^tools\[47\]\.type:/,
+    code: 'invalid_kernel_request',
+  })
+  assert.throws(() => prepareCragRequest(body, { capabilities: [] }), {
+    message: /^tools\[47\]\.type:/,
+  })
+  assert.throws(
+    () => prepareCragRequest({ ...body, crag_prompt: { mode: 'replace', text: 'Policy' } }, { capabilities }),
+    {
+      message: /^crag_prompt:/,
+    },
+  )
+  assert.throws(
+    () =>
+      prepareCragRequest({ ...body, tools: [{ type: 'web_search_20990101', name: 'web_search' }] }, { capabilities }),
+    { message: /^tools\[0\]\.type:/ },
+  )
+  const replay = {
+    ...body,
+    tools: body.tools.slice(0, 1),
+    messages: [
+      body.messages[0],
+      {
+        role: 'assistant',
+        content: [{ type: 'server_tool_use', id: 'srvtoolu_example', name: 'web_search', input: {} }],
+      },
+      { role: 'user', content: [{ type: 'text', text: 'Continue' }] },
+    ],
+  }
+  assert.deepEqual(prepareCragPrintBody(replay, { preset: 'zero', capabilities }), replay)
+})
 
 test('caller cwd accepts a single standalone absolute path from the raw system', () => {
   const posix = '/synthetic/work space/项目'
@@ -208,6 +283,58 @@ test('official passthrough does not append the caller system', () => {
   assert.equal(out.crag_prompt, undefined)
 })
 
+test('native CRAG normalizes inline image aliases without moving content or tool results', () => {
+  const cache = { type: 'ephemeral' }
+  const alias = { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAB' }, cache_control: cache }
+  const image = {
+    type: 'image',
+    source: { type: 'base64', media_type: 'image/png', data: 'AAAB' },
+    cache_control: cache,
+  }
+  const before = { type: 'text', text: 'before' }
+  const after = { type: 'text', text: 'after' }
+  const result = { type: 'tool_result', tool_use_id: 'toolu_example', is_error: true, content: [before, alias, after] }
+  const remote = { type: 'image_url', image_url: 'https://example.invalid/image.png' }
+  const messages = [
+    { role: 'user', content: [before, alias, after, remote] },
+    { role: 'assistant', content: [{ type: 'tool_use', id: result.tool_use_id, name: 'lookup', input: {} }] },
+    { role: 'user', content: [result, after] },
+  ]
+  const expected = [
+    { ...messages[0], content: [before, image, after, remote] },
+    messages[1],
+    { ...messages[2], content: [{ ...result, content: [before, image, after] }, after] },
+  ]
+  const body = { messages }
+  const original = structuredClone(body)
+  const options = { capabilities: ['prompt_append', 'generation_controls_v3'] }
+  assert.deepEqual(prepareCragPrintBody(body, options).messages, expected)
+  assert.deepEqual(prepareCragPrintBody({ messages: expected }, options).messages, expected)
+  assert.deepEqual(prepareCragPrintBody(body, { capabilities: ['prompt_append'] }).messages, messages)
+  assert.deepEqual(body, original)
+})
+
+test('native CRAG rejects invalid or lossy inline image aliases, including in tool results', () => {
+  const options = { capabilities: ['prompt_append', 'generation_controls_v3'] }
+  for (const imageUrl of [
+    null,
+    {},
+    { url: 123 },
+    'data:image/png;base64,!!==',
+    'data:text/plain;base64,AAAB',
+    'data:image/png,AAAB',
+    { url: 'data:image/png;base64,AAAB', detail: 'high' },
+  ]) {
+    const block = { type: 'image_url', image_url: imageUrl }
+    for (const content of [[block], [{ type: 'tool_result', tool_use_id: 'toolu_example', content: [block] }]]) {
+      assert.throws(
+        () => prepareCragPrintBody({ messages: [{ role: 'user', content }] }, options),
+        (error) => error.status === 400 && error.body.error.code === 'invalid_image_url',
+      )
+    }
+  }
+})
+
 test('caller tail drops billing lines and non-text blocks', () => {
   assert.equal(
     callerSystemTail([
@@ -275,4 +402,246 @@ test('routing save accepts only the two CRAG print presets', () => {
     validatePersonaRoutingPatch({ compatibility: { crag_persona_preset: 'official' } })[0],
     /official_full \/ zero/,
   )
+})
+
+test('summary cleanup preserves result text, media, errors and historical tool pairs', () => {
+  const body = agentBody({ summary: true })
+  const historical = [
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'old', name: 'Read', input: {} }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'old', content: 'old output' }] },
+  ]
+  body.messages.splice(1, 0, ...historical)
+  const current = body.messages[4].content[0]
+  const image = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'aW1hZ2U=' } }
+  current.content = [{ type: 'text', text: 'tool_result replayed' }, image]
+  current.is_error = true
+  current.cache_control = { type: 'ephemeral', ttl: '1h' }
+  const before = structuredClone(body)
+  const out = prepareCragPrintBody(body, { agentSummary: true, officialPassthrough: true, foldSystemMessages: false })
+  assert.deepEqual(out.messages.slice(0, 3), before.messages.slice(0, 3))
+  // The call is read-only too, so no tool_use is left without its tool_result.
+  assert.deepEqual(out.messages[3].content, [{ type: 'text', text: '[tool call Write test-tool] {"content":"Draft"}' }])
+  assert.deepEqual(out.messages[4].content, [
+    { type: 'text', text: '[tool result test-tool (error)]', cache_control: current.cache_control },
+    ...current.content,
+    before.messages[4].content.at(-1),
+  ])
+  assert.deepEqual(out.messages[5], before.messages[5])
+  assert.deepEqual(body, before)
+  // A normal continuation, including a tool reporting this error, remains live.
+  assert.deepEqual(prepareCragPrintBody(body, { foldSystemMessages: false }).messages, before.messages)
+})
+
+const sysTurn = (text, extra = {}) => ({ role: 'system', content: [{ type: 'text', text, ...extra }] })
+const userTurn = (content) => ({ role: 'user', content })
+const asstTurn = (content) => ({ role: 'assistant', content })
+
+test('history system turns fold into the preceding user turn as reminders', () => {
+  const cc = { type: 'ephemeral', ttl: '1h' }
+  const messages = [
+    userTurn('hi'),
+    sysTurn('# Environment update\n - cwd: /a'),
+    asstTurn([{ type: 'text', text: 'ok' }]),
+    userTurn([{ type: 'text', text: 'next' }]),
+    sysTurn('<total_tokens>9 tokens left</total_tokens>', { cache_control: cc }),
+  ]
+  const out = prepareCragPrintBody({ messages, system: 'caller' }).messages
+  assert.deepEqual(
+    out.map((m) => m.role),
+    ['user', 'assistant', 'user'],
+  )
+  assert.deepEqual(out[0].content, [
+    { type: 'text', text: 'hi' },
+    { type: 'text', text: '<system-reminder>\n# Environment update\n - cwd: /a\n</system-reminder>' },
+  ])
+  assert.deepEqual(out[2].content.at(-1), {
+    type: 'text',
+    text: '<system-reminder>\n<total_tokens>9 tokens left</total_tokens>\n</system-reminder>',
+    cache_control: cc,
+  })
+  assert.equal(messages[0].content, 'hi', 'caller history is not mutated')
+})
+
+test('folding keeps earlier turns byte-stable as history grows', () => {
+  const turn1 = [userTurn('hi'), sysTurn('note 1')]
+  const turn2 = [...turn1, asstTurn('ok'), userTurn('again'), sysTurn('note 2')]
+  const a = prepareCragPrintBody({ messages: turn1 }).messages
+  const b = prepareCragPrintBody({ messages: turn2 }).messages
+  assert.deepEqual(b.slice(0, a.length), a)
+})
+
+test('a system turn after an assistant turn joins the next user turn after its tool results', () => {
+  const messages = [
+    userTurn('go'),
+    asstTurn([{ type: 'tool_use', id: 't1', name: 'Bash', input: {} }]),
+    sysTurn('<system-reminder>\nfile changed\n</system-reminder>'),
+    userTurn([
+      { type: 'tool_result', tool_use_id: 't1', content: 'done' },
+      { type: 'text', text: 'and' },
+    ]),
+  ]
+  const out = foldHistorySystemMessages(messages)
+  assert.deepEqual(
+    out.map((m) => m.role),
+    ['user', 'assistant', 'user'],
+  )
+  assert.deepEqual(
+    out[2].content.map((b) => b.type + (b.text ? `:${b.text}` : '')),
+    ['tool_result', 'text:<system-reminder>\nfile changed\n</system-reminder>', 'text:and'],
+  )
+})
+
+test('system turns that cannot fold keep their original shape', () => {
+  const image = {
+    role: 'system',
+    content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AA' } }],
+  }
+  const trailing = [userTurn('q'), asstTurn('a'), sysTurn('late')]
+  assert.deepEqual(foldHistorySystemMessages(trailing), trailing)
+  const withImage = [userTurn('q'), image]
+  assert.deepEqual(foldHistorySystemMessages(withImage), withImage)
+  const plain = [userTurn('q')]
+  assert.equal(foldHistorySystemMessages(plain), plain)
+  const off = prepareCragPrintBody({ messages: [userTurn('q'), sysTurn('n')] }, { foldSystemMessages: false })
+  assert.deepEqual(
+    off.messages.map((m) => m.role),
+    ['user', 'system'],
+  )
+})
+
+test('an agent summary keeps its trailing budget turns but folds shared history', () => {
+  const body = agentBody({ summary: true })
+  body.messages.splice(1, 0, sysTurn('# Environment update'))
+  const out = prepareCragPrintBody(body, { agentSummary: true }).messages
+  assert.equal(out.at(-1).role, 'system')
+  assert.equal(
+    out.slice(0, -1).some((m) => m.role === 'system'),
+    false,
+  )
+  assert.ok(out[0].content.at(-1).text.includes('# Environment update'))
+})
+
+test('folded turn controls are lifted unless a later turn overrides them', () => {
+  const effortOnly = {
+    role: 'system',
+    content: [],
+    output_config: { effort: 'max' },
+  }
+  const dated = {
+    role: 'system',
+    content: "Today's date is 2026-11-15.",
+    output_config: { effort: 'medium' },
+  }
+  const lifted = prepareCragPrintBody({
+    output_config: { effort: 'high', format: { type: 'json_schema' } },
+    messages: [userTurn('q'), dated, asstTurn('a'), userTurn('r'), effortOnly],
+  })
+  assert.deepEqual(
+    lifted.messages.map((m) => m.role),
+    ['user', 'assistant', 'user'],
+  )
+  assert.deepEqual(lifted.output_config, {
+    effort: 'max',
+    format: { type: 'json_schema' },
+  })
+  assert.ok(lifted.messages[0].content.at(-1).text.includes("Today's date"))
+
+  const overridden = prepareCragPrintBody({
+    output_config: { effort: 'high' },
+    messages: [userTurn('q'), dated, asstTurn('a'), { ...userTurn('r'), output_config: { effort: 'low' } }],
+  })
+  assert.deepEqual(overridden.output_config, { effort: 'high' })
+
+  const clearAt = { role: 'system', content: 'cleared', clear_at: 'tool_uses' }
+  const kept = [userTurn('q'), clearAt]
+  assert.deepEqual(foldHistorySystemMessages(kept), kept)
+
+  const summary = agentBody({ summary: true })
+  summary.messages.splice(1, 0, dated)
+  summary.messages.push({
+    role: 'system',
+    content: [],
+    output_config: { effort: 'low' },
+  })
+  const summaryOut = prepareCragPrintBody(summary, { agentSummary: true })
+  assert.equal(summaryOut.output_config?.effort, summary.output_config?.effort)
+})
+
+test('a fold that would put a 1h breakpoint after a 5m one keeps the system turn', () => {
+  const longSystem = {
+    role: 'system',
+    content: [
+      {
+        type: 'text',
+        text: 'note',
+        cache_control: { type: 'ephemeral', ttl: '1h' },
+      },
+    ],
+  }
+  const shortResult = {
+    role: 'user',
+    content: [
+      {
+        type: 'tool_result',
+        tool_use_id: 't1',
+        content: 'ok',
+        cache_control: { type: 'ephemeral' },
+      },
+    ],
+  }
+  const inverted = [userTurn('q'), asstTurn('a'), longSystem, shortResult]
+  assert.deepEqual(foldHistorySystemMessages(inverted), inverted)
+
+  const longResult = {
+    role: 'user',
+    content: [
+      {
+        type: 'tool_result',
+        tool_use_id: 't1',
+        content: 'ok',
+        cache_control: { type: 'ephemeral', ttl: '1h' },
+      },
+    ],
+  }
+  const folded = foldHistorySystemMessages([userTurn('q'), asstTurn('a'), longSystem, longResult])
+  assert.deepEqual(
+    folded.map((m) => m.role),
+    ['user', 'assistant', 'user'],
+  )
+  assert.equal(folded[2].content[0].type, 'tool_result')
+  assert.equal(folded[2].content[1].cache_control.ttl, '1h')
+})
+
+test('an agent summary leaves no unpaired tool_use for CRAG (history tool_result set is incomplete)', () => {
+  const body = agentBody({ summary: true })
+  body.messages[1].content.push({ type: 'tool_use', id: 'other', name: 'Read', input: {} })
+  const out = prepareCragPrintBody(body, { agentSummary: true }).messages
+  const answered = out
+    .flatMap((m) => (Array.isArray(m.content) ? m.content : []))
+    .filter((b) => b.type === 'tool_result')
+  const calls = out.flatMap((m) => (m.role === 'assistant' && Array.isArray(m.content) ? m.content : []))
+  // Only the unanswered call stays live; the answered one is text now.
+  assert.deepEqual(
+    calls.filter((b) => b.type === 'tool_use').map((b) => b.id),
+    ['other'],
+  )
+  assert.equal(answered.length, 0)
+})
+
+test('summary cleanup turns ToolSearch tool_reference results into text', () => {
+  const body = agentBody({ summary: true })
+  const current = body.messages[2].content[0]
+  current.content = [{ type: 'tool_reference', tool_name: 'Monitor' }]
+  const before = structuredClone(body)
+  const out = prepareCragPrintBody(body, { agentSummary: true, officialPassthrough: true, foldSystemMessages: false })
+  const blocks = out.messages[2].content
+  // CRAG rejects a top-level tool_reference as "unsupported native history block".
+  assert.ok(blocks.every((block) => block.type === 'text'))
+  assert.deepEqual(blocks.slice(0, 2), [
+    { type: 'text', text: `[tool result ${current.tool_use_id}]` },
+    { type: 'text', text: '[tool_reference Monitor]' },
+  ])
+  assert.deepEqual(body, before)
+  // Outside a summary fork the live tool_reference continuation is untouched.
+  assert.deepEqual(prepareCragPrintBody(body, { foldSystemMessages: false }).messages, before.messages)
 })

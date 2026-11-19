@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import {
   isRetryableCodexTransport,
+  isRetryableSameCodexAccount,
   runCodexKernelHop,
   handleCodexProtocol,
   pickCodexCandidates,
@@ -38,6 +39,56 @@ test('502 upstream_transport is retryable before commit', () => {
   )
   assert.equal(isRetryableCodexTransport({ ok: true, status: 200 }), false)
   assert.equal(isRetryableCodexTransport({ ok: false, status: 401, body: { error: { code: 'oauth_revoked' } } }), false)
+})
+test('server_is_overloaded retries only before output commitment', () => {
+  const result = {
+    ok: false,
+    committed: false,
+    status: 503,
+    body: { error: { type: 'service_unavailable_error', code: 'server_is_overloaded' } },
+  }
+  assert.equal(isRetryableSameCodexAccount(result), true)
+  assert.equal(isRetryableSameCodexAccount({ ...result, committed: true }), false)
+  assert.equal(isRetryableSameCodexAccount(result, { headersSent: true }), false)
+  assert.equal(isRetryableSameCodexAccount(result, { signal: AbortSignal.abort() }), false)
+})
+
+function overloadedResult(status, code) {
+  return {
+    ok: false,
+    committed: false,
+    status,
+    body: { error: { code, message: 'busy' } },
+  }
+}
+
+test('same-account retries accept server_is_overloaded on transient 5xx before commit', () => {
+  for (const status of [500, 502, 503, 504]) {
+    assert.equal(
+      isRetryableSameCodexAccount(overloadedResult(status, 'server_is_overloaded')),
+      true,
+      `status ${status}`,
+    )
+  }
+  assert.equal(isRetryableSameCodexAccount(overloadedResult(503, 'overloaded_error')), true)
+})
+
+test('same-account retries stop after commit, headers, cancel, conversion, or non-retryable status', () => {
+  const base = overloadedResult(502, 'server_is_overloaded')
+  assert.equal(isRetryableSameCodexAccount({ ...base, committed: true }), false)
+  assert.equal(isRetryableSameCodexAccount(base, { headersSent: true }), false)
+  assert.equal(isRetryableSameCodexAccount(base, { conversionError: new Error('bad stream') }), false)
+  assert.equal(isRetryableSameCodexAccount(base, { signal: AbortSignal.abort() }), false)
+  assert.equal(isRetryableSameCodexAccount(overloadedResult(429, 'server_is_overloaded')), false)
+  assert.equal(
+    isRetryableSameCodexAccount({
+      ok: false,
+      committed: false,
+      status: 502,
+      body: { error: { code: 'usage_limit_reached' } },
+    }),
+    false,
+  )
 })
 
 test('runCodexKernelHop retries a silent first-hop 502 then succeeds', async () => {
@@ -566,7 +617,7 @@ test('request log first_token_ms falls back to hop ttftMs without firstTokenAt',
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-test('incomplete Responses stream still bills tokens from the completed event', async () => {
+test('Codex billing uses the completed event when hop usage has only zero totals', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-bill-'))
   writeGptVm(root, 'vm-gpt-a')
   const res = {
@@ -607,9 +658,9 @@ test('incomplete Responses stream still bills tokens from the completed event', 
           'data: {"type":"response.completed","response":{"service_tier":"priority","usage":{"input_tokens":40,"output_tokens":2,"input_tokens_details":{"cached_tokens":5}}}}',
         )
         return {
-          ok: false,
+          ok: true,
           status: 200,
-          terminalState: 'incomplete',
+          terminalState: 'verified',
           usage: { input_tokens: 0, output_tokens: 0 },
         }
       },
@@ -971,7 +1022,7 @@ test('transient GPT failures retry the same account three times before switching
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-test('same-account retry never replays after the first SSE event', async () => {
+test('buffered Responses JSON returns the hop error without replaying after the first SSE event', async () => {
   const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
   rt.resetOpenAIAccountRuntime()
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-same-emitted-'))
@@ -987,7 +1038,7 @@ test('same-account retry never replays after the first SSE event', async () => {
       },
     }),
   )
-  assert.equal(out, undefined)
+  assert.deepEqual(out, { status: 500, body: { error: { code: 'server_error' } } })
   assert.deepEqual(seen, ['vm-gpt-a'])
   rt.resetOpenAIAccountRuntime()
   fs.rmSync(root, { recursive: true, force: true })
@@ -1291,26 +1342,41 @@ test('codex kernel envelope originator follows the default user agent when the c
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-test('codex rebuild outbound session is stable on the same slot', async () => {
+test('Codex follow-ups keep their VM and outbound session after another VM gains priority', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-stable-'))
   const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+  t.after(() => {
+    sticky.db.close()
+    fs.rmSync(root, { recursive: true, force: true })
+  })
   writeGptVm(root, 'vm-gpt-a')
+  const seen = []
+  const onHop = ({ exec }) => {
+    seen.push(exec.vmId)
+    return { ok: true, status: 200, terminalState: 'verified', body: { id: 'resp_ok' } }
+  }
   const inbound = 'sess-stable'
   const first = await hopCodex({
     root,
     stickyRouter: sticky,
     headers: { 'x-session-id': inbound },
     body: { model: 'gpt-5.4', input: 'hi', stream: false },
+    onHop,
   })
+  writeGptVm(root, 'vm-gpt-b')
+  const otherVmFile = path.join(root, 'vms', 'vm-gpt-b.json')
+  const otherVm = JSON.parse(fs.readFileSync(otherVmFile, 'utf8'))
+  otherVm.policy = { priority: 10, weight: 10 }
+  fs.writeFileSync(otherVmFile, JSON.stringify(otherVm))
   const second = await hopCodex({
     root,
     stickyRouter: sticky,
     headers: { 'x-session-id': inbound },
     body: { model: 'gpt-5.4', input: 'hi again', stream: false },
+    onHop,
   })
+  assert.deepEqual(seen, ['vm-gpt-a', 'vm-gpt-a'])
   assert.equal(first.envelopes[0].session.session_id, second.envelopes[0].session.session_id)
-  sticky.db?.close?.()
-  fs.rmSync(root, { recursive: true, force: true })
 })
 
 test('codex rebuild remints session after failover to another slot', async () => {

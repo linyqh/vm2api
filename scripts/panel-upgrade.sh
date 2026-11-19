@@ -29,14 +29,35 @@ probe() {
     const port = process.env.PORT || "8787"
     const base = `http://127.0.0.1:${port}`
     const key = process.env.KIN_API_KEY || process.env.VM2API_API_KEY || ""
+    const refill = Number(process.env.KIN_RATE_REFILL || 1)
+    const interval = Number.isFinite(refill) && refill > 0 ? Math.min(30000, Math.ceil(1000 / refill)) : 1000
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+    let nextRequestAt = 0
+
     async function json(path) {
-      const res = await fetch(`${base}${path}`, {
-        headers: { Authorization: `Bearer ${key}` },
-        signal: AbortSignal.timeout(12000),
-      })
-      if (!res.ok) throw new Error(`${path}: HTTP ${res.status}`)
-      const body = await res.json()
-      return body.data || body
+      for (let attempt = 0; ; attempt++) {
+        await sleep(Math.max(0, nextRequestAt - Date.now()))
+        nextRequestAt = Date.now() + interval
+        const res = await fetch(`${base}${path}`, {
+          headers: { Authorization: `Bearer ${key}` },
+          signal: AbortSignal.timeout(12000),
+        })
+        if (res.ok) {
+          const body = await res.json()
+          return body.data || body
+        }
+        const retryAfter = res.headers.get("retry-after")
+        await res.body?.cancel()
+        if (res.status !== 429 || attempt >= 3) throw new Error(`${path}: HTTP ${res.status}`)
+
+        const retryMs = retryAfter === null ? 0 : /^\d+$/.test(retryAfter)
+          ? Number(retryAfter) * 1000
+          : Date.parse(retryAfter) - Date.now()
+        const delay = Math.max(interval, 2000 * 2 ** attempt, Number.isFinite(retryMs) ? retryMs : 0)
+        if (delay > 30000) throw new Error(`${path}: HTTP 429; Retry-After exceeds the 30s probe retry limit`)
+        console.error(`${path}: HTTP 429; retrying in ${delay}ms`)
+        nextRequestAt = Date.now() + delay
+      }
     }
     function kernelHealthy(detail) {
       const kernel = detail.kernel
@@ -124,6 +145,36 @@ else
     printf '\nVM2API_IMAGE_TAG=%s\n' "$IMAGE_TAG" >> .env
   fi
   compose pull vm2api
+  # Image upgrades do not refresh Compose files. Add only the bind missing
+  # from the effective configuration; leave operator files and mounts alone.
+  CONFIG=$(compose config --format json vm2api)
+  HAS_CRAG_BIND=$(printf '%s' "$CONFIG" | docker exec -i "$CONTAINER" node -e '
+    try {
+      const { volumes = [] } = JSON.parse(require("node:fs").readFileSync(0, "utf8")).services.vm2api
+      console.log(volumes.some(({ target }) => target === "/run/crag-host-machine-id") ? "yes" : "no")
+    } catch {
+      console.error("Could not inspect the vm2api Compose mounts")
+      process.exit(1)
+    }
+  ')
+  unset CONFIG
+  if [ "$HAS_CRAG_BIND" = no ]; then
+    # Keep the overlay on disk: Compose records its path for later panel upgrades.
+    CRAG_BIND_FILE=$(mktemp "$ROOT/.vm2api-crag-host-machine-id.XXXXXX")
+    cat > "$CRAG_BIND_FILE" <<'EOF'
+services:
+  vm2api:
+    volumes:
+      - type: bind
+        source: "${VM2API_CRAG_HOST_ID_FILE:-/etc/machine-id}"
+        target: /run/crag-host-machine-id
+        read_only: true
+        bind:
+          create_host_path: false
+EOF
+    chmod 0644 "$CRAG_BIND_FILE"
+    COMPOSE_FILE_LIST="$COMPOSE_FILE_LIST:$CRAG_BIND_FILE"
+  fi
 fi
 
 compose up -d --no-deps --force-recreate vm2api

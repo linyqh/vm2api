@@ -8,6 +8,8 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { normalizeCragKernelVersion, normalizeKernelDataplane, normalizeSlotPersonaPreset } from '../vm/slot-engine.mjs'
+import { normalizeImageContentBlocks } from './images.mjs'
+import { needsCragProviderCompatibility } from './kernel-request.mjs'
 /**
  * Print is the CRAG v2 worker only. A live health report wins, then an
  * explicit dataplane on the VM, then the kernel.json that worker was started
@@ -165,8 +167,7 @@ export function trackCallerSystemBlock(system, declaration) {
   }
 }
 
-/** Caller tail only. Drops non-text blocks, cache_control and billing lines. */
-export function callerSystemTail(system) {
+function callerSystemBlocks(system) {
   const parts = []
   for (const block of systemBlocks(system)) {
     const text = textOf(block)
@@ -176,9 +177,20 @@ export function callerSystemTail(system) {
       .filter((line) => !BILLING_LINE.test(line.trim()))
       .join('\n')
       .trim()
-    if (kept) parts.push(kept)
+    if (kept) {
+      const part = { type: 'text', text: kept }
+      if (block?.cache_control != null) part.cache_control = block.cache_control
+      parts.push(part)
+    }
   }
-  return parts.join('\n\n')
+  return parts
+}
+
+/** Caller tail only. Drops non-text blocks, cache_control and billing lines. */
+export function callerSystemTail(system) {
+  return callerSystemBlocks(system)
+    .map((block) => block.text)
+    .join('\n\n')
 }
 
 function stripCallerPromptAlias(body) {
@@ -203,25 +215,296 @@ export function cragPromptTooLarge(bytes) {
   return error
 }
 
+// Unwrapped result items become top-level user blocks. CRAG takes text, image
+// and document there; a ToolSearch tool_reference (or any other result-only
+// block) is rejected as "unsupported native history block", so it goes to text.
+const READ_ONLY_RESULT_TYPES = new Set(['text', 'image', 'document'])
+
+function readOnlyResultBlock(item) {
+  if (READ_ONLY_RESULT_TYPES.has(item?.type)) return item
+  if (item?.type === 'tool_reference') return { type: 'text', text: `[tool_reference ${item.tool_name}]` }
+  return { type: 'text', text: JSON.stringify(item) }
+}
+
+function readOnlySummaryResults(messages) {
+  if (!Array.isArray(messages)) return messages
+  const index = messages.findLastIndex((message) => message?.role === 'user')
+  const message = messages[index]
+  if (!Array.isArray(message?.content) || !message.content.some((block) => block?.type === 'tool_result'))
+    return messages
+  // A summary fork observes these results; sending their IDs as live results
+  // would claim the parent's CRAG continuation, regardless of the new session ID.
+  const content = message.content.flatMap((block) => {
+    if (block?.type !== 'tool_result') return [block]
+    const label = { type: 'text', text: `[tool result ${block.tool_use_id}${block.is_error ? ' (error)' : ''}]` }
+    if (block.cache_control) label.cache_control = block.cache_control
+    const result = typeof block.content === 'string' ? [{ type: 'text', text: block.content }] : block.content || []
+    return [label, ...result.map(readOnlyResultBlock)]
+  })
+  const out = messages.slice()
+  out[index] = { ...message, content }
+  // The calls those results answer must go read-only too: CRAG rejects a
+  // history tool_use with no tool_result ("history tool_result set is incomplete").
+  const ids = new Set(message.content.filter((block) => block?.type === 'tool_result').map((b) => b.tool_use_id))
+  const callIndex = out.findLastIndex((m, i) => i < index && m?.role === 'assistant')
+  const call = out[callIndex]
+  if (Array.isArray(call?.content) && call.content.some((b) => b?.type === 'tool_use' && ids.has(b.id))) {
+    out[callIndex] = {
+      ...call,
+      content: call.content.map((block) => {
+        if (block?.type !== 'tool_use' || !ids.has(block.id)) return block
+        const text = {
+          type: 'text',
+          text: `[tool call ${block.name} ${block.id}] ${JSON.stringify(block.input ?? {})}`,
+        }
+        if (block.cache_control) text.cache_control = block.cache_control
+        return text
+      }),
+    }
+  }
+  return out
+}
+
+const SYSTEM_REMINDER_OPEN = '<system-reminder>'
+
+function contentBlocks(content) {
+  if (typeof content === 'string') return content ? [{ type: 'text', text: content }] : []
+  return Array.isArray(content) ? content : []
+}
+
+function reminderBlocks(message) {
+  const out = []
+  for (const block of contentBlocks(message?.content)) {
+    const text = textOf(block)
+    if (!text.trim()) continue
+    const wrapped = text.trimStart().startsWith(SYSTEM_REMINDER_OPEN)
+      ? text
+      : `${SYSTEM_REMINDER_OPEN}\n${text}\n</system-reminder>`
+    const part = { type: 'text', text: wrapped }
+    if (block && typeof block === 'object' && block.cache_control != null) part.cache_control = block.cache_control
+    out.push(part)
+  }
+  return out
+}
+
+function isEmptyText(block) {
+  return block && typeof block === 'object' && block.type === 'text' && block.text === ''
+}
+
+/** Leading tool_result blocks must stay first in a user turn. */
+function leadingToolResults(blocks) {
+  let index = 0
+  while (blocks[index]?.type === 'tool_result') index += 1
+  return index
+}
+
+function prependAfterToolResults(blocks, extra) {
+  const index = leadingToolResults(blocks)
+  return [...blocks.slice(0, index), ...extra, ...blocks.slice(index)]
+}
+
+/** Moving a 1h marker behind a 5m / TTL-less one breaks Anthropic's TTL order. */
+function invertsCacheTtl(moved, passed) {
+  const long = moved.some((block) => block?.cache_control?.ttl === '1h')
+  return long && passed.some((block) => block?.cache_control != null && block.cache_control.ttl !== '1h')
+}
+
+function hasOutputConfig(message) {
+  return message?.output_config != null && typeof message.output_config === 'object'
+}
+
+/** Media has no reminder form, and `clear_at` acts where it stands. */
+function foldable(message) {
+  if (message?.clear_at != null) return false
+  return contentBlocks(message?.content).every((block) => textOf(block) || isEmptyText(block))
+}
+
+/**
+ * Claude Code adds `role: "system"` turns to the history (environment
+ * updates, token counters, task notifications), usually one more per turn.
+ * The CRAG worker replays history through `--resume`, and a history that
+ * carries these turns is cached only up to tools + system on every request:
+ * the whole conversation is written again each turn. Folding each one into
+ * the adjacent user turn as a <system-reminder> keeps every earlier turn
+ * byte-stable, so the previous turn's breakpoint is found again.
+ *
+ * A system turn joins the user turn before it; one that follows an assistant
+ * turn joins the next user turn instead (after its tool_result blocks). Turns
+ * with no user turn to join keep their original shape, as do turns carrying
+ * media or `clear_at`, and turns whose move would invert cache TTL order.
+ *
+ * A folded turn's `output_config` governs the turns after it, so the last one
+ * still in effect is returned as `outputConfig` for the top level.
+ */
+function foldSystemTurns(messages) {
+  if (!Array.isArray(messages) || !messages.some((message) => message?.role === 'system'))
+    return { messages, outputConfig: null }
+  const out = []
+  let pending = []
+  let pendingSource = []
+  let outputConfig = null
+  const flush = () => {
+    out.push(...pendingSource)
+    if (pendingSource.some(hasOutputConfig)) outputConfig = null
+    pending = []
+    pendingSource = []
+  }
+  for (const message of messages) {
+    if (message?.role === 'system' && !foldable(message)) {
+      flush()
+      out.push(message)
+      if (hasOutputConfig(message)) outputConfig = null
+      continue
+    }
+    if (message?.role === 'system') {
+      const blocks = reminderBlocks(message)
+      const previous = out.at(-1)
+      if (!pending.length && !pendingSource.length && previous?.role === 'user') {
+        if (blocks.length)
+          out[out.length - 1] = {
+            ...previous,
+            content: [...contentBlocks(previous.content), ...blocks],
+          }
+        if (hasOutputConfig(message)) outputConfig = { ...outputConfig, ...message.output_config }
+      } else {
+        pending = pending.concat(blocks)
+        pendingSource.push(message)
+      }
+      continue
+    }
+    if (pendingSource.length) {
+      const content = contentBlocks(message?.content)
+      if (message?.role === 'user' && !invertsCacheTtl(pending, content.slice(0, leadingToolResults(content)))) {
+        out.push({
+          ...message,
+          content: prependAfterToolResults(content, pending),
+        })
+        for (const source of pendingSource)
+          if (hasOutputConfig(source)) outputConfig = { ...outputConfig, ...source.output_config }
+        pending = []
+        pendingSource = []
+      } else {
+        flush()
+        out.push(message)
+      }
+      if (hasOutputConfig(message)) outputConfig = null
+      continue
+    }
+    if (hasOutputConfig(message)) outputConfig = null
+    out.push(message)
+  }
+  flush()
+  return { messages: out, outputConfig }
+}
+
+export function foldHistorySystemMessages(messages) {
+  return foldSystemTurns(messages).messages
+}
+
+/**
+ * An agent_summary fork ends with its instruction followed by token-budget
+ * system turns; the summary is recognized by that instruction being the last
+ * user text. Fold the shared history (so it matches the parent's prefix) but
+ * leave the trailing system run where the fork sent it.
+ */
+function foldSummarySystemTurns(messages) {
+  if (!Array.isArray(messages)) return { messages, outputConfig: null }
+  let end = messages.length
+  while (end > 0 && messages[end - 1]?.role === 'system') end -= 1
+  if (end === messages.length) return foldSystemTurns(messages)
+  const head = messages.slice(0, end)
+  const tail = messages.slice(end)
+  const folded = foldSystemTurns(head)
+  if (folded.messages === head) return { messages, outputConfig: null }
+  // A trailing turn's own output_config overrides anything lifted from the head.
+  const outputConfig = tail.some(hasOutputConfig) ? null : folded.outputConfig
+  return { messages: [...folded.messages, ...tail], outputConfig }
+}
+
 /**
  * @param {object} body caller body, before cli-node persona injection
- * @param {{ preset?: 'official_full' | 'zero', officialPassthrough?: boolean, capabilities?: string[] }} [options]
+ * @param {{ preset?: 'official_full' | 'zero', officialPassthrough?: boolean, capabilities?: string[], agentSummary?: boolean, foldSystemMessages?: boolean }} [options]
  */
 export function prepareCragPrintBody(
   body,
-  { preset = 'official_full', officialPassthrough = false, capabilities } = {},
+  {
+    preset = 'official_full',
+    officialPassthrough = false,
+    capabilities,
+    agentSummary = false,
+    foldSystemMessages = true,
+  } = {},
 ) {
   const out = { ...(body || {}) }
+  const nativeV3 = Array.isArray(capabilities) && capabilities.includes('generation_controls_v3')
+  if (nativeV3 && Array.isArray(out.messages)) {
+    out.messages = out.messages.map((message) => {
+      const content = normalizeImageContentBlocks(message?.content, { inlineOnly: true })
+      return content === message?.content ? message : { ...message, content }
+    })
+  }
+  if (agentSummary) out.messages = readOnlySummaryResults(out.messages)
+  if (needsCragProviderCompatibility(out, capabilities)) {
+    stripCallerPromptAlias(out)
+    return out
+  }
+  if (foldSystemMessages) {
+    const folded = agentSummary ? foldSummarySystemTurns(out.messages) : foldSystemTurns(out.messages)
+    out.messages = folded.messages
+    if (folded.outputConfig)
+      out.output_config = {
+        ...(out.output_config || {}),
+        ...folded.outputConfig,
+      }
+  }
   const mode = preset === 'zero' ? 'replace' : 'append'
   delete out.system
   stripCallerPromptAlias(out)
   if (capabilities !== undefined && (!Array.isArray(capabilities) || !capabilities.includes(`prompt_${mode}`)))
     return out
+  const textCache = nativeV3 && capabilities.includes('system_text_cache_v3')
+  if (
+    nativeV3 &&
+    !officialPassthrough &&
+    Array.isArray(body?.system) &&
+    body.system.some(
+      (block) =>
+        typeof block !== 'string' &&
+        (!block ||
+          block.type !== 'text' ||
+          typeof block.text !== 'string' ||
+          Object.keys(block).some((key) => !['type', 'text'].includes(key) && !(textCache && key === 'cache_control'))),
+    )
+  ) {
+    const message =
+      'CRAG V3 native system prompts support text only; structured system metadata requires isolated provider execution'
+    throw Object.assign(new Error(message), {
+      status: 400,
+      code: 'unsupported_capability',
+      body: {
+        type: 'error',
+        error: {
+          type: 'unsupported_capability',
+          code: 'unsupported_capability',
+          message,
+          details: { retryable: false },
+        },
+      },
+    })
+  }
   const tail = officialPassthrough ? '' : callerSystemTail(body?.system)
   if (!tail) return out
-  if (mode === 'replace' && Buffer.byteLength(tail, 'utf8') > CRAG_PRINT_PROMPT_MAX_BYTES) {
+  if (textCache && mode === 'append') {
+    out.system = body.system
+    return out
+  }
+  if (!nativeV3 && mode === 'replace' && Buffer.byteLength(tail, 'utf8') > CRAG_PRINT_PROMPT_MAX_BYTES) {
     throw cragPromptTooLarge(Buffer.byteLength(tail, 'utf8'))
   }
   out.crag_prompt = { mode, text: tail }
+  if (textCache) {
+    const blocks = callerSystemBlocks(body?.system)
+    if (blocks.some((block) => block.cache_control != null)) out.crag_prompt.blocks = blocks
+  }
   return out
 }

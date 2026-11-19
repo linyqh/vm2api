@@ -50,6 +50,7 @@ test('risk-audit and request-level codes never change the slot state', () => {
     'content_filter_refusal',
     'content_policy_refusal',
     'usage_policy_refusal',
+    ErrorCode.THIRD_PARTY_CLIENT,
     'invalid_request',
     'entitlement_required',
     'signature_repairable',
@@ -123,7 +124,7 @@ test('mutators keep the legacy trio in step', () => {
 
   applyScheduleOff(vm, true)
   assert.equal(vm.schedule_manual, true)
-  assert.equal(vm.schedule_disabled_reason, 'disabled')
+  assert.equal(vm.schedule_disabled_reason, 'organization_disabled', '调度关 never renames 不可调度')
   assert.equal(vm.unschedulable.reason, 'organization_disabled')
 
   applyScheduleOff(vm, false)
@@ -192,14 +193,26 @@ test('migration maps every legacy reason and is idempotent', () => {
   )
 })
 
-test('resolveSlotState: off > unschedulable > restricted > on', () => {
+test('resolveSlotState: unschedulable > off > restricted > on', () => {
   const now = 1_000_000
   const offAndBroken = { schedulable: false }
   applyUnschedulable(offAndBroken, 'organization_disabled')
   applyScheduleOff(offAndBroken, true)
   const off = resolveSlotState({ vm: offAndBroken, now })
-  assert.equal(off.schedule_state, 'off')
-  assert.equal(off.unschedulable_reason, 'organization_disabled', 'details keep the error under 调度关')
+  assert.equal(off.schedule_state, 'unschedulable', 'a dead slot must not hide under 调度关')
+  assert.equal(off.unschedulable_reason, 'organization_disabled')
+  assert.equal(offAndBroken.schedule_disabled_reason, 'organization_disabled')
+
+  // Operator turned it off first, then the grant died.
+  const offThenRevoked = { schedulable: true }
+  applyScheduleOff(offThenRevoked, true, { reason: 'seat-exp-20261118' })
+  assert.equal(resolveSlotState({ vm: offThenRevoked, now }).schedule_state, 'off')
+  applyUnschedulable(offThenRevoked, 'oauth_revoked', { refresh_error: 'oauth_revoked' })
+  const revoked = resolveSlotState({ vm: offThenRevoked, now })
+  assert.equal(revoked.schedule_state, 'unschedulable')
+  assert.equal(revoked.unschedulable_text, '凭证吊销')
+  assert.equal(offThenRevoked.schedule_disabled_reason, 'oauth_revoked')
+  assert.equal(offThenRevoked.schedule_off, true, 'operator intent is kept')
 
   const broken = { schedulable: true }
   applyUnschedulable(broken, 'organization_disabled', { status: 403 })
@@ -294,4 +307,13 @@ test('resolveSlotState reads records written before the migration', () => {
     availability: { key: 'quota', reason: 'quota_5h_header' },
   })
   assert.equal(leftover.schedule_state, 'restricted')
+})
+
+test('host memory pressure stays on the host, not on each slot', async (t) => {
+  const { installHostMemoryPressure } = await import('../../src/lib/cluster/host-memory-pressure.mjs')
+  installHostMemoryPressure({ levelForVm: () => 'critical', snapshot: () => [] })
+  t.after(() => installHostMemoryPressure(null))
+  // Admission already filters by host memory in pool-scheduler; the slot row must not inherit it.
+  assert.equal(resolveSlotState({ vm: { schedulable: true } }).schedule_state, 'on')
+  assert.equal(resolveSlotState({ vm: { schedulable: true, node_id: 'node-a' } }).schedule_state, 'on')
 })

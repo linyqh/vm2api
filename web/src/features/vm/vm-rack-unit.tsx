@@ -3,15 +3,14 @@ import type { UsageAccountRow } from '@/types/panel-usage'
 import type { Vm } from '@/types/panel-vm'
 import { resetCountdown } from '@/lib/fable-status'
 import { fmtNum, fmtUsd } from '@/lib/format'
-import { subscriptionListLabel } from '@/lib/subscription-expiry'
 import { cn } from '@/lib/utils'
-import { slotCredentialLabel } from '@/lib/vm-kind'
 import { vmCostLedger } from '@/lib/vm-usage'
 import { RISK_SOLID, riskFg, riskLevel } from '@/features/vm/usage-meter'
+import { VmAccountIdentity } from '@/features/vm/vm-account-identity'
 import {
   BLADE_STATE_CLASS,
   BladeControls,
-  TierBadge,
+  GeminiSlotStatus,
   tierStyle,
   useOpenOnKey,
   VmSeats,
@@ -82,7 +81,6 @@ export const VmUnit = memo(function VmUnit({
   const state = bladeState(vm)
   const ledger = vmCostLedger(vm, accounts)
   const total = ledger[ledger.length - 1]
-  const email = String(vm.email || '')
   return (
     <article
       role='button'
@@ -97,26 +95,14 @@ export const VmUnit = memo(function VmUnit({
       )}
       {...open}
     >
-      <div className='col-span-2 flex min-w-0 items-center gap-1.5'>
-        <span className='font-mono text-[11px] text-muted-foreground'>
-          {vm.id}
-        </span>
-        <TierBadge vm={vm} className='ms-auto h-4 px-1 text-[9.5px]' />
+      <div className='col-span-2 min-w-0'>
+        <VmAccountIdentity vm={vm} />
       </div>
-      <span
-        title={
-          [email, subscriptionListLabel(vm, now).text]
-            .filter(Boolean)
-            .join('\n') || undefined
-        }
-        className={cn(
-          'col-span-2 truncate text-[12.5px] font-semibold',
-          !email && 'font-medium text-muted-foreground'
-        )}
-      >
-        {slotCredentialLabel(vm, true)}
-      </span>
-      {state === 'live' ? (
+      {vm.gemini ? (
+        <div className='col-span-2'>
+          <GeminiSlotStatus vm={vm} />
+        </div>
+      ) : state === 'live' ? (
         <span className='flex items-end gap-1.5'>
           {vmWindows(vm).map((w) => (
             <MiniColumn key={w.key} w={w} now={now} />
@@ -133,7 +119,7 @@ export const VmUnit = memo(function VmUnit({
           {NOTE[state]}
         </span>
       )}
-      {total.cost ? (
+      {total.cost || total.tokens ? (
         <span
           className='grid gap-px self-end border-l border-[color:color-mix(in_oklch,var(--tc,var(--border))_55%,transparent)] ps-2 text-right'
           title={ledger

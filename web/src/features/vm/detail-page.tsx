@@ -66,7 +66,16 @@ import {
   type DeleteActiveVmPlan,
 } from '@/features/vm/active-vm'
 import { ActiveVmBadge } from '@/features/vm/active-vm-badge'
-import { DeleteActiveVmHint } from '@/features/vm/delete-active-hint'
+import {
+  DeleteActiveVmHint,
+  NodeGoneDeleteOption,
+} from '@/features/vm/delete-active-hint'
+import {
+  completeVmDeletion,
+  useNodeGone,
+  vmDeletePath,
+  type VmDeleteResult,
+} from '@/features/vm/delete-vm'
 import { VmAccountTab } from '@/features/vm/detail-account-tab'
 import { VmOpsTab } from '@/features/vm/detail-ops-tab'
 import { VmOverviewTab } from '@/features/vm/detail-overview-tab'
@@ -156,12 +165,16 @@ function VmDetailBody({
       !isAntigravityVm(detail.data.vm),
     refetchInterval: wantedTab === 'seed' ? 2000 : false,
   })
+  const cragTelemetry =
+    detail.data?.kernel?.telemetry?.state === 'launch_policy' ||
+    detail.data?.vm?.resolved_dataplane === 'crag'
   const seedUploadLog = useQuery({
     ...vmSeedUploadLogQueryOptions(id),
     enabled:
       perms.admin &&
       wantedTab === 'seed' &&
       seedDebug &&
+      !cragTelemetry &&
       !!detail.data?.vm &&
       !isAntigravityVm(detail.data.vm),
     refetchInterval: seedDebug && wantedTab === 'seed' ? 2000 : false,
@@ -170,6 +183,7 @@ function VmDetailBody({
 
   const [bindId, setBindId] = useState('')
   const [confirmDel, setConfirmDel] = useState(false)
+  const [forceDel, setForceDel] = useState(false)
   const [confirmReset, setConfirmReset] = useState(false)
   const [resetMode, setResetMode] = useState<'keep' | 'traits'>('keep')
   const [resetInput, setResetInput] = useState('')
@@ -282,6 +296,19 @@ function VmDetailBody({
     },
     onError: (error: Error) => toast.error(error.message),
   })
+  const saveId = useMutation({
+    mutationFn: (nextId: string) =>
+      api(`/api/panel/vms/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ id: nextId }),
+      }),
+    onSuccess: async (_saved, nextId) => {
+      toast.success(`编号已改为 ${nextId}`)
+      await refreshAll()
+      await navigate({ to: '/vm/$id', params: { id: nextId } })
+    },
+    onError: (error: Error) => toast.error(error.message),
+  })
 
   const saveSeed = useMutation({
     mutationFn: (body: Record<string, unknown>) =>
@@ -318,25 +345,27 @@ function VmDetailBody({
     },
   })
   const deletePlan: DeleteActiveVmPlan = planDeleteActiveVm(vm, slotList)
+  const nodeGone = useNodeGone(confirmDel ? vm : null)
   const remove = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (force: boolean) => {
       if (deletePlan.kind === 'switch') {
         await api(
           `/api/panel/vms/${encodeURIComponent(deletePlan.replacement.id)}/activate`,
           { method: 'POST' }
         )
       }
-      return api(`/api/panel/vms/${encodeURIComponent(id)}`, {
+      return api<VmDeleteResult>(vmDeletePath(id, force), {
         method: 'DELETE',
       })
     },
-    onSuccess: async () => {
-      toast.success(
+    onSuccess: async (data) => {
+      await completeVmDeletion(
+        qc,
+        data,
         deletePlan.kind === 'switch'
           ? `已切换活跃到 ${deletePlan.replacement.id} 并删除 ${id}`
           : '已删除'
       )
-      await qc.invalidateQueries({ queryKey: dashboardQueryOptions().queryKey })
       navigate({ to: '/vm' })
     },
     onError: (error: Error) => toast.error(error.message),
@@ -509,7 +538,9 @@ function VmDetailBody({
           vm={vm}
           canEdit={perms.admin}
           saving={saveName.isPending}
+          savingId={saveId.isPending}
           onSave={(name) => saveName.mutate(name)}
+          onSaveId={(nextId) => saveId.mutate(nextId)}
         />
         <Tabs value={tab} onValueChange={onTabChange}>
           <TabsList>
@@ -534,7 +565,6 @@ function VmDetailBody({
             dash={dash}
             u5={u5}
             u7={u7}
-            tierKey={tierKey}
             now={now}
             cost={cost}
             split={split}
@@ -675,6 +705,7 @@ function VmDetailBody({
                     seed={seed.data}
                     slot={seedSlot}
                     telemetry={kernel?.telemetry}
+                    cragTelemetry={cragTelemetry}
                     saving={saveSeed.isPending}
                     readError={seed.isError ? seed.error.message : null}
                     debug={seedDebug}
@@ -698,7 +729,10 @@ function VmDetailBody({
         </Tabs>
         <ConfirmDialog
           open={confirmDel}
-          onOpenChange={setConfirmDel}
+          onOpenChange={(open) => {
+            setConfirmDel(open)
+            if (!open) setForceDel(false)
+          }}
           title={`删除 ${id}`}
           desc={
             <>
@@ -713,10 +747,16 @@ function VmDetailBody({
           isLoading={remove.isPending}
           handleConfirm={() => {
             if (!remove.isPending && deletePlan.kind !== 'blocked') {
-              remove.mutate()
+              remove.mutate(forceDel && !!nodeGone)
             }
           }}
-        />
+        >
+          <NodeGoneDeleteOption
+            gone={nodeGone}
+            checked={forceDel}
+            onCheckedChange={setForceDel}
+          />
+        </ConfirmDialog>
         <ConfirmDialog
           open={confirmReset}
           onOpenChange={(open) => {

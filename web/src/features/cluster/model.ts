@@ -1,6 +1,7 @@
 import type {
   ClusterApiNode,
   ClusterLocalStatus,
+  HostMemoryPressure,
   NodeHostStats,
 } from '@/types/panel-cluster'
 import type { HostStats } from '@/types/panel-overview'
@@ -94,6 +95,21 @@ export function remoteLinkTone(node: ClusterApiNode): StatusTone {
   else if (state !== 'ready') text = LINK_STATE_TEXT[state] || state
   else if (node.direct_link?.state === 'down') text = '直连断了，走 SSH'
   return { ...LINK_TONE[link], text, label: text }
+}
+
+/** SSH 就绪或直连在线：机器还在，删槽要走普通删除去清理节点上的容器。 */
+export function nodeReachable(node: ClusterApiNode): boolean {
+  return node.link.state === 'ready' || node.direct_link?.state === 'ok'
+}
+
+/** 「移除节点」的提示；节点连不上时指向槽位删除里的「节点不可达」。 */
+export function removeNodeHint(m: ClusterMachine): string {
+  const n = m.slots.length
+  if (!n) return '断开 SSH、删除本地凭证与 Docker 桥；远端容器保持运行'
+  if (!m.remote || nodeReachable(m.remote)) {
+    return `这台上还有 ${n} 个槽，先删掉或挪走才能移除`
+  }
+  return `这台上还有 ${n} 个槽。节点连不上时，删除槽位可勾选「节点不可达」只删面板记录，删完再移除`
 }
 
 /** 第二行小字：`直连 21ms · SSH 4ms`；没连上时给错误原因。 */
@@ -252,11 +268,19 @@ export type ClusterMachine = {
     load: [number, number | null, number | null]
   } | null
   mem: Meter | null
+  /** 调度用的整机内存压力；ok / 未采样为 null。 */
+  memPressure: HostMemoryPressure | null
   disk: Meter | null
   slots: Vm[]
   capacity: MachineCapacity | null
   todayUsd: number
   remote?: ClusterApiNode
+}
+
+function pressureOf(
+  p: HostMemoryPressure | null | undefined
+): HostMemoryPressure | null {
+  return p && p.level !== 'ok' ? p : null
 }
 
 function todayOf(vms: Vm[]): number {
@@ -314,6 +338,7 @@ export function buildLocalMachine(input: {
       h && memTotal
         ? { pct: Number(h.mem_pct) || 0, used: memUsed, total: memTotal }
         : null,
+    memPressure: pressureOf(h?.memory_pressure),
     disk: diskMeter(input.status?.disk),
     slots,
     capacity: memTotal
@@ -347,6 +372,7 @@ export function buildRemoteMachine(
     linkSub: linkLatencyText(node),
     cpu: h ? hostCpu(h) : null,
     mem: h ? { pct: h.mem_pct, used: h.mem_used, total: h.mem_total } : null,
+    memPressure: live ? pressureOf(node.memory_pressure) : null,
     disk: diskMeter(h),
     slots,
     capacity: h

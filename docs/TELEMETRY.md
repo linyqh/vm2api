@@ -1,6 +1,9 @@
 # VM-native telemetry
 
-Telemetry is an explicit per-VM seed-policy opt-in. New VMs are disabled.
+Telemetry is a per-VM seed-policy opt-in. New VMs follow
+`routing.telemetry.default_enabled` (missing or false means off). Turning that
+switch on also enables every existing Claude VM; turning it off does not opt
+existing VMs out.
 `kin-seed.json` → `seed_policy.telemetry_disabled` is the only enable authority.
 Linux Docker and KVM use the existing resident cli-node, supervised by the Rust
 kernel, as the sole upstream sender. macOS native slots report `unsupported`.
@@ -74,6 +77,9 @@ are whole minutes from **60–86400** seconds. Changes are published and observe
 without restarting the VM or inference process. All events share that cadence:
 no key-event, full-queue, shutdown, credential-ready or geo-ready forced flush.
 Empty batches are not sent.
+`routing.telemetry.default_enabled` defaults to **false**. When it changes to
+true, every Claude VM is opted in and the policy is published. Changing it back
+to false only affects VMs created afterward.
 
 ## Queue and disable semantics
 
@@ -134,6 +140,30 @@ response reports `published: true`, `applied: false`. Neither is UI success for
 runtime application. An off policy is confirmed only by native disabled state
 and an empty queue; absence or an active old state remains unconfirmed. Both
 single-VM and bulk controls can republish an unconfirmed, already-saved policy.
+
+### CRAG native Claude launch policy
+
+CRAG uses a separate Unix-socket control route, not the queue/ACK protocol
+above. `kin-seed.json` explicitly opts in with `seed_policy.telemetry_disabled:
+false`. The panel writes the guest's `CLAUDE_CONFIG_DIR/settings.json` alongside
+it. On enable it removes `DISABLE_TELEMETRY`, `CLAUDE_CODE_DISABLE_TELEMETRY`,
+`DO_NOT_TRACK`, and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`; on disable it
+writes the kill switches. Other kernels retain their existing settings policy.
+
+The panel checks `POST /internal/v1/telemetry/apply` and, only on a restart-required
+response, uses slot maintenance to drain requests, restart the selected CRAG
+kernel, verify again and restore the scheduling intent. Active native work or
+an unavailable worker remains unconfirmed. Stopped slots are not started.
+
+The telemetry page's recheck reads the running worker's authenticated policy
+without republishing configuration or restarting anything. It requires
+`crag_telemetry_apply_v1` (available in CRAG 3.1.4) and shows an unconfirmed
+state when the running worker cannot attest the saved policy. A successful
+check reports `upload_confirmed: false`: it does not attest a running sender,
+an emptied queue, or network delivery. The managed upload interval is not
+applied to CRAG's official Claude process.
+
+### Official initialization
 
 Official initialization's `sync_telemetry` remains default-off. When enabled, it
 publishes the existing policy; it does not opt the account in. The finalizer's

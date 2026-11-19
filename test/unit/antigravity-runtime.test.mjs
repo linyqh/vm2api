@@ -37,13 +37,7 @@ import {
   writeWorkerFiles,
 } from '../../src/lib/vm/vm-runtime.mjs'
 import { diagnoseSlotServices, powerOnSlot } from '../../src/lib/vm/slot-recovery.mjs'
-import {
-  panelAntigravityShellLaunch,
-  createSlotShell,
-  preparePanelShellLogin,
-  adoptShellLogin,
-  adoptLiveShellLogin,
-} from '../../src/lib/vm/slot-shell.mjs'
+import { panelAntigravityShellLaunch, createSlotShell } from '../../src/lib/vm/slot-shell.mjs'
 
 const vm = {
   id: 'vm-ag',
@@ -371,16 +365,13 @@ test('AG shell is plain and rejects Claude credential/login workflows before wri
   let authCalls = 0
   const shell = createSlotShell({
     projectRoot: root,
-    authLoginReady: async () => {
+    checkClaude: async () => {
       authCalls++
     },
   })
   assert.equal((await shell.issueTicket(vm.id)).ok, true)
   assert.equal((await shell.issueTicket(vm.id, { login: true })).error.code, 'platform_login_not_supported')
   assert.equal(authCalls, 0)
-  await assert.rejects(preparePanelShellLogin(root, vm), { code: 'platform_login_not_supported' })
-  await assert.rejects(adoptShellLogin(root, vm), { code: 'platform_login_not_supported' })
-  assert.equal((await adoptLiveShellLogin(root, vm)).imported, false)
   assert.equal(fs.existsSync(path.join(root, 'vms', vm.id, 'cli-home', '.claude')), false)
 })
 

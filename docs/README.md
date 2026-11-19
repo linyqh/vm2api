@@ -1,11 +1,16 @@
 # 文档
 
 - [DEPLOY.md](DEPLOY.md) — 安装与升级（含 `deploy/install.sh` 一键安装 / 更新）
+- [托管节点内核排障与验收](managed-kernel-troubleshooting.md) — CRAG 缺包、控制面连接、单槽重装、Claude 版本与账号状态的分层检查
 - [nginx-shell.md](nginx-shell.md) — 集群 / 槽运维终端 WebSocket 连不上时查 nginx Upgrade
-- [FORMAT.md](FORMAT.md) — 本地与 CI 同一套格式（Biome / gofmt / Prettier，LF）
+- [DEVELOPMENT.md](DEVELOPMENT.md) — 分支（dev 开发 / main 发布）、工作树、验证、CI 触发与发版流程
+- [开发验证与 CI](../README.md#开发验证与-ci) — 核心集、指定测试文件、按目录触发与手动全量 / ARM 检查
+- [CRAG 面板历史复用](performance/crag-panel-history-reuse.md) — 入站优化过程、CPU 对照、长会话回放和缓存边界
+- [FORMAT.md](FORMAT.md) — 仅格式化改动文件；手动全量 CI 使用同一套 Biome / gofmt / Prettier 配置（LF）
 - [API.md](API.md) — `/v1`
 - [RISK.md](RISK.md) — 封控拦截（蒸馏 → 硬正则 → 拒答缓存 → 决策模型 → 放行出站）
 - [PANEL_API.md](PANEL_API.md) — 管理台 API
+- [CRAG 支付与鉴权验收](crag-payment-acceptance.md) — 商城调用、回调归属、宿主订阅兑换与实付复跑
 - [AFO_INTEGRATION.md](AFO_INTEGRATION.md) — AFO 平台对接的 `/api/v1` 兼容层规格（未实现）
 - [redaction/README.md](redaction/README.md) — 可启停内容脱敏：默认关闭；helper 未就绪时阻断，不发明文
 - [ISSUE_BACKLOG.md](ISSUE_BACKLOG.md) — open issue 复核后暂不修复的清单（2026-10-28）

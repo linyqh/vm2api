@@ -1,3 +1,4 @@
+import type { GeminiEnvironment } from '@/features/import/gemini-environments'
 import type { WindowEstimate } from './panel-pricing'
 
 /**
@@ -82,10 +83,11 @@ export type CragLicenseStatus = {
   vm_id: string
   /** offline: CRAGU1 universal code. online: device-bound CRAGL1. */
   kind?: 'offline' | 'online'
-  /** kernel: one offline code covers every slot and machine. device: one VM. */
-  scope?: 'kernel' | 'device'
+  /** kernel: all slots; device: one VM; host: one subscription seat. */
+  scope?: 'kernel' | 'device' | 'host'
+  seat?: number
   license_id?: string
-  term?: '1m' | '6m' | '1y'
+  term?: '1m' | '3m' | '6m' | '1y'
   /** Signed UTC epoch seconds, not browser-local timestamps. */
   issued_at?: number
   not_before?: number
@@ -97,6 +99,7 @@ export type CragLicenseStatus = {
 export type CragLicenseResponse = {
   license: CragLicenseStatus
   machine_code: string
+  payload_key_id?: string
 }
 
 export type VmTelemetryState = {
@@ -112,6 +115,13 @@ export type VmTelemetryState = {
   pending_events: number
   last_upload_at: string | null
   last_error: string | null
+}
+
+export type CragTelemetryState = {
+  state: 'launch_policy'
+  enabled: boolean | null
+  error: string | null
+  upload_confirmed: false
 }
 
 export type VmKernelHealth = {
@@ -136,7 +146,7 @@ export type VmKernelSnapshot = {
   credential_owner?: string | null
   credential_state?: string | null
   proxy_state?: string | null
-  telemetry?: VmTelemetryState | null
+  telemetry?: VmTelemetryState | CragTelemetryState | null
   process_topology?: {
     rust_pid1?: boolean
     go_worker_pid1?: boolean
@@ -174,6 +184,8 @@ export type KvmProbe = {
 export type VmCreateOptions = {
   vm: unknown
   kvm: KvmProbe
+  /** CRAG support for this machine only; cluster nodes use their placement preflight. */
+  crag_supported: boolean
 }
 
 export type VmSmbios = {
@@ -267,6 +279,7 @@ export type ScheduleState = 'on' | 'off' | 'unschedulable' | 'restricted'
 
 export type Vm = {
   id: string
+  gemini?: GeminiEnvironment
   name?: string
   owner_user_id?: string | null
   /** 所在集群节点；null / 缺省 = 本机。 */
@@ -382,7 +395,14 @@ export type Vm = {
   claude_reset_credits?: {
     eligible?: boolean
     available_count?: number
+    /** Cards shown to the operator: ready or cooling down, not withheld by upstream. */
+    held_count?: number
     credits?: Array<{
+      /** Opaque per-slot card handle used to pick the card to spend. */
+      ref?: string
+      kind?: 'session' | 'weekly' | 'fable' | 'full'
+      state?: 'ready' | 'cooldown' | 'unavailable'
+      gives_back_weekly?: boolean
       label?: string
       resets_left?: number
       starts_at?: string
@@ -403,6 +423,14 @@ export type Vm = {
   rate_limit_tier?: string | null
   /** Whether official usage lists a Fable window; not a subscription identifier. */
   usage_has_fable?: boolean | null
+  /** 开了 pool.fable_requires_max 且本槽不是 Max：Fable 不会派到这里。 */
+  fable_requires_max?: boolean
+  /** 上游回「Usage credits are required」后 Fable 暂停调度到此槽，`until` 前有效。 */
+  fable_credits_required?: {
+    model?: string | null
+    at?: string | null
+    until?: string | null
+  } | null
   /** anthropic | openai | antigravity。缺省兼容旧 Claude 槽。 */
   platform?: string | null
   /** claude | codex | antigravity */
@@ -494,9 +522,11 @@ export type Vm = {
   total_cost?: number
   /** 累计 token（含缓存），与 total_cost 同源。 */
   total_tokens?: number
+  lifetime_usage?: { cost: number; tokens: number }
   expires_at?: string
   refreshed_at?: string
   oauth_source?: string
+  oauth_registration?: 'console' | 'oauth' | null
   account_uuid?: string
   org_uuid?: string
   access_preview?: string
@@ -561,6 +591,8 @@ export type Vm = {
   window_7d_success?: number
   window_7d_errors?: number
   window_7d_tokens?: number
+  /** 近 24h 每 30 分钟 [成功, 失败]，最后一格是当前；无请求为 null。 */
+  health_24h?: Array<[number, number]> | null
   window_fable_cost?: number
   estimate_5h?: WindowEstimate
   estimate_7d?: WindowEstimate

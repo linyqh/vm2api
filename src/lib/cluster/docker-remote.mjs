@@ -173,6 +173,26 @@ export async function updateContainerMemory(connect, id, { memory, memorySwap },
   )
 }
 
+/** Live `docker update --pids-limit`; the cgroup pids.max follows without a restart. */
+export async function updateContainerPids(connect, id, pidsLimit, { timeoutMs = 15_000 } = {}) {
+  if (!Number.isSafeInteger(pidsLimit) || pidsLimit <= 0) {
+    throw new ClusterError(400, 'invalid_pids_limit', 'Docker pids 上限不合法')
+  }
+  return withDockerDeadline(
+    connect,
+    async (scopedConnect) => {
+      const result = await dockerJson(scopedConnect, {
+        method: 'POST',
+        path: `${containerPath(id)}/update`,
+        body: { PidsLimit: pidsLimit },
+        timeoutMs,
+      })
+      return { warnings: Array.isArray(result?.Warnings) ? result.Warnings : [] }
+    },
+    timeoutMs,
+  )
+}
+
 function captureDockerOutput(buf, maxOutputBytes) {
   const stdout = []
   const stderr = []
@@ -196,7 +216,7 @@ function captureDockerOutput(buf, maxOutputBytes) {
 }
 
 /** Finite non-TTY commands only. Closing a timed-out stream is not a process kill. */
-export async function execCapture(connect, id, cmd, { timeoutMs = 10_000, maxOutputBytes = 65_536 } = {}) {
+export async function execCapture(connect, id, cmd, { user, timeoutMs = 10_000, maxOutputBytes = 65_536 } = {}) {
   if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes <= 0 || maxOutputBytes > MAX_RESPONSE_BYTES / 2 - 8) {
     throw new RangeError('invalid Docker exec output limit')
   }
@@ -208,7 +228,7 @@ export async function execCapture(connect, id, cmd, { timeoutMs = 10_000, maxOut
         {
           method: 'POST',
           path: `${containerPath(id)}/exec`,
-          body: { Cmd: cmd, Tty: false, AttachStdout: true, AttachStderr: true },
+          body: { Cmd: cmd, Tty: false, AttachStdout: true, AttachStderr: true, ...(user ? { User: user } : {}) },
           timeoutMs,
         },
         [201],
@@ -464,6 +484,16 @@ export async function containerAction(connect, id, action, { t } = {}) {
   )
 }
 
+/** Send a signal (e.g. HUP for a config reload) to a running container. */
+export async function signalContainer(connect, id, signal) {
+  if (!/^[A-Z0-9]+$/.test(String(signal || ''))) throw new ClusterError(400, 'invalid_signal', '信号名不合法')
+  await dockerJson(
+    connect,
+    { method: 'POST', path: `${containerPath(id)}/kill?signal=${signal}`, timeoutMs: 30_000 },
+    [204],
+  )
+}
+
 export async function removeContainer(connect, id) {
   await dockerJson(connect, { method: 'DELETE', path: `${containerPath(id)}?force=1&v=1`, timeoutMs: 60_000 }, [204])
 }
@@ -537,10 +567,9 @@ function execPath(execId) {
 /**
  * `docker exec -it` over the Engine API. The start call is hijacked
  * (`Upgrade: tcp`); with Tty the stream is raw, no 8-byte frame headers.
- * No `User`: the session runs as the container's configured user.
  * @returns {Promise<{ execId: string, stream: import('node:stream').Duplex }>}
  */
-export async function openExecTty(connect, id, { cmd, env = [], workingDir, cols = 80, rows = 24 } = {}) {
+export async function openExecTty(connect, id, { cmd, env = [], user, workingDir, cols = 80, rows = 24 } = {}) {
   const created = await dockerJson(
     connect,
     {
@@ -553,6 +582,7 @@ export async function openExecTty(connect, id, { cmd, env = [], workingDir, cols
         AttachStdin: true,
         AttachStdout: true,
         AttachStderr: true,
+        ...(user ? { User: user } : {}),
         ...(workingDir ? { WorkingDir: workingDir } : {}),
       },
     },
@@ -628,6 +658,26 @@ export async function imagePresent(connect, ref) {
   if (res.status === 404) return false
   if (res.status !== 200) throw new ClusterError(502, 'docker_api_error', dockerMessage(res))
   return true
+}
+
+/** Every image on the engine (repo tags included); the caller filters. */
+export async function listImages(connect) {
+  return dockerJson(connect, { path: '/images/json', timeoutMs: 30_000 })
+}
+
+/**
+ * Untag one image reference without force. False when the engine refuses (409: a container,
+ * even a stopped one, still uses it) or the tag is already gone.
+ */
+export async function removeImageTag(connect, ref) {
+  const res = await dockerRequest(connect, {
+    method: 'DELETE',
+    path: `/images/${encodeURIComponent(ref)}`,
+    timeoutMs: 60_000,
+  })
+  if (res.status === 200) return true
+  if (res.status === 404 || res.status === 409) return false
+  throw new ClusterError(502, 'docker_api_error', dockerMessage(res))
 }
 
 export async function inspectNetworkOrNull(connect, name) {

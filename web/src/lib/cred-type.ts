@@ -71,6 +71,15 @@ export function credEndpointLabel(endpoint: CredEndpoint): string {
   return CRED_ENDPOINT_LABEL[endpoint]
 }
 
+export function credentialRegistrationOf(vm: Vm): CredEndpoint {
+  if (!vm.has_token) return 'none'
+  if (isCodexVm(vm)) return 'oauth'
+  const type = credTypeOf(vm)
+  if (type === 'apikey') return 'api'
+  if (vm.oauth_registration) return vm.oauth_registration
+  return type === 'official-setup-token' ? 'console' : 'oauth'
+}
+
 /**
  * Claude 槽刷新走 OAuth 接口，但实际推理都是 `Authorization: Bearer` 调 Console
  * （Setup Token 形式），所以 OAuth 与 Setup Token 都归 Console；只有 `x-api-key`
@@ -122,8 +131,8 @@ export function importSurfaceFor(
 export type ImportMethod = 'session' | 'link' | 'cc'
 
 export const IMPORT_KINDS: { id: ImportKind; label: string }[] = [
-  { id: 'setup-token', label: 'Setup Token' },
   { id: 'oauth', label: 'OAuth' },
+  { id: 'setup-token', label: 'Setup Token' },
   { id: 'apikey', label: 'Console' },
 ]
 
@@ -132,7 +141,7 @@ export function importMethodsFor(
 ): { id: ImportMethod; label: string }[] {
   if (kind === 'apikey') return []
   const methods: { id: ImportMethod; label: string }[] = [
-    { id: 'cc', label: 'Claude Code' },
+    { id: 'cc', label: 'Claude Code 授权' },
     { id: 'link', label: '授权链接' },
     { id: 'session', label: 'Cookie' },
   ]
@@ -141,10 +150,11 @@ export function importMethodsFor(
 }
 
 export function defaultImportKind(): ImportKind {
-  return 'setup-token'
+  return 'oauth'
 }
 
 export function defaultImportMethod(kind: ImportKind): ImportMethod {
+  if (kind === 'oauth') return 'cc'
   return kind === 'apikey' ? 'link' : 'session'
 }
 

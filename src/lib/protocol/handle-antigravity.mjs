@@ -1,11 +1,10 @@
 import crypto from 'node:crypto'
 import { listVms, getVm } from '../vm/vm-registry.mjs'
-import { isValidVmId } from '../vm/vm-file.mjs'
 import { isAntigravityVm } from '../vm/vm-kind.mjs'
 import { isClientStream } from './convert.mjs'
 import { ErrorCode } from '../core/errors.mjs'
 import { keyScopeFromRequest, vmPoolDenial } from '../admin/key-scope.mjs'
-import { ownerScopeFromRequest } from '../admin/resource-owner.mjs'
+import { ownerScopeFromRequest, pinnedVmIdFromRequest } from '../admin/resource-owner.mjs'
 import { normalizeAntigravityRouting, antigravityModelId, resolveAntigravityVariant } from './antigravity-route.mjs'
 import {
   normalizeAntigravityRequest,
@@ -106,10 +105,7 @@ export async function handleAntigravityProtocol({
   if (denial) return fail(403, denial.code, denial.message)
   if (!['all', 'antigravity'].includes(scope.group_type))
     return fail(403, 'key_group_mismatch', '此密钥不可调用 Antigravity。')
-  const pin =
-    req.apiKeyKind === 'master' && isValidVmId(String(req.headers?.['x-kin-vm'] || '').trim())
-      ? String(req.headers['x-kin-vm']).trim()
-      : null
+  const pin = pinnedVmIdFromRequest(req, apiKeyStore?.users)
   const ownerScope = ownerScopeFromRequest(req, apiKeyStore?.users)
   const responseStore = ops.responseStore || antigravityResponseStore
   const responseScope = antigravityResponseScope(req)

@@ -7,6 +7,64 @@ import {
   shouldContinue,
 } from '../../src/lib/pool/upstream-error-policy.mjs'
 
+test('broken native handoff contracts stop without replaying or cooling an account', () => {
+  for (const code of [
+    'native_handoff_missing',
+    'native_handoff_invalid',
+    'native_handoff_conflict',
+    'native_handoff_incomplete',
+  ]) {
+    for (const committed of [false, true]) {
+      const policy = classifyUpstreamResult({
+        ok: false,
+        status: 502,
+        nativeHandoff: true,
+        terminalState: 'incomplete',
+        committed,
+        body: { type: 'error', error: { type: 'api_error', code, message: 'Provider terminal proof is unavailable' } },
+      })
+      assert.equal(policy.action, 'stop')
+      assert.equal(policy.retrySameAccount, false)
+      assert.equal(policy.cooldownUntil, null)
+      assert.equal(policy.scope, 'request')
+    }
+  }
+})
+
+test('CRAG host capacity rejections stop without an account or egress cooldown', () => {
+  for (const code of ['license_crag_host_over_quota', 'license_crag_host_usage_unverified']) {
+    const policy = classifyUpstreamResult({
+      ok: false,
+      status: 403,
+      terminalState: 'rejected',
+      body: { type: 'error', error: { type: 'permission_error', code } },
+    })
+    assert.equal(policy.reason, code)
+    assert.equal(policy.scope, 'request')
+    assert.equal(policy.action, 'stop')
+    assert.equal(policy.retrySameAccount, false)
+    assert.equal(policy.cooldownUntil, null)
+  }
+})
+
+test('a locally rejected CRAG quota hop can move to another slot without cooling down', () => {
+  const code = 'license_crag_host_over_quota'
+  const rejected = {
+    ok: false,
+    status: 403,
+    terminalState: 'rejected',
+    upstreamExecutions: 0,
+    body: { type: 'error', error: { type: 'permission_error', code } },
+  }
+  const policy = classifyUpstreamResult(rejected)
+  assert.equal(policy.reason, code)
+  assert.equal(policy.scope, 'worker')
+  assert.equal(policy.action, 'continue')
+  assert.equal(policy.retrySameAccount, false)
+  assert.equal(policy.cooldownUntil, null)
+  assert.equal(classifyUpstreamResult({ ...rejected, committed: true }).action, 'stop')
+})
+
 test('unified account 429 without reset header uses usage window then 30 minutes', () => {
   const now = 1_700_000_000_000
   const usageReset = now + 3_600_000
@@ -56,15 +114,63 @@ test('unified account 429 cools account until authoritative reset', () => {
 })
 
 test('#163: a bare 429 is unknown for every model; the model name never decides scope', () => {
-  for (const model of ['claude-sonnet-4-5-20250929', 'claude-haiku-4-5', 'claude-opus-4-6', 'unknown-model']) {
+  for (const model of [
+    'claude-sonnet-4-5-20250929',
+    'claude-haiku-4-5',
+    'claude-opus-4-6',
+    'claude-fable-5-2',
+    'unknown-model',
+  ]) {
     const policy = classifyUpstreamResult(
       { status: 429, body: { error: { type: 'rate_limit_error', message: 'Rate limited' } }, headers: {} },
       { model, now: 1000 },
     )
     assert.equal(policy.reason, 'rate_limited_unknown', model)
     assert.equal(policy.scope, 'account', model)
-    assert.equal(policy.cooldownUntil, 61_000, model)
+    assert.equal(policy.action, 'continue', model)
+    assert.equal(policy.cooldownUntil, null, model)
     assert.equal(policy.circuit, undefined, model)
+  }
+})
+
+test('#1139: only a proven Fable window cools the Fable family', () => {
+  const error = { type: 'rate_limit_error', message: 'Error' }
+  const body = { type: 'error', error }
+  const facts = {
+    schema_version: 2,
+    source: 'provider_http',
+    http_status: 429,
+    response_headers: { 'content-type': 'application/json' },
+    error,
+  }
+  const result = { status: 429, body, providerResult: facts }
+  for (const [label, failure, reason, action] of [
+    [
+      'native limit header',
+      {
+        ...result,
+        providerResult: { ...facts, response_headers: { 'Anthropic-RateLimit-Unified-7d_oi-Status': 'rejected' } },
+      },
+      'fable_rate_limited',
+      'continue-and-cooldown',
+    ],
+    [
+      'forwarded Retry-After',
+      { ...result, headers: { 'Retry-After': '7' } },
+      'rate_limited_unknown',
+      'continue-and-cooldown',
+    ],
+    ['no native facts', { status: 429, body }, 'rate_limited_unknown', 'continue'],
+    [
+      'different error text',
+      { ...result, body: { ...body, error: { ...error, message: 'Rate limited' } } },
+      'rate_limited_unknown',
+      'continue',
+    ],
+  ]) {
+    const policy = classifyUpstreamResult(failure, { model: 'claude-fable-5-2', now: 1000 })
+    assert.equal(policy.reason, reason, label)
+    assert.equal(policy.action, action, label)
   }
 })
 
@@ -177,7 +283,7 @@ test('response-header timeout does not cool the account', () => {
   assert.equal(shouldContinue(policy), true)
 })
 
-test('generic 502 overload switches units through the circuit, not a 15s cooldown', () => {
+test('generic 502 server error switches units through the circuit, not a 15s cooldown', () => {
   const policy = classifyUpstreamResult(
     {
       status: 502,
@@ -186,7 +292,7 @@ test('generic 502 overload switches units through the circuit, not a 15s cooldow
     { now: 1000 },
   )
   assert.equal(policy.action, 'continue')
-  assert.equal(policy.reason, 'provider_overloaded')
+  assert.equal(policy.reason, 'upstream_server_error')
   assert.equal(policy.cooldownUntil, null)
   assert.equal(policy.circuit, true)
   assert.equal(policy.decision.scope, 'unit')
@@ -210,6 +316,24 @@ test('incomplete 502 is an empty hop, not account overload', () => {
   assert.equal(policy.action, 'continue')
   assert.equal(policy.cooldownUntil, null)
   assert.equal(policy.retrySameAccount, true)
+})
+
+test('a dead native Claude process fails over without a cooldown or circuit', () => {
+  // crag-v2 answers 502 when the VM's Claude process dies before replying,
+  // e.g. killed by the container's memory or pids limit. The account is fine.
+  for (const error of [
+    { type: 'process_error', message: 'Claude process exited (None): Claude native process exited with code None' },
+    { type: 'api_error', message: 'Claude process exited (Some(1)): Claude native process exited with code Some(1)' },
+  ]) {
+    const policy = classifyUpstreamResult({ status: 502, body: { type: 'error', error } }, { now: 1000 })
+    assert.equal(policy.action, 'continue', error.type)
+    assert.equal(policy.reason, 'worker_process_exit')
+    assert.equal(policy.scope, 'worker')
+    assert.equal(policy.cooldownUntil, null)
+    assert.notEqual(policy.circuit, true)
+    assert.equal(policy.retrySameAccount, false)
+    assert.equal(shouldContinue(policy), true)
+  }
 })
 
 test('slot_busy 503 does not park the account', () => {
@@ -570,7 +694,7 @@ test('Usage Policy API Error stops the request and is cached with no expiry', ()
   }
 })
 
-test('third-party extra-usage 400 and 503 are cached refusals, not invalid requests', () => {
+test('third-party extra-usage 400 and 503 stop as third_party_client without cooldown or refusal cache', () => {
   const messages = [
     "HTTP 400: Third-party apps now draw from your extra usage, not your plan limits. We've added a $20 credit to get you started.",
     'API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Third-party apps now draw from your extra usage, not your plan limits."}}',
@@ -588,10 +712,11 @@ test('third-party extra-usage 400 and 503 are cached refusals, not invalid reque
         },
       })
       assert.equal(policy.action, 'stop', `${status} ${message}`)
-      assert.equal(policy.reason, 'usage_policy_refusal')
-      assert.equal(policy.rememberRefusal, true)
-      assert.equal(policy.refusalTtlMs, 0)
+      assert.equal(policy.reason, 'third_party_client')
+      assert.equal(policy.scope, 'request')
+      assert.equal(policy.rememberRefusal, undefined)
       assert.equal(policy.cooldownUntil, null)
+      assert.equal(policy.retrySameAccount, false)
       assert.equal(policy.circuit, undefined)
       assert.equal(policy.decision.origin, 'client')
       assert.equal(shouldContinue(policy), false)
@@ -965,4 +1090,61 @@ test('fatal credential ensure escalation stays on permanent oauth_revoked', () =
   assert.notEqual(policy.reason, 'credential_refresh_failed')
   assert.equal(policy.cooldownUntil, Number.MAX_SAFE_INTEGER)
   assert.equal(shouldContinue(policy), true)
+})
+
+test('native launch permission errors stop at the worker without overload classification', () => {
+  const result = {
+    status: 502,
+    body: {
+      error: {
+        code: 'upstream_error',
+        message:
+          'Claude native launch failed (guest identity requires user/mount namespaces and bind-mount permissions): Permission denied (os error 13)',
+      },
+    },
+  }
+  const policy = classifyUpstreamResult(result)
+  assert.equal(policy.scope, 'worker')
+  assert.equal(policy.reason, 'native_launch_permission_denied')
+  assert.equal(policy.action, 'stop')
+  assert.equal(policy.cooldownUntil, null)
+  assert.equal(policy.retrySameAccount, false)
+})
+
+test('non-permission native launch failures remain local worker errors', () => {
+  const body = {
+    error: { code: 'upstream_error', message: 'Claude native launch failed: No such file or directory (os error 2)' },
+  }
+  const policy = classifyUpstreamResult({ status: 502, body })
+  assert.equal(policy.reason, 'native_launch_failed')
+  assert.equal(policy.scope, 'worker')
+  assert.equal(policy.action, 'stop')
+  assert.equal(policy.circuit, undefined)
+  assert.equal(body.error.code, 'upstream_error')
+})
+
+test('explicit overload errors retain overload classification', () => {
+  for (const status of [502, 529]) {
+    const policy = classifyUpstreamResult({ status, body: { error: { message: 'Overloaded' } } })
+    assert.equal(policy.reason, 'provider_overloaded')
+  }
+})
+
+test('fable usage-credits 429 moves on and marks the account, not the request', () => {
+  for (const message of ['Usage credits are required for this model.', 'Extra usage required for this model']) {
+    const policy = classifyUpstreamResult(
+      { status: 429, body: { type: 'error', error: { type: 'rate_limit_error', message } } },
+      { model: 'claude-fable-5-2', now: 1000 },
+    )
+    assert.equal(policy.reason, 'fable_credits_required')
+    assert.equal(policy.scope, 'account')
+    assert.equal(policy.action, 'continue')
+    assert.equal(policy.retrySameAccount, false)
+    assert.equal(policy.cooldownUntil, null)
+  }
+  const fast = classifyUpstreamResult(
+    { status: 429, body: { error: { message: 'Usage credits are required for fast mode' } } },
+    { model: 'claude-fable-5-2' },
+  )
+  assert.equal(fast.reason, 'entitlement_required')
 })

@@ -549,6 +549,14 @@ export class RequestLogStore {
       model: extra.model || null,
       stream: !!extra.stream,
       status: extra.status ?? null,
+      upstream_status: extra.audit_upstream_400
+        ? 400
+        : Number(extra.upstream_status) === 400
+          ? null
+          : (extra.upstream_status ?? null),
+      upstream_400_message: extra.audit_upstream_400_message
+        ? String(extra.audit_upstream_400_message).slice(0, 300)
+        : null,
       duration_ms,
       api_key_kind: extra.api_key_kind || null,
       api_key_id: extra.api_key_id || null,
@@ -579,6 +587,7 @@ export class RequestLogStore {
       attempt_count: extra.attempt_count ?? null,
       final_state: extra.final_state || null,
       final_account_id: extra.final_account_id || extra.account_id || null,
+      usage_account_id: extra.usage_account_id || null,
       session_id: sessionIdForLog(extra.session_id),
       outbound_session_id: sessionIdForLog(extra.outbound_session_id),
       reasoning_effort: REASONING_EFFORTS.has(extra.reasoning_effort) ? extra.reasoning_effort : null,
@@ -625,7 +634,6 @@ export class RequestLogStore {
             : null,
         hop_meta: extra.hop_meta || null,
         via: extra.via || extra.hop_meta?.via || null,
-        upstream_status: extra.upstream_status ?? null,
         outbound_summary: extra.outbound_summary || null,
         cache_prefix: extra.cache_prefix || null,
         cache_continuity: extra.cache_continuity || null,
@@ -717,6 +725,14 @@ export class RequestLogStore {
 
   billingStats(opts = {}) {
     return this.repo.billingStats(opts)
+  }
+
+  healthBuckets(opts = {}) {
+    return this.repo.healthBuckets(opts)
+  }
+
+  topErrors(opts) {
+    return this.repo.topErrors(opts)
   }
 
   ownerBilling(opts = {}) {

@@ -19,6 +19,7 @@ import {
   type ImportMethod,
 } from '@/lib/cred-type'
 import { importErrorMessage } from '@/lib/import-errors'
+import type { LoginCommit } from '@/lib/login-terminal'
 import { proxyNamedLabel } from '@/lib/vm-status'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -38,8 +39,7 @@ import { CodexCredentialPanel } from '@/features/vm/codex-credential-panel'
 import { ConvertOauthToSetupButton } from '@/features/vm/convert-oauth-button'
 import { vmQueryOptions } from '@/features/vm/queries'
 
-export type CommitResult = {
-  official_cc_bootstrap?: { scheduled?: boolean; reason?: string } | null
+export type CommitResult = LoginCommit & {
   oauth_email?: string
 }
 
@@ -254,7 +254,8 @@ function ClaudeCredentialPanel({
       setCode('')
       setLink(EMPTY_LINK)
       await invalidate()
-      onCommitted?.(d, vmId, '换票完成')
+      toast.success('换票完成，已同步到 VM 客户端')
+      onCommitted?.(d, vmId, '换票并同步完成')
     },
     onError: (e: Error) => toast.error(importErrorMessage(e)),
   })
@@ -289,7 +290,8 @@ function ClaudeCredentialPanel({
       setApiKey('')
       setSessionKey('')
       await invalidate()
-      onCommitted?.(d, vmId, '已导入')
+      toast.success('凭证已导入并同步到 VM 客户端')
+      onCommitted?.(d, vmId, '已导入并同步')
     },
     onError: (e: Error) => toast.error(importErrorMessage(e)),
   })
@@ -377,6 +379,17 @@ function ClaudeCredentialPanel({
             <Hint>需要 sk-ant-api03- 开头的 Console API Key。</Hint>
           ) : null}
         </div>
+      ) : activeMethod === 'cc' ? (
+        <ClaudeLogin
+          vm={vm}
+          disabled={busy}
+          onLogin={async (result) => {
+            await invalidate()
+            const message = 'Claude Code 授权已保存并同步'
+            toast.success(message)
+            onCommitted?.(result, vmId, message)
+          }}
+        />
       ) : activeMethod === 'session' ? (
         <div className='space-y-2'>
           <Label htmlFor='cred-session-key'>sessionKey / access token</Label>
@@ -411,14 +424,6 @@ function ClaudeCredentialPanel({
             {importCred.isPending ? '换票中…' : '导入'}
           </Button>
         </div>
-      ) : activeMethod === 'cc' ? (
-        <ClaudeLogin
-          vm={vm}
-          disabled={busy}
-          onLogin={() => {
-            void invalidate()
-          }}
-        />
       ) : linkReady ? (
         <div className='space-y-2'>
           <div className='flex flex-wrap items-center gap-2'>

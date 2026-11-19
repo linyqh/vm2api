@@ -37,9 +37,11 @@ import {
 } from '../vm/slot-engine.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { kernelCpuCommand, kernelCpuCommandMatches, usesKernelCpuLimit } from '../vm/kernel-cpu.mjs'
+import { kvmCragAppArmorCommand } from '../vm/kvm-crag-apparmor.mjs'
 import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
 import { isKvmRuntime, runtimeKind } from '../vm/runtime-kind.mjs'
 import { slotMemory, slotDockerCpus, memoryMiB, normalizeVmConfig } from '../vm/machine-spec.mjs'
+import { slotCreationLimits } from '../vm/slot-capacity.mjs'
 import { dockerEnvMap, ensureKvmMachineRecord, kvmEnvMapIncomplete, kvmMachineFields } from '../vm/kvm-machine.mjs'
 import { slotExecArgv, slotExecCmd } from '../vm/slot-exec.mjs'
 import {
@@ -48,16 +50,20 @@ import {
   displayName,
   kvmBindChownArgv,
   normalizeTimezone,
+  resolveSlotRouting,
   KVM_CAPS,
   STANDARD_LOCALE,
   writeWorkerFiles,
 } from '../vm/vm-runtime.mjs'
-import { projectCragUniversalVm } from '../vm/crag-license.mjs'
+import { projectCragUniversalVm, readCragClusterSubscription } from '../vm/crag-license.mjs'
+import { withCragRuntimeAdmission } from '../vm/slot-runtime-admission.mjs'
+import { publishKvmCragLicense } from '../vm/kvm-crag-license.mjs'
 import { patchVmRecord } from '../vm/vm-registry.mjs'
 import {
   containerAction,
   createContainerRaw,
   createNetwork,
+  dockerJson,
   execDetached,
   imagePresent,
   inspectContainerOrNull,
@@ -65,6 +71,7 @@ import {
   connectContainerToNetwork,
   disconnectContainerFromNetwork,
   removeContainer,
+  signalContainer,
   removeNetwork,
   renameContainer,
 } from './docker-remote.mjs'
@@ -91,6 +98,11 @@ import {
   removeRemoteSlotDir,
 } from './remote-slot-files.mjs'
 import { slotImageSpec } from './slot-image.mjs'
+import {
+  clusterSubscriptionBinds,
+  hasClusterSubscriptionBinds,
+  publishClusterSubscription,
+} from './crag-subscription-files.mjs'
 
 const CRAG_V2_SECCOMP = JSON.stringify(
   JSON.parse(fs.readFileSync(new URL('../vm/crag-v2-seccomp.json', import.meta.url), 'utf8')),
@@ -420,12 +432,23 @@ export function slotEgressNames(vmId) {
  * user, so it runs as that same uid:gid; with a root login the image default
  * (kincli) could not open the root-owned file and crash-looped on EACCES. The
  * user is part of the digest so a helper created under the old spec is rebuilt.
+ *
+ * Only what needs a new container is hashed: listen addresses, image, user,
+ * binary and mounts. Proxy, DNS and policy fields reload via SIGHUP instead
+ * (see ensureRemoteEgress), so `kin.egress.proxy` records the proxy at creation.
  */
 export function remoteEgressContainer({ vmId, proxyId, dir, imageRef, body, host, binaryDigest = '' }) {
   const user = `${host.uid}:${host.gid}`
+  let listen = ''
+  try {
+    const cfg = JSON.parse(body)
+    listen = `${cfg.listen_tcp || ''}\0${cfg.listen_dns || ''}`
+  } catch {
+    listen = String(body)
+  }
   const digest = crypto
     .createHash('sha256')
-    .update(body)
+    .update(`egress-v2\0${listen}\0${dir}\0`)
     .update(imageRef)
     .update(user)
     .update(binaryDigest)
@@ -442,6 +465,8 @@ export function remoteEgressContainer({ vmId, proxyId, dir, imageRef, body, host
         'kin.egress.vm': vmId,
         'kin.egress.proxy': proxyId,
         'kin.egress.cfg': digest,
+        // Helpers created from this spec run a binary that reloads on SIGHUP.
+        'kin.egress.reload': 'hup',
         'vm2api.cluster': '1',
       },
       HostConfig: {
@@ -454,6 +479,11 @@ export function remoteEgressContainer({ vmId, proxyId, dir, imageRef, body, host
       },
     },
   }
+}
+
+/** A reused helper may take a new config by SIGHUP only if it was created with a reload-capable binary. */
+export function canReloadRemoteEgress(existing) {
+  return existing?.Config?.Labels?.['kin.egress.reload'] === 'hup'
 }
 
 /** Keep the running helper only when it is healthy and matches the spec. A crash loop reports Running too. */
@@ -526,9 +556,22 @@ export async function ensureRemoteEgress(session, vm, { imageRef, binaryDigest =
     binaryDigest,
   })
   const existing = await inspectContainerOrNull(session.docker, names.egress)
-  if (!canReuseRemoteEgress(existing, digest)) {
+  const cfgFile = `${dir}/egress.json`
+  let reuse = canReuseRemoteEgress(existing, digest) && canReloadRemoteEgress(existing)
+  let reloaded = false
+  if (reuse) {
+    const current = await readRemoteFileNoFollow(session.client, cfgFile).catch(() => null)
+    if (current == null) reuse = false
+    else if (current.toString('utf8') !== body) {
+      // Proxy/DNS/policy change: keep the container and its established connections.
+      await writeRemoteFile(await openSftp(session.client), cfgFile, body, { mode: 0o600 })
+      await signalContainer(session.docker, names.egress, 'HUP')
+      reloaded = true
+    }
+  }
+  if (!reuse) {
     await runRemote(session.client, `umask 077 && mkdir -p ${shellQuote(dir)} && chmod 700 ${shellQuote(dir)}`)
-    await writeRemoteFile(await openSftp(session.client), `${dir}/egress.json`, body, { mode: 0o600 })
+    await writeRemoteFile(await openSftp(session.client), cfgFile, body, { mode: 0o600 })
     if (existing) await removeContainer(session.docker, names.egress)
     await createContainerRaw(session.docker, names.egress, spec)
     await containerAction(session.docker, names.egress, 'start')
@@ -547,7 +590,7 @@ export async function ensureRemoteEgress(session, vm, { imageRef, binaryDigest =
   await runRemote(session.client, remoteIptablesScript(plan, { sudo: session.host.uid !== 0 }), {
     code: 'egress_iptables_failed',
   })
-  return { ok: true, mode: 'socks', network: net.name, egress: names.egress }
+  return { ok: true, mode: 'socks', network: net.name, egress: names.egress, reused: reuse, reloaded }
 }
 /** Policy changes stop only the exit helper, preserving slot containers and bindings. */
 export async function setRemoteProxyEgressEnabled(vm, projectRoot, enabled) {
@@ -708,7 +751,7 @@ function kvmSlotContainerBody(vm, { image, network, remoteDir, routing, accel, s
         `${remoteDir}/slot-bin:/opt/kin-guest/opt/kin-live:ro`,
       ],
       NetworkMode: network,
-      RestartPolicy: { Name: 'unless-stopped' },
+      RestartPolicy: { Name: remoteSlotRestartPolicy(vm, routing) },
       StopTimeout: 30,
       Memory: mem,
       MemorySwap: mem,
@@ -726,10 +769,11 @@ function kvmSlotContainerBody(vm, { image, network, remoteDir, routing, accel, s
   return body
 }
 
-export function slotContainerBody(vm, { image, network, remoteDir, user, routing, accel }) {
+export function slotContainerBody(vm, { image, network, remoteDir, user, routing, accel, subscription = false }) {
   if (isKvmRuntime(vm)) return kvmSlotContainerBody(vm, { image, network, remoteDir, routing, accel, slotUser: user })
   const slotName = displayName(vm.id)
-  const mem = parseMemoryBytes(slotMemory(vm, routing))
+  const limits = slotCreationLimits(vm, routing)
+  const mem = parseMemoryBytes(limits.memory)
   const cpus = slotDockerCpus(vm)
   const codex = isCodexVm(vm)
   const crag =
@@ -771,15 +815,16 @@ export function slotContainerBody(vm, { image, network, remoteDir, user, routing
         `${remoteDir}/machine-id:/etc/machine-id:ro`,
         `${remoteDir}/machine-id:/var/lib/dbus/machine-id:ro`,
         `${remoteDir}/slot-bin:${LIVE_BIN}:ro`,
+        ...(subscription ? clusterSubscriptionBinds(remoteDir) : []),
       ],
       NetworkMode: network,
-      RestartPolicy: { Name: 'unless-stopped' },
+      RestartPolicy: { Name: remoteSlotRestartPolicy(vm, routing) },
       Memory: mem,
       // Equal swap allowance lets idle CLI pages leave RAM on small nodes
       // (MemorySwap == Memory would forbid swap entirely).
       MemorySwap: mem * 2,
       ...(cpus > 0 ? { NanoCpus: Math.round(cpus * 1e9) } : {}),
-      PidsLimit: 256,
+      PidsLimit: limits.pids,
       ReadonlyRootfs: true,
       Tmpfs: { '/tmp': 'rw,noexec,nosuid,size=32m' },
       SecurityOpt: crag
@@ -864,6 +909,19 @@ export async function refreshNodeSlotPayload(
   const nodeId = vmNodeId(vm)
   if (!id || !nodeId) return { id, ok: false, code: 'not_cluster_slot', error: '不是集群槽' }
   if (isNativeNodeVm(vm)) return refreshNativeSlotPayload(vm, projectRoot, { routing, recreate })
+  const resolvedRouting = resolveSlotRouting(projectRoot, routing)
+  if (recreate !== false && vm.status === 'running') {
+    const result = await withCragRuntimeAdmission(vm, projectRoot, { routing: resolvedRouting, action: 'reload' }, () =>
+      refreshDockerSlotPayload(vm, projectRoot, { routing: resolvedRouting, recreate, startFn, sessionFor, inspect }),
+    )
+    return { id, node_id: nodeId, ...result }
+  }
+  return refreshDockerSlotPayload(vm, projectRoot, { routing: resolvedRouting, recreate, startFn, sessionFor, inspect })
+}
+
+async function refreshDockerSlotPayload(vm, projectRoot, { routing, recreate, startFn, sessionFor, inspect }) {
+  const id = vm.id
+  const nodeId = vmNodeId(vm)
   const kernel = vm.kernel && OS_CATALOG[vm.kernel] ? vm.kernel : 'ubuntu-24.04'
   const kind = runtimeKind(vm)
   try {
@@ -1023,16 +1081,6 @@ export async function refreshClusterSlotPayloads(
   for (const vm of vms || []) {
     // Codex inference is the host Codex kernel; this update targets Claude CLI payloads.
     if (isCodexVm(vm)) continue
-    if (isKvmRuntime(vm) && (resolveKernelDataplane(vm, routing || {}) === 'crag' || vm?.dataplane === 'crag')) {
-      items.push({
-        id: vm.id,
-        ok: false,
-        code: 'remote_unsupported',
-        error: 'crag 数据面暂不支持 KVM 槽',
-        kernel_changed: false,
-      })
-      continue
-    }
     const nodeId = vmNodeId(vm)
     const kernel = vm.kernel && OS_CATALOG[vm.kernel] ? vm.kernel : 'ubuntu-24.04'
     const kind = runtimeKind(vm)
@@ -1058,9 +1106,6 @@ export async function refreshClusterSlotPayloads(
 }
 
 async function prepare(vm, projectRoot, routing, { pinnedImageId = null } = {}) {
-  if (isKvmRuntime(vm) && resolveKernelDataplane(vm, routing || {}) === 'crag') {
-    return { fail: { ok: false, code: 'remote_unsupported', error: 'crag 数据面暂不支持 KVM 槽' } }
-  }
   vm.kernel = vm.kernel && OS_CATALOG[vm.kernel] ? vm.kernel : 'ubuntu-24.04'
   vm.timezone = normalizeTimezone(vm.timezone)
   vm.locale = vm.locale || STANDARD_LOCALE
@@ -1121,8 +1166,44 @@ async function chownRemoteKvmBinds(session, name, vm) {
   await runRemote(session.client, kvmBindChownArgv(name, vm).map(shellQuote).join(' '), { timeoutMs: 15_000 })
 }
 
+function remoteSlotRestartPolicy(vm, routing) {
+  return resolveKernelDataplane(vm, routing) === 'crag' ? 'no' : 'unless-stopped'
+}
+
+async function updateRemoteSlotRestartPolicy(docker, info, policy) {
+  if (!info || (info.HostConfig?.RestartPolicy?.Name || 'no') === policy) return false
+  await dockerJson(docker, {
+    method: 'POST',
+    path: `/containers/${encodeURIComponent(info.Id)}/update`,
+    body: { RestartPolicy: { Name: policy } },
+    timeoutMs: 15_000,
+  })
+  return true
+}
+
+/** Reconcile an existing node slot without stopping, recreating or starting it. */
+export async function syncRemoteSlotRestartPolicy(vm, routing) {
+  if (!vmNodeId(vm) || isNativeNodeVm(vm) || remoteSlotRestartPolicy(vm, routing) !== 'no')
+    return { ok: true, changed: false }
+  try {
+    const { docker } = await nodeSession(vmNodeId(vm))
+    const info = await inspectContainerOrNull(docker, vm.runtime?.container || containerName(vm.id))
+    return { ok: true, changed: await updateRemoteSlotRestartPolicy(docker, info, 'no') }
+  } catch (err) {
+    return failure(err, 'kernel_restart_policy_failed')
+  }
+}
+
 /** Remote twin of startVmRuntime. Running + same image/network is left alone (Node restart must not bounce slots). */
-export async function startRemoteSlot(vm, projectRoot, { recreate = false, routing, pinnedImageId = null } = {}) {
+export async function startRemoteSlot(vm, projectRoot, opts = {}) {
+  const { recreate = false, pinnedImageId = null } = opts
+  const routing = resolveSlotRouting(projectRoot, opts.routing)
+  return withCragRuntimeAdmission(vm, projectRoot, { routing, action: 'start' }, () =>
+    startRemoteSlotAdmitted(vm, projectRoot, { recreate, routing, pinnedImageId }),
+  )
+}
+
+async function startRemoteSlotAdmitted(vm, projectRoot, { recreate, routing, pinnedImageId = null }) {
   try {
     if (!isKvmRuntime(vm)) slotDockerCpus(vm)
     const p = await prepare(vm, projectRoot, routing, { pinnedImageId })
@@ -1130,6 +1211,8 @@ export async function startRemoteSlot(vm, projectRoot, { recreate = false, routi
     if (resolveKernelDataplane(vm, routing) === 'crag') await projectCragUniversalVm(projectRoot, vm)
     const { nodeId, session, image, egressImage, user, remoteDir, slotDir } = p
     const kvm = isKvmRuntime(vm)
+    const crag = !kvm && resolveKernelDataplane(vm, routing) === 'crag'
+    const subscription = crag && !!readCragClusterSubscription(projectRoot, vm)
     let accel = vm.runtime?.accel
     if (kvm && accel !== 'kvm' && accel !== 'tcg') {
       const probe = await probeRemoteAccel(session, routing)
@@ -1158,10 +1241,12 @@ export async function startRemoteSlot(vm, projectRoot, { recreate = false, routi
       runtimeLabelOf(existing) === runtimeKind(vm) &&
       codexRoleMatches(existing, vm) &&
       clusterDockerCommandReady(vm, existing, routing) &&
+      (!subscription || hasClusterSubscriptionBinds(existing, remoteDir)) &&
       // Running stays true during Docker restart-policy backoff. Recreate the
       // loop just like the local runtime; otherwise watchdog revival is a no-op.
       !existing.State?.Restarting &&
       !recreate
+    if (matches) await updateRemoteSlotRestartPolicy(session.docker, existing, remoteSlotRestartPolicy(vm, routing))
     const common = {
       nodeId,
       name,
@@ -1176,6 +1261,7 @@ export async function startRemoteSlot(vm, projectRoot, { recreate = false, routi
       accel,
     }
     if (matches && existing.State?.Running) {
+      if (subscription) await publishClusterSubscription(projectRoot, vm, session)
       await reconcileSlotCredentials(vm, slotDir, session)
       applyRuntime(vm, { ...common, info: existing })
       return { ok: true, action: 'already-running', runtime: vm.runtime }
@@ -1190,6 +1276,7 @@ export async function startRemoteSlot(vm, projectRoot, { recreate = false, routi
     writeWorkerFiles(vm, projectRoot, { transparent: true, routing })
     ensureGuestMachineIdFile(projectRoot, vm)
     await pushSlotFiles(vm, slotDir, ['run', 'seed'], session)
+    if (subscription) await publishClusterSubscription(projectRoot, vm, session, { force: true })
     if (!existing) await migrateClaudeDir(session, vm, remoteDir)
     if (kvm) {
       await runRemote(
@@ -1204,7 +1291,7 @@ export async function startRemoteSlot(vm, projectRoot, { recreate = false, routi
       await createContainerRaw(
         session.docker,
         name,
-        slotContainerBody(vm, { image, network: eg.network, remoteDir, user, routing, accel }),
+        slotContainerBody(vm, { image, network: eg.network, remoteDir, user, routing, accel, subscription }),
       )
       action = 'created'
     }
@@ -1218,12 +1305,23 @@ export async function startRemoteSlot(vm, projectRoot, { recreate = false, routi
 }
 
 /** Remote twin of reloadSlotWorker: rewrite + push config, bounce the container, never remove it unless the exit moved. */
-export async function reloadRemoteSlot(vm, projectRoot, { routing } = {}) {
+export async function reloadRemoteSlot(vm, projectRoot, opts = {}) {
+  const routing = resolveSlotRouting(projectRoot, opts.routing)
+  return withCragRuntimeAdmission(vm, projectRoot, { routing, action: 'reload' }, () =>
+    reloadRemoteSlotAdmitted(vm, projectRoot, { routing }),
+  )
+}
+
+async function reloadRemoteSlotAdmitted(vm, projectRoot, { routing }) {
   try {
     if (!isKvmRuntime(vm)) slotDockerCpus(vm)
     const p = await prepare(vm, projectRoot, routing)
     if (p.fail) return p.fail
     const { nodeId, session, image, user, remoteDir, slotDir } = p
+    const subscription =
+      !isKvmRuntime(vm) &&
+      resolveKernelDataplane(vm, routing) === 'crag' &&
+      !!readCragClusterSubscription(projectRoot, vm)
     const binaries =
       typeof pushSlotBinaries === 'function' ? await pushSlotBinaries(vm, projectRoot, session) : { digest: '' }
     const eg = await ensureRemoteEgress(session, vm, {
@@ -1240,21 +1338,27 @@ export async function reloadRemoteSlot(vm, projectRoot, { routing } = {}) {
       existing.Config?.Labels?.['kin.vm.layout'] !== SLOT_LAYOUT ||
       runtimeLabelOf(existing) !== runtimeKind(vm) ||
       !codexRoleMatches(existing, vm) ||
-      !clusterDockerCommandReady(vm, existing, routing)
+      !clusterDockerCommandReady(vm, existing, routing) ||
+      (subscription && !hasClusterSubscriptionBinds(existing, remoteDir))
     ) {
-      return startRemoteSlot(vm, projectRoot, { recreate: !!existing, routing })
+      return startRemoteSlotAdmitted(vm, projectRoot, { recreate: !!existing, routing })
     }
+    await updateRemoteSlotRestartPolicy(session.docker, existing, remoteSlotRestartPolicy(vm, routing))
     const relays = await clusterManager().ensureSlotRelays(nodeId, vm.id)
     writeWorkerFiles(vm, projectRoot, { transparent: true, routing })
     await pushSlotFiles(vm, slotDir, ['run', 'seed'], session)
+    if (subscription) await publishClusterSubscription(projectRoot, vm, session, { force: true })
     await reconcileSlotCredentials(vm, slotDir, session)
     const running = !!existing.State?.Running
     if (isKvmRuntime(vm) && running) {
       await chownRemoteKvmBinds(session, name, vm)
+      if (resolveKernelDataplane(vm, routing) === 'crag') {
+        await publishKvmCragLicense(projectRoot, vm, { force: true })
+      }
       const argv = slotExecArgv(
         { ...vm, runtime: { ...(vm.runtime || {}), container: name, type: 'kvm' } },
-        ['systemctl', 'restart', 'kin-kernel.service'],
-        { user: '0' },
+        kvmCragAppArmorCommand({ restart: true }),
+        { user: '0', interactive: true },
       )
       await runRemote(session.client, ['docker', ...argv].map(shellQuote).join(' '), { timeoutMs: 60_000 })
     } else {
@@ -1282,7 +1386,8 @@ export async function reloadRemoteSlot(vm, projectRoot, { routing } = {}) {
 }
 
 /** Update a node slot's Go services without recreating its VM/container. */
-export async function migrateRemoteServiceContainers(vm, projectRoot) {
+export async function migrateRemoteServiceContainers(vm, projectRoot, opts = {}) {
+  const routing = resolveSlotRouting(projectRoot, opts.routing)
   try {
     const session = await nodeSession(vmNodeId(vm))
     const remoteDir = remoteSlotDir(session.host, vm.id)
@@ -1298,11 +1403,18 @@ export async function migrateRemoteServiceContainers(vm, projectRoot) {
         removeDestinations: ['/usr/local/bin/kin-worker'],
         layout: true,
       })
-      migrated.push(
-        await migrateRemoteContainer(session.docker, slotName, body, {
-          wasRunning: !!slot.State?.Running,
-        }),
-      )
+      const migrate = async () => {
+        if (remoteSlotRestartPolicy(vm, routing) === 'no') {
+          await updateRemoteSlotRestartPolicy(session.docker, slot, 'no')
+          body.HostConfig.RestartPolicy = { Name: 'no' }
+        }
+        return migrateRemoteContainer(session.docker, slotName, body, { wasRunning: !!slot.State?.Running })
+      }
+      const result = slot.State?.Running
+        ? await withCragRuntimeAdmission(vm, projectRoot, { routing, action: 'reload' }, migrate)
+        : await migrate()
+      if (!result.ok) return result
+      migrated.push(result)
     }
     const egressName = slotEgressNames(vm.id).egress
     const egress = await inspectContainerOrNull(session.docker, egressName)
@@ -1339,6 +1451,8 @@ export async function stopRemoteSlot(vm) {
       if (vm.runtime) vm.runtime = { ...vm.runtime, pid: null, ip: null, stopped: true }
       return { ok: true, action: 'absent', runtime: vm.runtime || null }
     }
+    // A controller-confirmed stop can make the old CRAG seat eligible for reclaim.
+    await updateRemoteSlotRestartPolicy(session.docker, info, 'no')
     const t = isKvmRuntime(vm) || runtimeLabelOf(info) === 'kvm' ? 30 : undefined
     await containerAction(session.docker, name, 'stop', { t })
     vm.runtime = { ...(vm.runtime || {}), pid: null, stopped: true }
@@ -1361,7 +1475,7 @@ export async function destroyRemoteSlot(vm) {
     await removeRemoteSlotDir(vm, session)
     await clusterManager().dropSlotRelays(vm.id)
     if (vm.runtime) vm.runtime = { ...vm.runtime, pid: null, ip: null, stopped: true, removed: true }
-    return { ok: true, action: info ? 'removed' : 'absent', runtime: vm.runtime || null }
+    return { ok: true, action: info ? 'removed' : 'absent', teardownConfirmed: true, runtime: vm.runtime || null }
   } catch (err) {
     return failure(err)
   }

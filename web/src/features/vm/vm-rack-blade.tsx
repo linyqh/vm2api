@@ -7,12 +7,10 @@ import {
 import type { UsageAccountRow } from '@/types/panel-usage'
 import type { Vm } from '@/types/panel-vm'
 import { Download, LifeBuoy, Link2, Play, RefreshCw } from 'lucide-react'
-import { credEndpointLabel, credEndpointOf } from '@/lib/cred-type'
 import { fmtAgo, fmtNum, fmtUsd } from '@/lib/format'
-import { subscriptionListLabel } from '@/lib/subscription-expiry'
 import { tierVisual } from '@/lib/tier-visual'
 import { cn } from '@/lib/utils'
-import { isAntigravityVm, slotCredentialLabel } from '@/lib/vm-kind'
+import { isAntigravityVm } from '@/lib/vm-kind'
 import {
   claudeTier,
   credentialStatus,
@@ -24,8 +22,6 @@ import {
 import { vmTotalCost, vmTotalTokens } from '@/lib/vm-usage'
 import { StatusMark } from '@/components/status-mark'
 import { ProxyChip } from '@/features/proxies/proxy-chip'
-import { ActiveVmBadge } from '@/features/vm/active-vm-badge'
-import { runtimeTypeLabel, runtimeTypeOf } from '@/features/vm/machine-spec'
 import {
   SchedulableSwitch,
   vmSchedulableProps,
@@ -35,6 +31,7 @@ import {
   VmQuotaActions,
   VmUsageWindows,
 } from '@/features/vm/usage-windows'
+import { VmAccountIdentity } from '@/features/vm/vm-account-identity'
 import { VmActionMenu } from '@/features/vm/vm-action-menu'
 import { useVmActions } from '@/features/vm/vm-actions-context'
 import { useVmPerms } from '@/features/vm/vm-perms'
@@ -121,9 +118,36 @@ export function BladeControls({
       onClick={(e) => e.stopPropagation()}
       onKeyDown={(e) => e.stopPropagation()}
     >
-      <SchedulableSwitch {...vmSchedulableProps(vm)} />
+      {vm.gemini ? null : <SchedulableSwitch {...vmSchedulableProps(vm)} />}
       <VmActionMenu vm={vm} />
     </div>
+  )
+}
+
+export function GeminiSlotStatus({ vm }: { vm: Vm }) {
+  const environment = vm.gemini
+  if (!environment) return null
+  const labels = {
+    authorized: '已授权',
+    authorizing: '等待 Google 授权',
+    unverified: '未授权',
+    reauth_required: '需要重新授权',
+    disabled: '已停用',
+  }
+  const detail =
+    environment.auth_state === 'authorized' ? vm.unschedulable_text : null
+  const tone =
+    environment.auth_state === 'authorized'
+      ? { key: 'ok', cls: 'ok' as const, text: labels.authorized }
+      : poolStatus(vm)
+  return (
+    <span className='flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground'>
+      <StatusMark
+        variant='pill'
+        tone={{ ...tone, label: labels[environment.auth_state] }}
+      />
+      {detail ? <span>{detail}</span> : null}
+    </span>
   )
 }
 
@@ -190,32 +214,6 @@ export function VmSeats({
   )
 }
 
-/** 一行规格：调用形式 · 形态 · 节点 · 出口。替代原先五枚边框 chip。 */
-function SpecLine({ vm }: { vm: Vm }) {
-  const lane = credEndpointOf(vm)
-  const parts = [
-    lane === 'none' ? null : credEndpointLabel(lane),
-    runtimeTypeLabel(runtimeTypeOf(vm)),
-    vm.node_name || vm.node_id || 'local',
-  ].filter(Boolean)
-  return (
-    <div className='flex min-w-0 items-center gap-1.5 overflow-hidden text-[11.5px] whitespace-nowrap text-muted-foreground'>
-      {parts.map((p, i) => (
-        <span key={i} className='flex shrink-0 items-center gap-1.5'>
-          {p}
-          <span
-            aria-hidden='true'
-            className='text-[color:var(--text-tertiary)]'
-          >
-            ·
-          </span>
-        </span>
-      ))}
-      <ProxyChip vm={vm} className='min-w-0 shrink' />
-    </div>
-  )
-}
-
 function Callout({
   tone,
   title,
@@ -276,10 +274,11 @@ function CalloutAction({
 
 function lifeLine(vm: Vm, accounts?: UsageAccountRow[]) {
   const cost = vmTotalCost(vm, accounts)
-  if (!cost) return null
+  const tokens = vmTotalTokens(vm, accounts)
+  if (!cost && !tokens) return null
   return (
     <span className='font-mono text-[11.5px] text-muted-foreground tabular-nums'>
-      总计 {fmtUsd(cost, 2)} · {fmtNum(vmTotalTokens(vm, accounts))} tok
+      总计 {fmtUsd(cost, 2)} · {fmtNum(tokens)} tok
     </span>
   )
 }
@@ -458,8 +457,6 @@ export const VmBlade = memo(function VmBlade({
   const open = useOpenOnKey(vm)
   const state = bladeState(vm)
   const large = size === 'l'
-  const email = String(vm.email || '')
-  const sub = subscriptionListLabel(vm, now)
   const restricted = zoneOf(vm) === 'restricted'
   return (
     <article
@@ -479,45 +476,9 @@ export const VmBlade = memo(function VmBlade({
       {...open}
     >
       <div className='grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-0.5'>
-        <span className='flex min-w-0 items-baseline gap-2'>
-          <span className='font-mono text-[11.5px] text-muted-foreground'>
-            {vm.id}
-          </span>
-          {vm.name && vm.name !== vm.id ? (
-            <span className='truncate text-[11.5px] text-[color:var(--text-tertiary)]'>
-              {vm.name}
-            </span>
-          ) : null}
-        </span>
-        <div className='flex items-center gap-1'>
-          <ActiveVmBadge vm={vm} />
-          <TierBadge vm={vm} />
+        <div className='col-span-2 min-w-0'>
+          <VmAccountIdentity vm={vm} />
         </div>
-        <span
-          title={email || undefined}
-          className={cn(
-            'col-span-2 truncate font-semibold tracking-[-0.012em]',
-            large ? 'text-sm' : 'text-[13px]',
-            email
-              ? state === 'dead'
-                ? 'text-muted-foreground'
-                : ''
-              : 'font-medium text-muted-foreground'
-          )}
-        >
-          {slotCredentialLabel(vm)}
-        </span>
-        <span
-          className={cn(
-            'col-span-2 truncate font-mono text-[11px] tabular-nums',
-            sub.tone === 'bad' && 'text-[color:var(--status-bad)]',
-            sub.tone === 'warn' && 'text-[color:var(--status-warn)]',
-            sub.tone === 'muted' && 'text-muted-foreground'
-          )}
-          title={sub.title}
-        >
-          {sub.text}
-        </span>
         {restricted && state !== 'dead' ? (
           <StatusMark
             variant='pill'
@@ -529,8 +490,10 @@ export const VmBlade = memo(function VmBlade({
           />
         ) : null}
       </div>
-      <SpecLine vm={vm} />
-      {state === 'live' ? (
+      <ProxyChip vm={vm} className='min-w-0 justify-self-start' />
+      {vm.gemini ? (
+        <GeminiSlotStatus vm={vm} />
+      ) : state === 'live' ? (
         <BladeUsage vm={vm} accounts={accounts} now={now} />
       ) : state === 'unprobed' ? (
         <div className='grid min-w-0 content-start gap-1.5'>

@@ -402,6 +402,37 @@ test('log coverage follows recorded prunes, not the oldest row or the current re
   }
 })
 
+test('lifetime usage follows the account across slots and survives repeated pruning', () => {
+  const { db, repo } = freshDb()
+  try {
+    const old = new Date(Date.now() - 30 * 86400_000).toISOString()
+    seed(repo, [
+      { created_at: old, vm_id: 'vm-01', final_account_id: 'claude-a', input_tokens: 10, total_cost: 1 },
+      { vm_id: 'vm-02', account_id: 'claude-a', cache_read_tokens: 20, total_cost: 2 },
+      { vm_id: 'vm-02', account_id: 'claude-b', output_tokens: 15, total_cost: 4 },
+      { created_at: old, vm_id: 'vm-01', usage_account_id: 'openai:a', cache_creation_tokens: 7, total_cost: 1 },
+      { vm_id: 'vm-03', usage_account_id: 'openai:a', output_tokens: 3, total_cost: 2 },
+      { created_at: old, vm_id: 'vm-03', account_id: 'vm-03', input_tokens: 20, total_cost: 4 },
+    ])
+    const lifetime = () =>
+      repo
+        .billingStats({ now: Date.now() })
+        .lifetime_accounts.sort((left, right) => left.account_id.localeCompare(right.account_id))
+    const expected = [
+      { account_id: 'claude-a', total_cost: 0.000036, total_tokens: 30 },
+      { account_id: 'claude-b', total_cost: 0.000225, total_tokens: 15 },
+      { account_id: 'openai:a', total_cost: 0.00007125, total_tokens: 10 },
+    ]
+    assert.deepEqual(lifetime(), expected)
+    assert.equal(repo.cleanup({ retainDays: 7 }).usage_logs, 3)
+    assert.deepEqual(lifetime(), expected)
+    assert.equal(repo.cleanup({ retainDays: 7 }).usage_logs, 0)
+    assert.deepEqual(lifetime(), expected)
+  } finally {
+    db.close()
+  }
+})
+
 test('window_fable only counts fable rows since reset_7d_oi', () => {
   const { db, repo } = freshDb()
   try {
@@ -479,5 +510,63 @@ test('unpricedModels lists unpriced rows', () => {
     assert.equal(rows[0].requests, 2)
   } finally {
     db.close()
+  }
+})
+
+test('healthBuckets counts SLA success / errors per 30-minute slot and skips idle slots', () => {
+  const { dir, db, repo } = freshDb()
+  try {
+    const now = Date.parse('2026-11-15T12:00:00.000Z')
+    const at = (minAgo) => new Date(now - minAgo * 60_000).toISOString()
+    seed(repo, [
+      { vm_id: 'vm-a', account_id: 'acc-a', created_at: at(5), status: 200 },
+      { vm_id: 'vm-a', account_id: 'acc-a', created_at: at(10), status: 500, error_code: 'api_error' },
+      { vm_id: 'vm-a', account_id: 'acc-a', created_at: at(31), status: 200 },
+      { vm_id: 'vm-a', account_id: 'acc-a', created_at: at(61), status: 200 },
+      { vm_id: 'vm-a', account_id: 'acc-a', created_at: at(24 * 60 - 1), status: 200 },
+      { vm_id: 'vm-a', account_id: 'acc-a', created_at: at(24 * 60 + 1), status: 200 },
+      { vm_id: 'vm-b', account_id: 'acc-b', created_at: at(40), status: 502 },
+    ])
+    const all = repo.healthBuckets({ now })
+    const a = all.get('acc-a\0vm-a')
+    assert.equal(a.length, 48)
+    assert.deepEqual(a[47], [1, 1], 'last slot holds the two newest rows')
+    assert.deepEqual(a[46], [1, 0], '31 minutes ago falls in the previous slot')
+    assert.deepEqual(a[45], [1, 0], '61 minutes ago falls two slots back')
+    assert.deepEqual(a[0], [1, 0], 'oldest in-range row lands in slot 0')
+    assert.equal(
+      a.reduce((n, [ok, err]) => n + ok + err, 0),
+      5,
+      'rows older than 24h are excluded',
+    )
+    assert.deepEqual(all.get('acc-b\0vm-b')[46], [0, 1], 'all-failure slot')
+    assert.equal(all.has('acc-c\0vm-c'), false, 'idle slot has no entry')
+
+    const byVm = repo.healthBuckets({ now, vmId: 'vm-b', slots: 84, slotMin: 120 })
+    assert.equal(byVm.get('vm-b').length, 84)
+    assert.deepEqual(byVm.get('vm-b')[83], [0, 1])
+
+    const top = repo.topErrors({ vmId: 'vm-a', since: at(60) })
+    assert.deepEqual(
+      top.map((r) => [r.code, r.count]),
+      [['api_error', 1]],
+    )
+  } finally {
+    db.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('billingStats attaches health_24h per account row', () => {
+  const { dir, db, repo } = freshDb()
+  try {
+    const now = Date.now()
+    seed(repo, [{ vm_id: 'vm-a', account_id: 'acc-a', created_at: new Date(now - 60_000).toISOString(), status: 200 }])
+    const row = repo.billingStats({ now }).accounts.find((r) => r.account_id === 'acc-a')
+    assert.equal(row.health_24h.length, 48)
+    assert.deepEqual(row.health_24h[47], [1, 0])
+  } finally {
+    db.close()
+    fs.rmSync(dir, { recursive: true, force: true })
   }
 })

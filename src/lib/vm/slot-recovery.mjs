@@ -12,7 +12,12 @@ import { isDeepStrictEqual } from 'node:util'
 import { clusterManager, vmNodeId } from '../cluster/placement.mjs'
 import { containerLogs, inspectContainerOrNull } from '../cluster/docker-remote.mjs'
 import { slotEgressNames } from '../cluster/remote-slot.mjs'
-import { kernelFaults, rustKernelHealth, toPublicKernelHealth } from '../transport/rust-kernel-client.mjs'
+import {
+  kernelFaults,
+  rustKernelBusy,
+  rustKernelHealth,
+  toPublicKernelHealth,
+} from '../transport/rust-kernel-client.mjs'
 import { codexKernelHealth } from '../transport/codex-kernel-client.mjs'
 import { codexKernelTracked } from '../transport/codex-kernel-supervisor.mjs'
 import { antigravityBridgeStatus } from '../transport/antigravity-bridge-supervisor.mjs'
@@ -31,9 +36,12 @@ import { resolveInferenceEngine } from './slot-engine.mjs'
 import { slotExecContainer } from './slot-exec.mjs'
 import { slotHost } from './slot-host.mjs'
 import { slotExec, startSlotReady, stopSlot } from './slot-runtime.mjs'
+import { withCragRuntimeAdmission } from './slot-runtime-admission.mjs'
 import { isAntigravityVm, isCodexVm } from './vm-kind.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
 import { slotDockerCpus } from './machine-spec.mjs'
+import { withSlotMaintenance } from './slot-maintenance.mjs'
+import { checkCragLicense } from './crag-license.mjs'
 import { bindVmProxy, getVm, patchVmRecord, vmHasSchedulableCredential } from './vm-registry.mjs'
 import {
   applyClearUnschedulable,
@@ -176,7 +184,9 @@ function linkCheck(status, internal) {
   if (!link) return check('node_link', '节点 SSH 链路', 'error', 'node_not_found', '槽位所在节点不存在')
   if (link.state === 'ready') return check('node_link', '节点 SSH 链路', 'ok', null, '已连接')
   const why = internal && link.error?.message ? `：${redactSecrets(link.error.message)}` : ''
-  return check('node_link', '节点 SSH 链路', 'error', 'node_link_down', `节点未连接（${link.state}）${why}`, {
+  const direct = status.data_path === 'direct'
+  const message = direct ? 'SSH 未连接；直连通道可达' : `节点未连接（${link.state}）`
+  return check('node_link', '节点 SSH 链路', direct ? 'warn' : 'error', 'node_link_down', `${message}${why}`, {
     state: link.state,
     error_code: link.error?.code || null,
   })
@@ -196,7 +206,7 @@ function relayCheck(status, internal) {
   return check('relay', '集群桥服务', 'error', 'relay_down', `未在监听：${dead.join('、')}`, detail)
 }
 
-async function egressCheck(vm, projectRoot, probes) {
+async function egressCheck(vm, projectRoot, probes, { sshUnavailable = false } = {}) {
   const label = '出口代理 / 出口桥'
   const proxy = vm.proxy
   if (!hasBoundExit(proxy)) return check('egress', label, 'error', 'proxy_required', '未绑定出口代理')
@@ -204,6 +214,7 @@ async function egressCheck(vm, projectRoot, probes) {
   if (blocked) return check('egress', label, 'error', 'proxy_blocked', `出口被策略禁用：${blocked}`)
   const local = isLocalEgressProxy(proxy)
   if (vmNodeId(vm)) {
+    if (sshUnavailable) return check('egress', label, 'warn', 'egress_unverified', 'SSH 未连接，无法检查节点出口')
     if (local) return check('egress', label, 'ok', null, '节点本地出口')
     const eg = await probes.remoteEgress(vm)
     if (eg.running) return check('egress', label, 'ok', null, `节点出口容器运行中（${proxy.id}）`)
@@ -292,7 +303,8 @@ async function kernelCheck(vm, projectRoot, engine, hasCredential, probes, inter
     })
   }
   if (engine !== 'rust') return check('kernel', label, 'skip', null, `推理引擎 ${engine}，不检查内核`)
-  const pub = toPublicKernelHealth(await probes.rustHealth(exec), 'rust')
+  const health = await probes.rustHealth(exec)
+  const pub = toPublicKernelHealth(health, 'rust')
   const detail = {
     ready_slots: pub.ready_slots,
     closed_slots: pub.closed_slots,
@@ -317,8 +329,11 @@ async function kernelCheck(vm, projectRoot, engine, hasCredential, probes, inter
       detail,
     )
   }
+  if (health?.license_valid === false)
+    return check('kernel', label, 'error', 'license_invalid', 'CRAG 内核授权不可用', detail)
   if (pub.recovering)
     return check('kernel', label, 'warn', 'kernel_recovering', '内核正在重启 CLI，稍后自动恢复', detail)
+  if (health?.ready === false) return check('kernel', label, 'error', 'kernel_not_ready', '内核在线但尚未就绪', detail)
   if (pub.ready_slots === 0) {
     if (pub.closed_slots > 0)
       return check(
@@ -329,7 +344,7 @@ async function kernelCheck(vm, projectRoot, engine, hasCredential, probes, inter
         `所有会话槽均已闭合（${pub.closed_slots} 个槽闭合），无可用会话槽`,
         detail,
       )
-    if (pub.cli_pid > 0) return check('kernel', label, 'warn', 'kernel_busy', '所有会话槽都在忙', detail)
+    if (rustKernelBusy(health)) return check('kernel', label, 'warn', 'kernel_busy', '所有会话槽都在忙', detail)
     return check('kernel', label, 'error', 'kernel_no_cli', '内核在线但 CLI 未运行，没有可用会话槽', detail)
   }
   if (pub.closed_slots > 0) {
@@ -389,13 +404,17 @@ export async function diagnoseSlotServices(
   const nodeId = vmNodeId(vm)
   const hasCredential = vmHasSchedulableCredential(vm, projectRoot)
   const checks = [recordCheck(vm), credentialCheck(vm, projectRoot)]
+  let sshUnavailable = false
   if (nodeId) {
     const status = p.cluster()?.slotBridgeStatus(nodeId, vm.id) || null
+    sshUnavailable = status?.data_path === 'direct'
     checks.push(linkCheck(status, internal), relayCheck(status, internal))
   }
   checks.push(
-    await guarded('egress', '出口代理 / 出口桥', internal, () => egressCheck(vm, projectRoot, p)),
-    await guarded('container', '槽位容器', internal, () => containerCheck(vm, p, internal)),
+    await guarded('egress', '出口代理 / 出口桥', internal, () => egressCheck(vm, projectRoot, p, { sshUnavailable })),
+    sshUnavailable
+      ? check('container', '槽位容器', 'warn', 'container_unverified', 'SSH 未连接，无法检查容器状态')
+      : await guarded('container', '槽位容器', internal, () => containerCheck(vm, p, internal)),
     await guarded('kernel', '推理内核', internal, () =>
       kernelCheck(vm, projectRoot, engine, hasCredential, p, internal, routing),
     ),
@@ -447,12 +466,12 @@ export async function powerOnSlot({
   vm = getVm(projectRoot, id) || vm
   const runtimeBeforeBoot = structuredClone(vm.runtime || {})
   const boot = await (ops.startSlotReady || startSlotReady)(vm, projectRoot, { ...runtimeOptions, routing })
-  if (!boot.ok) {
+  if (!boot.ok || boot.rust_ok === false || boot.rust?.ok === false || boot.kernel?.ok === false) {
     return {
       ok: false,
       status: boot.status || 500,
-      code: boot.code || 'runtime_start_failed',
-      error: boot.error || 'runtime start failed',
+      code: boot.code || boot.rust?.code || boot.rust?.reason || 'runtime_start_failed',
+      error: boot.error || boot.rust?.error || boot.rust?.reason || 'runtime start failed',
       boot,
     }
   }
@@ -526,6 +545,7 @@ export async function recoverSlot({
   routing = {},
   fillTimezone = null,
   watchdog = null,
+  poolScheduler = null,
   internal = false,
   ops = {},
   now = () => Date.now(),
@@ -534,95 +554,111 @@ export async function recoverSlot({
   if (!vm) return { ok: false, status: 404, code: 'vm_not_found', error: 'vm not found' }
   if (recovering.has(id))
     return { ok: false, status: 409, code: 'recover_in_progress', error: '该槽位正在恢复中，请稍候' }
-  // Validate before holding the watchdog, repairing relays or stopping a live slot.
   try {
     if (!isKvmRuntime(vm)) slotDockerCpus(vm)
   } catch (error) {
     return { ok: false, status: 400, code: error.code, error: error.message }
   }
-  const manager = (ops.cluster || cluster)()
-  const stop = ops.stopSlot || stopSlot
-  const powerOn = ops.powerOn || ((args) => powerOnSlot(args))
-  const diagnose =
-    ops.diagnose || ((current) => diagnoseSlotServices(current, { projectRoot, routing, watchdog, internal }))
-  // Held through the settle wait and final check too, so the watchdog cannot bounce the slot under it.
+  const licensed = checkCragLicense(projectRoot, vm, routing)
+  if (!licensed.ok) return { ...licensed, status: 403 }
   recovering.add(id)
-  const drained = watchdog?.hold?.(id)
-  const started = now()
-  const steps = []
-  const step = async (stepId, fn) => {
-    const t0 = now()
-    let r
-    try {
-      r = await fn()
-    } catch (error) {
-      r = { ok: false, code: error?.code, message: String(error?.message || error) }
-    }
-    const code = r.ok ? null : r.code || `${stepId}_failed`
-    // Failed steps carry raw stderr / SSH text: admins get it masked, tenants only the code.
-    let message = r.message || ''
-    if (!r.ok)
-      message = internal ? redactSecrets(message) : `${STEP_LABELS[stepId]}失败（${code}），详情请联系管理员查看`
-    steps.push({ id: stepId, label: STEP_LABELS[stepId], ok: r.ok === true, code, message, ms: now() - t0 })
-    return r.ok === true
-  }
   try {
-    // A watchdog restart already past its hold check finishes before this cycle touches the slot.
-    await drained
-    const nodeId = vmNodeId(vm)
-    let proceed = true
-    if (nodeId) {
-      proceed = await step('node_link', async () => {
-        if (!manager) return { ok: false, code: 'cluster_unavailable', message: '集群未初始化' }
-        await manager.ensureLinkReady(nodeId)
-        return { ok: true, message: '节点 SSH 已连接' }
-      })
-      if (proceed) {
-        proceed = await step('relay', async () => {
-          const healed = await manager.healSlotBridges(nodeId, id, { force: true })
-          return {
-            ok: true,
-            message: `已重建：${healed.map((h) => (h === 'bridge' ? 'docker 桥' : '槽位中继')).join('、')}`,
+    return await withSlotMaintenance({
+      projectRoot,
+      id,
+      watchdog,
+      poolScheduler,
+      operation: () =>
+        withCragRuntimeAdmission(vm, projectRoot, { routing, action: 'recovery' }, async () => {
+          const manager = (ops.cluster || cluster)()
+          const stop = ops.stopSlot || stopSlot
+          const powerOn = ops.powerOn || ((args) => powerOnSlot(args))
+          const diagnose =
+            ops.diagnose || ((current) => diagnoseSlotServices(current, { projectRoot, routing, watchdog, internal }))
+          const started = now()
+          const steps = []
+          const step = async (stepId, fn) => {
+            const t0 = now()
+            let r
+            try {
+              r = await fn()
+            } catch (error) {
+              r = { ok: false, code: error?.code, message: String(error?.message || error) }
+            }
+            const code = r.ok ? null : r.code || `${stepId}_failed`
+            let message = r.message || ''
+            if (!r.ok)
+              message = internal
+                ? redactSecrets(message)
+                : `${STEP_LABELS[stepId]}失败（${code}），详情请联系管理员查看`
+            steps.push({ id: stepId, label: STEP_LABELS[stepId], ok: r.ok === true, code, message, ms: now() - t0 })
+            return r.ok === true
           }
-        })
-      }
-    }
-    if (proceed) {
-      proceed = await step('stop', async () => {
-        const halted = await stop(vm)
-        if (!halted?.ok) return { ok: false, code: 'stop_failed', message: halted?.error || '关机失败' }
-        return { ok: true, message: STOP_MESSAGES[halted.action] || '已关机' }
-      })
-    }
-    if (proceed) {
-      await step('start', async () =>
-        startStepResult(await powerOn({ projectRoot, id, proxyPool, routing, fillTimezone, by: 'recover_ok' })),
-      )
-    }
-    // Only an attempted boot earns a fresh budget; a cycle that never reached start fixed nothing.
-    if (watchdog?.reset && proceed) {
-      await step('watchdog_reset', async () => {
-        const { faulted } = watchdog.reset(id)
-        return { ok: true, message: faulted ? '已清除内核故障标记与重启计数' : '重启计数已清零' }
-      })
-    }
-    // A crash-looping entrypoint is "running" for its first moments: let it fail before judging it.
-    const booted = steps.some((s) => s.id === 'start' && s.ok)
-    const settleMs = ops.settleMs ?? BOOT_SETTLE_MS
-    if (booted && settleMs > 0) await new Promise((resolve) => setTimeout(resolve, settleMs))
-    const diagnosis = await diagnose(getVm(projectRoot, id) || vm)
-    return {
-      ok: true,
-      report: {
-        vm_id: id,
-        ok: steps.every((s) => s.ok) && diagnosis.ok,
-        duration_ms: now() - started,
-        steps,
-        diagnosis,
-      },
-    }
+          const nodeId = vmNodeId(vm)
+          let proceed = true
+          if (nodeId) {
+            proceed = await step('node_link', async () => {
+              if (!manager) return { ok: false, code: 'cluster_unavailable', message: '集群未初始化' }
+              await manager.ensureLinkReady(nodeId)
+              return { ok: true, message: '节点 SSH 已连接' }
+            })
+            if (proceed) {
+              proceed = await step('relay', async () => {
+                const healed = await manager.healSlotBridges(nodeId, id, { force: true })
+                return {
+                  ok: true,
+                  message: `已重建：${healed.map((h) => (h === 'bridge' ? 'docker 桥' : '槽位中继')).join('、')}`,
+                }
+              })
+            }
+          }
+          if (proceed) {
+            proceed = await step('stop', async () => {
+              const halted = await stop(vm)
+              if (!halted?.ok) return { ok: false, code: 'stop_failed', message: halted?.error || '关机失败' }
+              return { ok: true, message: STOP_MESSAGES[halted.action] || '已关机' }
+            })
+          }
+          if (proceed) {
+            proceed = await step('start', async () =>
+              startStepResult(await powerOn({ projectRoot, id, proxyPool, routing, fillTimezone })),
+            )
+          }
+          if (steps.some((s) => s.id === 'start' && !s.ok)) {
+            patchVmRecord(projectRoot, id, (record) => {
+              if (!record.unschedulable) applyUnschedulable(record, 'runtime_start_failed')
+            })
+          }
+          const settleMs = ops.settleMs ?? BOOT_SETTLE_MS
+          if (proceed && settleMs > 0) await new Promise((resolve) => setTimeout(resolve, settleMs))
+          const current = getVm(projectRoot, id) || vm
+          let diagnosis = await diagnose(current)
+          const errors = (diagnosis.checks ?? []).filter((c) => c.status === 'error')
+          const onlyOldFault = errors.length === 1 && errors[0].id === 'watchdog' && errors[0].code === 'kernel_faulted'
+          // Verify the repaired services first. Only the old L5 marker may remain before reset.
+          if (watchdog?.reset && proceed && (diagnosis.ok || onlyOldFault)) {
+            const reset = await step('watchdog_reset', async () => {
+              const { faulted } = watchdog.reset(id)
+              return { ok: true, message: faulted ? '已清除内核故障标记与重启计数' : '重启计数已清零' }
+            })
+            if (reset) {
+              const checks = (diagnosis.checks ?? []).map((c) =>
+                c.id === 'watchdog' ? watchdogCheck(current, slotEngine(current, routing), watchdog, internal) : c,
+              )
+              const failed = checks.find((c) => c.status === 'error')
+              diagnosis = { ...diagnosis, checks, ok: !failed, first_failure: failed?.id || null }
+            }
+          }
+          const ok = steps.every((s) => s.ok) && diagnosis.ok
+          if (ok) {
+            patchVmRecord(projectRoot, id, (record) => {
+              applyClearUnschedulable(record, { by: 'recover_ok' })
+            })
+          }
+          return { ok: true, report: { vm_id: id, ok, duration_ms: now() - started, steps, diagnosis } }
+        }),
+    })
   } finally {
-    watchdog?.release?.(id)
     recovering.delete(id)
   }
 }

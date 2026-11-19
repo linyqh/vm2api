@@ -19,17 +19,18 @@ import { isSlotProxyDesynced } from '../vm/vm-runtime.mjs'
 import { reloadSlotReady, startSlotReady } from '../vm/slot-runtime.mjs'
 import { resolveImportProxy } from '../vm/proxy-resolve.mjs'
 import { collectSlotIdentity } from '../vm/guest-identity.mjs'
-import { importWorkerCredential } from '../transport/go-worker-client.mjs'
+import { importWorkerCredential, syncClaudeClientCredentials } from '../transport/go-worker-client.mjs'
 import { rustKernelHealth, rustKernelReachable, rustKernelBusy } from '../transport/rust-kernel-client.mjs'
-import { credentialModeFromOauth, canOfficialCc } from './credential-mode.mjs'
+import {
+  credentialModeFromOauth,
+  canOfficialCc,
+  isOfficialSetupTokenMode,
+  isSetupTokenMode,
+} from './credential-mode.mjs'
 import { resolveAuthScheme } from './auth-scheme.mjs'
 import { flattenOauthIdentity, normalizeSubscriptionType } from './oauth-identity.mjs'
 import { persistOauthToVm } from './oauth-credentials.mjs'
-import {
-  officialCcUidGid,
-  scheduleOfficialCcBootstrap,
-  materializeOfficialClaudeCredentials,
-} from './official-cc-bootstrap.mjs'
+import { scheduleOfficialCcBootstrap } from './official-cc-bootstrap.mjs'
 import { normalizeTiers } from '../pool/quota-tiers.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
 import { finishOAuthImport } from './guest-oauth-helper.mjs'
@@ -150,7 +151,16 @@ export function createImportCommit(ctx) {
     }
   }
 
-  async function commitImportedOauthGrant({ vmId, vmPath, existing, oauth, source, name, skipOfficialCc = false }) {
+  async function commitImportedOauthGrant({
+    vmId,
+    vmPath,
+    existing,
+    oauth,
+    source,
+    name,
+    skipOfficialCc = false,
+    fromNativeLogin = false,
+  }) {
     const importedCredential = importedCredentialFromOauth(oauth, existing)
     const workerExec = {
       vmId,
@@ -164,7 +174,9 @@ export function createImportCommit(ctx) {
       bindVmProxy(ctx.cfg.paths.project, vmId, bound)
       adoptVmProxyBinding(existing, getVm(ctx.cfg.paths.project, vmId))
     }
-    if (process.env.KIN_CRS_MOCK !== '1') {
+    // The native login terminal has already authenticated in the live guest. Saving its grant
+    // must not depend on (or restart) an inference worker that may still be waiting for credentials.
+    if (!fromNativeLogin && process.env.KIN_CRS_MOCK !== '1') {
       const desynced = isSlotProxyDesynced(existing, ctx.cfg.paths.project)
       const legacy = slotHost(existing).native || isCodexVm(existing)
       const health = legacy ? null : await rustKernelHealth(workerExec)
@@ -214,13 +226,18 @@ export function createImportCommit(ctx) {
       }
     }
     await withVmLock(vmPath, () => {
+      const mode = importedCredential.mode || credentialModeFromOauth(oauth)
+      const setupRegistration =
+        isOfficialSetupTokenMode(mode) ||
+        (isSetupTokenMode(mode) && (oauth.oauth_registration === 'console' || oauth.flavor === 'setup_token'))
       persistOauthToVm(
         vmPath,
         {
           ...importedCredential,
           source: source || oauth.source || 'sessionKey-cookie-auth',
-          mode: importedCredential.mode || credentialModeFromOauth(oauth),
+          mode,
           type: importedCredential.type || importedCredential.mode,
+          oauth_registration: setupRegistration ? 'console' : 'oauth',
         },
         { acceptLiveGrant: true, operatorImport: true },
       )
@@ -241,10 +258,8 @@ export function createImportCommit(ctx) {
         Object.assign(existing, refreshed)
       }
     })
-    try {
-      const ids = officialCcUidGid(vmId)
-      materializeOfficialClaudeCredentials(workerExec.homeDir, ids)
-    } catch {}
+    const clientSync = await syncClaudeClientCredentials(workerExec)
+    if (!clientSync.ok) return clientSync
     const mode = importedCredential.mode || credentialModeFromOauth(oauth)
     const ccUnsupported = !slotHost(existing).supports('official_cc')
     const skipCc = skipOfficialCc || ccUnsupported || isCodexVm(existing) || !canOfficialCc(mode)
@@ -274,7 +289,7 @@ export function createImportCommit(ctx) {
             email: importedCredential.email,
           },
         })
-    return { ok: true, existing, official_cc_bootstrap: officialCc }
+    return { ok: true, existing, client_sync: clientSync, official_cc_bootstrap: officialCc }
   }
   async function commitImportedOauth(options) {
     let result

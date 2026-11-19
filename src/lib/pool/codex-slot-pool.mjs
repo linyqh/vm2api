@@ -11,6 +11,7 @@ import {
   hasSpendableCodexCredits,
 } from '../protocol/codex-usage.mjs'
 import { isLeftoverQuotaScheduleOff, isQuotaWindowReason } from './availability.mjs'
+import { resolveCredentialScheduleLevel } from './credential-weight.mjs'
 import { orderOpenAIAccounts } from './openai-account-selector.mjs'
 import { expiresAtToMs } from '../oauth/oauth-credentials.mjs'
 import {
@@ -92,7 +93,7 @@ function parkUntil(vm, now) {
 
 /**
  * Ordered candidate ids. Pinned master hops stay on that slot.
- * Ready slots first (lowest 5h/7d stress), parked slots last so a
+ * Ready slots first (level, then lowest 5h/7d stress), parked slots last so a
  * total-exhaust pool still has somewhere to fail instead of 503.
  */
 export function pickCodexSlots(vms, { pin = null, now = Date.now(), quotaPolicy = null, model = null } = {}) {
@@ -122,7 +123,7 @@ export function pickCodexSlots(vms, { pin = null, now = Date.now(), quotaPolicy 
     else ready.push(vm)
   }
   ready.sort((a, b) => {
-    const d = stressOf(a) - stressOf(b)
+    const d = codexScheduleLevel(b, now).level - codexScheduleLevel(a, now).level || stressOf(a) - stressOf(b)
     return d !== 0 ? d : String(a.id).localeCompare(String(b.id))
   })
   parked.sort((a, b) => {
@@ -143,22 +144,40 @@ export function pickCodexSlots(vms, { pin = null, now = Date.now(), quotaPolicy 
   }
 }
 
-function quotaRemainingRank(vm) {
-  const u5 = Number(vm?.utilization_5h)
-  const u7 = Number(vm?.utilization_7d)
-  let used = null
-  if (Number.isFinite(u5) || Number.isFinite(u7)) {
-    used = Math.max(Number.isFinite(u5) ? u5 : 0, Number.isFinite(u7) ? u7 : 0)
-  } else {
-    const limits = normalizeCodexLimits(extraToCodexSnapshot(extraFromSummary(vm)))
-    const p5 = Number(limits.used_5h_percent)
-    const p7 = Number(limits.used_7d_percent)
-    if (Number.isFinite(p5) || Number.isFinite(p7)) {
-      used = Math.max(Number.isFinite(p5) ? p5 / 100 : 0, Number.isFinite(p7) ? p7 / 100 : 0)
-    }
+function nullableFiniteNumber(value) {
+  // 缺失值不是零使用率；避免 null/空串被 Number 转为 0。
+  if (value == null || (typeof value === 'string' && value.trim() === '')) return null
+  const n = Number(value)
+  return Number.isFinite(n) ? n : null
+}
+
+function usedRatios(vm) {
+  const u5 = nullableFiniteNumber(vm?.utilization_5h)
+  const u7 = nullableFiniteNumber(vm?.utilization_7d)
+  if (u5 != null || u7 != null) {
+    return { u5: u5 != null ? u5 : null, u7: u7 != null ? u7 : null }
   }
-  if (used == null) return null
+  const limits = normalizeCodexLimits(extraToCodexSnapshot(extraFromSummary(vm)))
+  const p5 = nullableFiniteNumber(limits.used_5h_percent)
+  const p7 = nullableFiniteNumber(limits.used_7d_percent)
+  return { u5: p5 != null ? p5 / 100 : null, u7: p7 != null ? p7 / 100 : null }
+}
+
+function ratioRank(used) {
+  if (used == null || !Number.isFinite(used)) return null
   return Math.round((1 - Math.min(1, Math.max(0, used))) * 10_000)
+}
+
+/** 流速因子：5h 窗余量（座位可持续性）；只报 weekly 的号（无 5h 窗）回落到 7d 余量。 */
+function quotaRemainingRank(vm) {
+  const { u5, u7 } = usedRatios(vm)
+  return ratioRank(u5 != null ? u5 : u7)
+}
+
+/** 库存因子：7d 周额度余量。 */
+function quotaStockRank(vm) {
+  const { u7 } = usedRatios(vm)
+  return ratioRank(u7)
 }
 
 function quotaResetAt(vm) {
@@ -169,6 +188,27 @@ function quotaResetAt(vm) {
     .filter((value) => Number.isFinite(value))
   if (!resets.length) return null
   return Math.min(...resets)
+}
+
+/** 7d 窗剩余比例 0..1；无快照返回 null。 */
+function quotaRemaining7d(vm) {
+  const u7 = nullableFiniteNumber(vm?.utilization_7d)
+  if (u7 != null) return Math.max(0, 1 - Math.min(1, Math.max(0, u7)))
+  const limits = normalizeCodexLimits(extraToCodexSnapshot(extraFromSummary(vm)))
+  const p7 = nullableFiniteNumber(limits.used_7d_percent)
+  if (p7 == null) return null
+  return Math.max(0, 1 - Math.min(1, Math.max(0, p7 / 100)))
+}
+
+/** 7d 窗重置时刻（ms）；无快照返回 null。 */
+function quotaReset7dAt(vm) {
+  const limits = normalizeCodexLimits(extraToCodexSnapshot(extraFromSummary(vm)))
+  const ms = Date.parse(limits.reset_7d_at || vm?.reset_7d || '')
+  return Number.isFinite(ms) ? ms : null
+}
+
+export function codexScheduleLevel(vm, now = Date.now(), resetAt = quotaReset7dAt(vm)) {
+  return resolveCredentialScheduleLevel({ vm, manualLevel: vm?.schedule_level_manual ?? undefined, resetAt, now })
 }
 
 export function codexAccountStatus(vm, now = Date.now(), policy = null) {
@@ -193,8 +233,10 @@ export function codexSlotAllowsModel(vm, model) {
 export function codexAccountCandidate(vm, now = Date.now(), signals = null, policy = null) {
   const runtime = signals || openAIRuntimeSignals(vm?.id, now)
   const effective = effectiveOpenAIPolicy(vm, normalizeOpenAIQuotaPolicy(policy))
+  const reset7dAt = quotaReset7dAt(vm)
   return {
     id: vm.id,
+    priority: codexScheduleLevel(vm, now, reset7dAt).level,
     weight: Number(vm?.policy?.weight ?? vm?.weight ?? 1) || 1,
     concurrency: effective.max_concurrency,
     maxRpm: effective.max_rpm,
@@ -206,6 +248,9 @@ export function codexAccountCandidate(vm, now = Date.now(), signals = null, poli
     lastStartedAt: runtime.lastStartedAt ?? null,
     quotaResetAt: quotaResetAt(vm),
     quotaRemainingRank: quotaRemainingRank(vm),
+    quotaStockRank: quotaStockRank(vm),
+    quotaReset7dAt: reset7dAt,
+    quotaRemaining7d: quotaRemaining7d(vm),
     failureRateBps: runtime.failureRateBps || 0,
     firstOutputLatencyMs: runtime.firstOutputLatencyMs ?? null,
   }
@@ -292,7 +337,6 @@ export function orderCodexSessionSlots(
     now,
     requestIntervalMs,
     preferredAccountId: home && ids.includes(home) ? home : null,
-    preferredOverridesWeight: true,
     roundRobinCursor: cursor,
   })
   if (!ordered.ids.length) {

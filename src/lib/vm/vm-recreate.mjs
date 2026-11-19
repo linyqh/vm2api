@@ -13,9 +13,21 @@ import { writeSlotSeedFiles } from './slot-seed.mjs'
 import { manualScheduleLevelOf } from '../pool/credential-weight.mjs'
 import { applyUnschedulable, deriveScheduleFields, pickScheduleFields } from '../pool/schedule-state.mjs'
 import { activeHoursOf } from '../pool/active-hours.mjs'
-import { stampVmKind } from './vm-kind.mjs'
-import { materializeResolvedKernel } from './wrap-cli-runtime.mjs'
+import { isCodexVm, stampVmKind } from './vm-kind.mjs'
+import { isKvmRuntime } from './runtime-kind.mjs'
+import { resolveKernelDataplane } from './slot-engine.mjs'
+import {
+  WRAP_CLI_BIN,
+  cragV2PackageRoot,
+  describeCliPayload,
+  describeKernelPayload,
+  materializeCragV2,
+  materializeResolvedKernel,
+  materializeWrapCli,
+  verifyCragV2Tree,
+} from './wrap-cli-runtime.mjs'
 import { listVms } from './vm-registry.mjs'
+import { regenerateMachineIdentity } from './machine-spec.mjs'
 import { slotHost } from './slot-host.mjs'
 import {
   applyGeneratedFingerprint,
@@ -93,15 +105,50 @@ export function wipeSlotHome(projectRoot, id, { keepData = false } = {}) {
   invalidateVmSlotReadCache(projectRoot, id)
 }
 
-export function seedFreshCliHome(projectRoot, vm) {
-  const written = writeSlotSeedFiles(projectRoot, vm)
-  // A baked slot image carries its binaries; no .kin copy in the home.
-  if (!slotHost(vm).bakedKernel) {
-    try {
-      const laid = materializeResolvedKernel(projectRoot, vm)
-      if (laid?.ok === false && vm?.dataplane === 'crag') throw new Error(laid.error || laid.code)
-    } catch (error) {
-      if (vm?.dataplane === 'crag') throw error
+function requireKernelResult(result) {
+  if (result?.ok === false) {
+    throw Object.assign(new Error(result.error || result.code), { code: result.code })
+  }
+}
+
+/** Read-only create preflight for CRAG-capable placements. Nodes verify their CRAG payload via cragSlotPayload. */
+export function preflightFreshClaudeKernels(projectRoot, vm) {
+  if (!describeKernelPayload(projectRoot).path || !describeCliPayload(projectRoot, WRAP_CLI_BIN).path) {
+    throw Object.assign(new Error('请先拉取 cli-node 内核'), { code: 'kernel_package_missing' })
+  }
+  if (slotHost(vm).bakedKernel) return
+  const root = cragV2PackageRoot(projectRoot, 'amd64')
+  if (!root) {
+    throw Object.assign(new Error('CRAG v2 package missing (share/crag/kernels/v2/amd64 or KIN_CRAG_V2_ROOT)'), {
+      code: 'crag_v2_package_missing',
+    })
+  }
+  requireKernelResult(verifyCragV2Tree(root, { arch: 'amd64' }))
+}
+
+export function seedFreshCliHome(projectRoot, vm, { routing, preinstallBoth = false } = {}) {
+  const host = slotHost(vm)
+  const crag = resolveKernelDataplane(vm, routing) === 'crag'
+  const written = writeSlotSeedFiles(projectRoot, vm, null, { cragNativeTelemetry: crag && !host.native })
+  // Cluster payloads go in slot-bin, not the control plane's .kin home.
+  if (!host.bakedKernel) {
+    if (preinstallBoth) {
+      const wrap = materializeWrapCli(projectRoot, vm)
+      requireKernelResult(wrap)
+      const cli = fs.statSync(path.join(wrap.dest, WRAP_CLI_BIN), { throwIfNoEntry: false })
+      if (!wrap.kernel_bin || !wrap.wrapper || !cli?.isFile()) {
+        throw Object.assign(new Error('cli-node 安装不完整'), { code: 'kernel_materialize_failed' })
+      }
+      // Wrap already stages the encrypted CRAG package for local KVM slots.
+      if (!isKvmRuntime(vm)) requireKernelResult(materializeCragV2(projectRoot, vm, { select: false }))
+    } else {
+      const required = crag || (isKvmRuntime(vm) && !isCodexVm(vm))
+      try {
+        const laid = materializeResolvedKernel(projectRoot, vm, { routing })
+        if (required) requireKernelResult(laid)
+      } catch (error) {
+        if (required) throw error
+      }
     }
   }
   return { homeDir: written.homeDir, seed_policy: written.seed_policy || defaultSeedPolicy(vm.seed_policy || {}) }
@@ -115,6 +162,15 @@ function keptAccount(prev) {
     for (const key of ['access_token', 'refresh_token', 'id_token']) delete codex[key]
   }
   return { claude, codex }
+}
+
+function recreatedMachine(prev, keep) {
+  const machine = prev?.machine && typeof prev.machine === 'object' ? prev.machine : null
+  const kvm = prev?.runtime?.type === 'kvm'
+  if (keep && machine && (!kvm || (machine.mac && machine.disk_serial))) return { machine: { ...machine } }
+  // traits, or a KVM record that never stored its identity: the container is already gone, so draw one.
+  if (machine || kvm) return { machine: regenerateMachineIdentity(machine) }
+  return {}
 }
 
 export function buildRecreatedVmRecord(prev, generated, { mode = 'traits' } = {}) {
@@ -176,8 +232,12 @@ export function buildRecreatedVmRecord(prev, generated, { mode = 'traits' } = {}
     proxy_cli_enabled: hasBoundExit(prev.proxy),
     seed_policy: defaultSeedPolicy(prev.seed_policy || {}),
     runtime: { type: prev.runtime?.type === 'kvm' ? 'kvm' : 'docker' },
+    // Sizing survives a reset; traits draws a new MAC / SMBIOS / disk serial. KVM cannot boot without them.
+    ...recreatedMachine(prev, keep),
     proxy_required: prev.proxy_required,
     ...(prev.inference_engine ? { inference_engine: prev.inference_engine } : {}),
+    ...(prev.dataplane ? { dataplane: prev.dataplane } : {}),
+    ...(prev.crag_kernel_version ? { crag_kernel_version: prev.crag_kernel_version } : {}),
     ...(prev.persona_preset ? { persona_preset: prev.persona_preset } : {}),
     ...(prev.node_id ? { node_id: prev.node_id } : {}),
     ...(prev.owner_user_id ? { owner_user_id: prev.owner_user_id } : {}),

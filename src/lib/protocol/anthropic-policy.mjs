@@ -2,6 +2,7 @@ import crypto from 'node:crypto'
 import {
   anthropicContentIsEmpty,
   dropEmptySystemControlTurns,
+  isSmallTextTurn,
   liftMidConversationSystemMessages,
   mergeConsecutiveAnthropicMessages,
   messageHasTurnControls,
@@ -26,6 +27,7 @@ import {
 import { ensureOutputConfigSchema, rectifyUnofficialRequest } from './request-rectifier.mjs'
 import { DEFAULT_CACHE_TTL, applyCacheBreakpoints, stripCacheScopeFields } from './cache-ttl.mjs'
 import { normalizeImageContentBlocks } from './images.mjs'
+import { normalizeToolInputSchemas } from './tool-input-schema.mjs'
 
 const TOOL_NAME = /^[A-Za-z0-9_-]{1,64}$/
 
@@ -653,20 +655,30 @@ export function wireToolName(name, { official = false, rewriteTools = true } = {
  * product strings leave system and tool text, and tool names land on mcp__.
  * Official Claude Code keeps its own tool names; a stray mcp_ name is still fixed.
  */
-export function scrubUpstreamClientBody(body, { official = false, rewriteTools = true } = {}) {
+export function scrubUpstreamClientBody(
+  body,
+  { official = false, rewriteTools = true, preserveToolNames = false, shareUnchanged = false } = {},
+) {
   if (!body || typeof body !== 'object') return { body, reverse: {} }
-  const out = clone(body)
+  const out = shareUnchanged && !isSmallTextTurn(body) ? { ...body } : clone(body)
   const reverse = {}
   const used = new Set()
   const assigned = new Map()
+  const declared = new Set(
+    !preserveToolNames && Array.isArray(out.tools) ? out.tools.map((tool) => tool?.name).filter(Boolean) : [],
+  )
   const rename = (name) => {
+    if (preserveToolNames) return name
     if (assigned.has(name)) return assigned.get(name)
     let wire = wireToolName(name, { official, rewriteTools })
     if (!wire) return name
     if (wire !== name) {
       const base = wireToolName(name, { official, rewriteTools })
       let suffix = 2
-      while (used.has(wire)) wire = `${base}_${suffix++}`
+      while (used.has(wire) || declared.has(wire)) {
+        const tail = `_${suffix++}`
+        wire = `${base.slice(0, 64 - tail.length)}${tail}`
+      }
       reverse[wire] = name
     }
     used.add(wire)
@@ -685,11 +697,13 @@ export function scrubUpstreamClientBody(body, { official = false, rewriteTools =
     })
   }
   if (out.tool_choice && typeof out.tool_choice === 'object' && typeof out.tool_choice.name === 'string') {
-    const name = rename(out.tool_choice.name)
-    if (name !== out.tool_choice.name) out.tool_choice = { ...out.tool_choice, name }
+    const name = assigned.get(out.tool_choice.name)
+    if (name !== undefined && name !== out.tool_choice.name) out.tool_choice = { ...out.tool_choice, name }
   }
   if (Array.isArray(out.messages)) {
-    out.messages = out.messages.map((message) => scrubMessage(message, rename))
+    out.messages = out.messages.map((message) =>
+      preserveToolNames && message?.role !== 'system' ? message : scrubMessage(message, rename),
+    )
   }
   return { body: out, reverse }
 }
@@ -706,6 +720,14 @@ function scrubTextBlock(block) {
 
 function scrubToolReferenceFields(block, rename) {
   if (!block || typeof block !== 'object') return { block, changed: false }
+  if (
+    (block.type === 'tool_addition' || block.type === 'tool_removal') &&
+    block.tool?.type === 'tool_reference' &&
+    typeof block.tool.name === 'string'
+  ) {
+    const name = rename(block.tool.name)
+    if (name !== block.tool.name) return { block: { ...block, tool: { ...block.tool, name } }, changed: true }
+  }
   if (block.type === 'tool_result' && Array.isArray(block.content)) {
     let changed = false
     const content = block.content.map((inner) => {
@@ -785,9 +807,13 @@ export function composeToolNames(front = {}, hop = {}) {
  * blocks before persona or either hop. Caller billing is removed here unless
  * official passthrough is on; the project template writes its own.
  */
-export function toStandardAnthropicBody(body, { official = false, rewriteTools = true } = {}) {
-  const shaped = sanitizeAnthropicBody(stripCallerBilling(body), { preserveContentShape: false })
-  return scrubUpstreamClientBody(shaped, { official, rewriteTools })
+export function toStandardAnthropicBody(body, options = {}) {
+  const shaped = sanitizeAnthropicBody(stripCallerBilling(body), {
+    reuseCanonicalHistory: options.reuseCanonicalHistory === true && !isSmallTextTurn(body),
+  })
+  if (Array.isArray(shaped.tools)) shaped.tools = normalizeToolInputSchemas(shaped.tools)
+  applyMaxTokensCap(shaped)
+  return scrubUpstreamClientBody(shaped, options)
 }
 
 function stripBillingText(text) {

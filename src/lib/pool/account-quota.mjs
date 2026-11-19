@@ -28,9 +28,11 @@ import {
 import { rollWindowHistory } from './window-history.mjs'
 import { accountTierKey, isNearLimit, normalizeTiers, resolveTierPolicy } from './quota-tiers.mjs'
 import { resolvePolicyModelId } from '../protocol/model-policy.mjs'
+import { isFableCreditsRequiredMessage } from './upstream-error-policy.mjs'
 import { SessionLimitRegistry } from './session-limit.mjs'
 import { applyVmQuotaConfig, applyVmQuotaPolicy } from './vm-quota-override.mjs'
 import {
+  FABLE_PROBE_MODEL,
   isFablePlanDenied,
   isInventedFableWindow,
   isOfficialUsageRateLimited,
@@ -54,6 +56,32 @@ import {
   quotaGateOf,
   worstGateZone,
 } from './quota-gate.mjs'
+
+/** How long a 'usage credits required' Fable answer keeps Fable off the seat. */
+export const FABLE_CREDITS_DENY_MS = 6 * 60 * 60_000
+
+function fableModelKey(model) {
+  return resolvePolicyModelId(model) || String(model || '').trim()
+}
+
+function setFableCreditsRequired(unified, key, now, durationMs) {
+  const until = now + durationMs
+  unified.model_denied_until = { ...(unified.model_denied_until || {}), [key]: until }
+  unified.fable_credits_required = {
+    model: key,
+    at: new Date(now).toISOString(),
+    until: new Date(until).toISOString(),
+  }
+}
+
+function clearFableCreditsRequired(unified, key) {
+  if (unified.model_denied_until?.[key]) {
+    const denied = { ...unified.model_denied_until }
+    delete denied[key]
+    unified.model_denied_until = denied
+  }
+  if (unified.fable_credits_required?.model === key) delete unified.fable_credits_required
+}
 
 export { extraHeadersFromLimitError }
 export { estimateRequestRisk }
@@ -435,6 +463,16 @@ export class AccountQuota {
         }
       }
     }
+    // 限额查询's Fable hop sees the same 'usage credits required' 429 that
+    // routing does; record it the same way, and lift it when the hop succeeds.
+    if (probe.fable && !fableTransport) {
+      const fableKey = fableModelKey(FABLE_PROBE_MODEL)
+      if (Number(probe.fable.status) === 429 && isFableCreditsRequiredMessage(probe.fable.error)) {
+        setFableCreditsRequired(acc.unified, fableKey, Date.parse(nowIso) || Date.now(), FABLE_CREDITS_DENY_MS)
+      } else if (probe.fable.ok) {
+        clearFableCreditsRequired(acc.unified, fableKey)
+      }
+    }
     if (profileTier) {
       acc.unified.account_tier = profileTier
       acc.unified.account_tier_source = 'profile'
@@ -726,7 +764,7 @@ export class AccountQuota {
             reset_5h: w5.reset,
             reset_7d: w7.reset,
             message:
-              '临近额度闸线，本请求预估未命中缓存过大。Near the quota safety line, this large uncached request is not eligible on this account.',
+              '临近额度闸线，本请求预估未命中缓存过大。请缩短上下文、等待窗口重置，或改用其他模型。Near the quota safety line, this large uncached request is not eligible on this account; shorten the context, wait for the window to reset, or switch to another model.',
           },
         }
       }
@@ -1187,14 +1225,31 @@ export class AccountQuota {
     return this.repo.save(acc)
   }
 
+  /**
+   * Upstream said this account needs usage credits for Fable. Keep Fable off
+   * the seat for a while (other models still route) and leave a marker the
+   * panel shows instead of 未探测. The marker sits outside `unified.fable`
+   * because a Pro usage probe deletes that object. A later Fable success on
+   * the account clears both via clearModelUnsupported.
+   */
+  markFableCreditsRequired(accountId, model, durationMs = FABLE_CREDITS_DENY_MS) {
+    const key = fableModelKey(model)
+    if (!accountId || !key) return null
+    const acc = this.repo.get(accountId)
+    if (!acc) return null
+    const now = Date.now()
+    acc.unified = acc.unified || {}
+    setFableCreditsRequired(acc.unified, key, now, durationMs)
+    acc.unified.updated_at = new Date(now).toISOString()
+    return this.repo.save(acc)
+  }
+
   clearModelUnsupported(accountId, model) {
     const key = resolvePolicyModelId(model) || String(model || '').trim()
     if (!accountId || !key) return null
     const acc = this.repo.get(accountId)
     if (!acc?.unified?.model_denied_until?.[key]) return acc
-    const denied = { ...acc.unified.model_denied_until }
-    delete denied[key]
-    acc.unified.model_denied_until = denied
+    clearFableCreditsRequired(acc.unified, key)
     acc.unified.updated_at = new Date().toISOString()
     return this.repo.save(acc)
   }
@@ -1461,8 +1516,13 @@ function healOfficialOverwriteExtra(acc, accountId, repo) {
 function applyHeaderExhausted(acc, h = {}) {
   const s5 = String(h['anthropic-ratelimit-unified-5h-status'] || '').toLowerCase()
   const s7 = String(h['anthropic-ratelimit-unified-7d-status'] || '').toLowerCase()
+  // Callers only pass exhausted with evidence: a window status, plan-limit
+  // text, or the classifier's account_quota_exhausted. When no window is named,
+  // the representative claim picks it; only a claimless proof falls back to 5h.
+  const claim = String(h['anthropic-ratelimit-unified-representative-claim'] || '').toLowerCase()
+  const claim7 = /^seven_day$|^7d$/.test(claim)
   const hit5 = s5 === 'rejected' || s5 === 'rate_limited'
-  const hit7 = s7 === 'rejected' || s7 === 'rate_limited'
+  const hit7 = s7 === 'rejected' || s7 === 'rate_limited' || (!hit5 && claim7)
   if (hit7) {
     writeHeaderWindow(acc, '7d', {
       utilization: num(h['anthropic-ratelimit-unified-7d-utilization']),

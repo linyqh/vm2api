@@ -71,8 +71,15 @@ export const ErrorCode = {
   UPSTREAM_EMPTY_STREAM: 'upstream_empty_stream',
   CLI_ERROR: 'cli_error',
   KERNEL_UNAVAILABLE: 'kernel_unavailable',
+  SLOT_OAUTH_UNAVAILABLE: 'slot_oauth_unavailable',
+  CLUSTER_SLOT_RECONNECTING: 'cluster_slot_reconnecting',
+  CLUSTER_DELIVERY_UNCONFIRMED: 'cluster_delivery_unconfirmed',
   KERNEL_ERROR: 'kernel_error',
   FABLE_REQUIRES_MAX: 'fable_requires_max',
+  NATIVE_HANDOFF_MISSING: 'native_handoff_missing',
+  NATIVE_HANDOFF_INVALID: 'native_handoff_invalid',
+  NATIVE_HANDOFF_CONFLICT: 'native_handoff_conflict',
+  NATIVE_HANDOFF_INCOMPLETE: 'native_handoff_incomplete',
 
   INCOMPLETE_RESPONSE: 'incomplete_response',
   CLIENT_CANCELLED: 'client_cancelled',
@@ -84,6 +91,7 @@ export const ErrorCode = {
   DISTILL_BLOCKED: 'distill_blocked',
   REFUSAL_GUARD: 'refusal_guard',
   CONTENT_FILTER_REFUSAL: 'content_filter_refusal',
+  THIRD_PARTY_CLIENT: 'third_party_client',
   POLICY_BLOCKED: 'policy_blocked',
   // resource
   VM_NOT_FOUND: 'vm_not_found',
@@ -110,6 +118,12 @@ export const KERNEL_FAILURE_STATUS = Object.freeze({
   [ErrorCode.CLI_ERROR]: 502,
   [ErrorCode.KERNEL_ERROR]: 502,
   [ErrorCode.KERNEL_UNAVAILABLE]: 503,
+  [ErrorCode.CLUSTER_SLOT_RECONNECTING]: 503,
+  [ErrorCode.CLUSTER_DELIVERY_UNCONFIRMED]: 502,
+  [ErrorCode.NATIVE_HANDOFF_MISSING]: 502,
+  [ErrorCode.NATIVE_HANDOFF_INVALID]: 502,
+  [ErrorCode.NATIVE_HANDOFF_CONFLICT]: 502,
+  [ErrorCode.NATIVE_HANDOFF_INCOMPLETE]: 502,
 })
 
 export const CLIENT_POOL_BUSY_MESSAGE = '号池负载过高，稍后再试'
@@ -130,18 +144,35 @@ const POOL_OVERLOADED_CODES = new Set([
 const POOL_RATE_LIMITED_CODES = new Set(['pool_rate_limited'])
 /** Nothing eligible to wait for: configuration, quota, credentials, or model gates. */
 const POOL_UNAVAILABLE_CODES = new Set([
+  ErrorCode.POOL_UNAVAILABLE,
+  ErrorCode.SLOT_OAUTH_UNAVAILABLE,
   'account_pool_exhausted',
   'api_pool_exhausted',
   'no_available_accounts',
   'no_eligible_accounts',
 ])
 
+export function isClaudeSlotOAuthError(body) {
+  if (!body?.error && body?.type !== 'error') return false
+  const error = body.error
+  if (
+    [body.code, error?.code, error?.upstream_code].some(
+      (code) => code === 'NO_ACCOUNT' || code === ErrorCode.SLOT_OAUTH_UNAVAILABLE,
+    )
+  ) {
+    return true
+  }
+  const message = typeof error === 'string' ? error : error?.message || body.message
+  return typeof message === 'string' && /\bNo signed-in Claude account found\b/i.test(message)
+}
+
 const POOL_CAPACITY_MESSAGE = /no eligible|no ready api|account pool|号池没有|无可用账号|eligible claude/i
 const WRAP_CONNECTION_MESSAGE = /provider error:.*connection error/i
 const USAGE_POLICY_MESSAGE =
   /usage policy|legal\/aup|unable to respond to this request|violate our usage|content_filter_refusal/i
-// Billing refusal, not a content violation and not "extra usage required".
-const UNANSWERABLE_PROMPT_MESSAGE = /third[-\s]?party apps now draw from|no third[-\s]?party apps(?:\s+are)?\s+allowed/i
+// Anthropic bills a non-Claude-Code client against extra usage and refuses it
+// when the seat has none. A client/billing rejection, not a content refusal.
+const THIRD_PARTY_CLIENT_MESSAGE = /third[-\s]?party apps now draw from|no third[-\s]?party apps(?:\s+are)?\s+allowed/i
 
 export function isWrapConnectionError(message = '') {
   return WRAP_CONNECTION_MESSAGE.test(String(message || ''))
@@ -151,10 +182,35 @@ export function isUsagePolicyErrorMessage(message = '') {
   return USAGE_POLICY_MESSAGE.test(String(message || ''))
 }
 
-/** Usage Policy text, or a 400/503 the upstream will not answer for this prompt. */
+/** Usage Policy text the upstream will not answer for this prompt. */
 export function isUnanswerablePromptMessage(message = '') {
+  return USAGE_POLICY_MESSAGE.test(String(message || ''))
+}
+
+/** "Third-party apps now draw from your extra usage": the caller is not Claude Code. */
+export function isThirdPartyClientMessage(message = '') {
   const text = String(message || '')
-  return USAGE_POLICY_MESSAGE.test(text) || UNANSWERABLE_PROMPT_MESSAGE.test(text)
+  return THIRD_PARTY_CLIENT_MESSAGE.test(text) && !USAGE_POLICY_MESSAGE.test(text)
+}
+
+export const THIRD_PARTY_CLIENT_CLIENT_MESSAGE =
+  '上游将此请求识别为第三方客户端调用，不按订阅额度计费，已拒绝。这不是内容拒答；原样重试会得到同样结果。'
+
+/** Non-retryable client error that keeps the upstream sentence. */
+export function makeThirdPartyClientError({ requestId, upstreamMessage, upstreamType, upstreamStatus } = {}) {
+  return makeError({
+    type: ErrorType.INVALID_REQUEST,
+    code: ErrorCode.THIRD_PARTY_CLIENT,
+    message: THIRD_PARTY_CLIENT_CLIENT_MESSAGE,
+    status: 400,
+    details: {
+      upstream_message: String(upstreamMessage || '').slice(0, 300),
+      upstream_type: upstreamType,
+      upstream_status: upstreamStatus,
+      retryable: false,
+    },
+    request_id: requestId,
+  })
 }
 
 export const REFUSAL_GUARD_MESSAGE =
@@ -164,6 +220,7 @@ const REFUSAL_GUARD_MESSAGES = Object.freeze({
   exact: REFUSAL_GUARD_MESSAGE,
   similar: `${REFUSAL_GUARD_MESSAGE} 当前提示词与曾被拒答的内容相似。`,
   device: `${REFUSAL_GUARD_MESSAGE} 该设备此前已被封禁。`,
+  session: `${REFUSAL_GUARD_MESSAGE} 这个会话此前被上游拒答。`,
   upstream: 'Anthropic refused this request under its usage policy. Do not retry this request.',
 })
 
@@ -358,6 +415,20 @@ export function assistantStopReason(result = {}) {
 export function isCompleteAssistantMessage(result = {}) {
   const body = result?.body && typeof result.body === 'object' ? result.body : result
   if (!isAssistantMessageBody(body)) return false
+  if (result?.nativeHandoff) {
+    const facts = result.providerResult
+    const complete = facts?.schema_version === 2 ? facts.provider_complete === true : facts?.usage_complete === true
+    return (
+      result.ok === true &&
+      complete &&
+      !facts.error &&
+      !facts.delivery_error &&
+      facts.response_valid !== false &&
+      (facts.schema_version !== 2 || facts.stop_reason !== 'tool_use' || facts.handoff_complete === true) &&
+      facts.message_id === body.id &&
+      facts.stop_reason === assistantStopReason(result)
+    )
+  }
   if (result?.sawMessageStop) return true
   if (!assistantStopReason({ body, stopReason: result?.stopReason })) return false
   return assistantVisibleOutput(body)
@@ -371,6 +442,7 @@ export function isIncompleteAssistantMessage(result = {}) {
 
 export function finalizeAssembledAssistantHop(result = {}) {
   if (isClientCancelledResult(result)) return result
+  if (result?.nativeHandoff) return result
   if (isCompleteAssistantMessage(result)) return result?.ok ? result : { ...result, ok: true }
   if (isIncompleteAssistantMessage(result) || result?.ok) {
     return {
@@ -385,6 +457,10 @@ export function finalizeAssembledAssistantHop(result = {}) {
 
 export function mergeAssembledAssistantHop(result = {}, assembled = null) {
   if (!assembled || result?.body?.error || result?.body?.type === 'error') return result
+  // Native transport already assembled and validated its public content. In
+  // particular, an outer assembler must not resurrect suppressed refusal tools
+  // or replace final trailer usage with an earlier SSE observation.
+  if (result?.nativeHandoff) return result
   const assembledResult = { body: assembled, stopReason: assembled.stop_reason }
   if (!isCompleteAssistantMessage(assembledResult) && isCompleteAssistantMessage(result)) return result
   return {
@@ -423,6 +499,7 @@ export function mapUpstreamError(status, body, headers = {}) {
       'classifier_runtime_unsupported',
       'classifier_invalid_cache',
       'invalid_request_context',
+      'invalid_kernel_request',
     ].includes(inboundCode)
   ) {
     return makeError({ type: ErrorType.INVALID_REQUEST, code: inboundCode, message: body.error.message, status: 400 })
@@ -433,7 +510,11 @@ export function mapUpstreamError(status, body, headers = {}) {
     (upType ? body?.message : null) ||
     body?.raw ||
     null
-  if (/^license_(required|expired|not_yet_valid|invalid|binding_mismatch|unconfigured)$/.test(inboundCode)) {
+  if (
+    /^license_(required|expired|not_yet_valid|invalid|binding_mismatch|unconfigured|crag_host_over_quota|crag_host_usage_unverified)$/.test(
+      inboundCode,
+    )
+  ) {
     return makeError({
       type: ErrorType.PERMISSION,
       code: inboundCode,
@@ -454,7 +535,7 @@ export function mapUpstreamError(status, body, headers = {}) {
       type: ErrorType.RATE_LIMIT,
       code: ErrorCode.QUOTA_GUARD_REQUEST_TOO_LARGE,
       message: String(
-        msg || '临近额度闸线，本请求预估未命中缓存过大，未发往上游。请缩短上下文、等待窗口重置，或稍后再试。',
+        msg || '临近额度闸线，本请求预估未命中缓存过大，未发往上游。请缩短上下文、等待窗口重置，或改用其他模型。',
       ),
       status: 429,
       details: body?.error?.details,
@@ -474,7 +555,16 @@ export function mapUpstreamError(status, body, headers = {}) {
   }
   // Kernel slot busy on the last hop is capacity, same as a full pool queue.
   if (inboundCode === 'slot_busy' || /rust kernel has no free slot/i.test(String(msg || ''))) {
-    return poolClientError('overloaded')
+    const out = poolClientError('overloaded')
+    // Name the local CRAG queue so a 529 here is not read as provider overload (#1213).
+    const queue = /runtime queue (timeout|is full)/i.exec(String(msg || ''))
+    if (queue) {
+      out.body.error.details = {
+        source: 'local_kernel_queue',
+        reason: queue[1].toLowerCase() === 'timeout' ? 'runtime_queue_timeout' : 'runtime_queue_full',
+      }
+    }
+    return out
   }
   if (
     inboundCode === 'wrap_connection_error' ||
@@ -529,6 +619,14 @@ export function mapUpstreamError(status, body, headers = {}) {
         ...(body?.error?.upstream_code ? { upstream_code: body.error.upstream_code } : {}),
       },
       request_id,
+    })
+  }
+  if (isThirdPartyClientMessage(msg)) {
+    return makeThirdPartyClientError({
+      requestId: request_id,
+      upstreamMessage: msg,
+      upstreamType: upType,
+      upstreamStatus: status,
     })
   }
   if (isUnanswerablePromptMessage(msg)) {
@@ -613,7 +711,12 @@ export function mapUpstreamError(status, body, headers = {}) {
       type: ErrorType.INVALID_REQUEST,
       code: ErrorCode.UPSTREAM_INVALID,
       message: String(msg),
-      status: inboundCode === ErrorCode.UPSTREAM_INVALID && status >= 400 && status < 500 ? status : 400,
+      status:
+        (inboundCode === ErrorCode.UPSTREAM_INVALID || upType === 'invalid_request_error') &&
+        status >= 400 &&
+        status < 500
+          ? status
+          : 400,
       param: body?.error?.param || undefined,
       details: {
         upstream_type: upType,

@@ -31,6 +31,13 @@ services:
       PORT: ${PORT:-8787}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - /run/vm2api-gemini:/run/vm2api-gemini:ro
+      - type: bind
+        source: "${VM2API_CRAG_HOST_ID_FILE:-/etc/machine-id}"
+        target: /run/crag-host-machine-id
+        read_only: true
+        bind:
+          create_host_path: false
       - ./vms:/opt/vm2api/vms
       - ./data:/opt/vm2api/data
       - ./bin:/opt/vm2api/bin

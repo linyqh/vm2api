@@ -9,7 +9,8 @@ import type {
   VmSeedSettings,
   VmsListResponse,
 } from '@/types/panel-vm'
-import { api, getVmCragLicense } from '@/lib/api'
+import type { VmKernelSwitchJob } from '@/lib/api'
+import { ApiError, api, getVmCragLicense, getVmKernelSwitch } from '@/lib/api'
 
 /** 创建表单默认规格 + 本机 KVM 能力。ACL 与 POST /vms/create 相同，租户可读。 */
 export function vmCreateOptionsQueryOptions() {
@@ -43,11 +44,96 @@ export function vmQueryOptions(id: string) {
   })
 }
 
+export type CragRuntimeVm = {
+  state: 'running' | 'not_running' | 'unknown'
+  ready: boolean
+  quota_blocked?: true
+  scope: 'host' | 'independent' | 'unknown'
+  version: string | null
+  active_requests: number | null
+  queued: number | null
+  ready_slots: number | null
+}
+
+export type CragRuntime = {
+  running_vms: number
+  ready_vms: number
+  unknown_vms: number
+  host_running_vms: number
+  host_unknown_vms: number
+  host_runtime_available: number | 'unlimited' | null
+  host_over_limit: boolean | null
+  checked_at: string
+  vms: Record<string, CragRuntimeVm>
+}
+
+export type CragHostStatus = {
+  ready: boolean
+  target_probe_failed?: true
+  state: 'unavailable' | 'unredeemed' | 'active' | 'expired' | 'sync_pending'
+  slot_limit?: number | 'unlimited'
+  expires_at?: number
+  revision?: number
+  sku?: string
+  months?: number
+  used_slots?: number
+  vm_count?: number
+  total_slots?: number
+  enabled_slots?: number
+  activated_slots?: Array<{
+    vm_id: string
+    scope: 'host' | 'device' | 'kernel'
+    expires_at: number
+  }>
+  available_slots?: number | null
+  available_seats?: number | 'unlimited' | null
+  reclaim_pending_count?: number
+  reclaim_supported?: boolean
+  upgrade_available?: boolean
+  runtime?: CragRuntime
+}
+
+export function cragHostStatusQueryOptions() {
+  return queryOptions({
+    queryKey: ['crag-host-subscription'] as const,
+    queryFn: ({ signal }) =>
+      api<CragHostStatus>('/api/panel/crag-subscription', { signal }),
+    retry: false,
+  })
+}
+
 export function vmCragLicenseQueryOptions(id: string) {
   return queryOptions({
     queryKey: ['panel', 'vm', id, 'crag-license'] as const,
     queryFn: () => getVmCragLicense(id),
     staleTime: 0,
+    retry: false,
+  })
+}
+
+export function vmKernelSwitchQueryOptions(id: string) {
+  const queryKey = ['panel', 'vm-kernel-switch', id] as const
+  return queryOptions({
+    queryKey,
+    queryFn: async ({ client, queryKey, signal }) => {
+      const previous = client.getQueryData<VmKernelSwitchJob | null>(queryKey)
+      const job = await getVmKernelSwitch(id, signal)
+      if (!job && previous?.status === 'running') {
+        throw new ApiError(
+          '切换任务记录已丢失，操作可能已中断（控制面可能已重启）。请核对 VM 实际状态。',
+          0,
+          'kernel_switch_interrupted'
+        )
+      }
+      return job
+    },
+    refetchInterval: (query) =>
+      query.state.status !== 'error' && query.state.data?.status === 'running'
+        ? 2000
+        : false,
+    refetchOnMount: 'always',
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
     retry: false,
   })
 }
@@ -99,10 +185,12 @@ export function vmCredentialQueryOptions(id: string, enabled = true) {
 }
 
 export function testModelsQueryOptions(vmId: string) {
-  const q = vmId ? `?vm_id=${encodeURIComponent(vmId)}` : ''
   return queryOptions({
     queryKey: ['panel', 'test-models', vmId || ''] as const,
-    queryFn: () => api<TestModelsPayload>(`/api/panel/test-models${q}`),
+    queryFn: () => {
+      const q = vmId ? `?vm_id=${encodeURIComponent(vmId)}` : ''
+      return api<TestModelsPayload>(`/api/panel/test-models${q}`)
+    },
     enabled: !!vmId,
   })
 }
@@ -144,5 +232,32 @@ export function vmOfficialCcQueryOptions(id: string) {
     },
     refetchInterval: (query) =>
       query.state.data?.status === 'running' ? 2500 : false,
+  })
+}
+
+export type VmHealthRange = '24h' | '7d'
+
+export type VmHealthPayload = {
+  range: VmHealthRange
+  slot_min: number
+  start: string
+  buckets: Array<[number, number]> | null
+  top_errors: Array<{
+    code: string
+    status: number | null
+    count: number
+    last_at: string
+  }>
+}
+
+/** 展开明细的请求健康：按需取，30 秒内复用。 */
+export function vmHealthQueryOptions(id: string, range: VmHealthRange) {
+  return queryOptions({
+    queryKey: ['panel', 'vm', id, 'health', range] as const,
+    queryFn: () =>
+      api<VmHealthPayload>(
+        `/api/panel/vms/${encodeURIComponent(id)}/health?range=${range}`
+      ),
+    staleTime: 30_000,
   })
 }

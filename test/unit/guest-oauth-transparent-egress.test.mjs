@@ -1,6 +1,64 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { runGuestOAuthAuthService } from '../../src/lib/oauth/guest-oauth-helper.mjs'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import {
+  finishOAuthImport,
+  prepareSlotOAuth,
+  runGuestOAuthAuthService,
+} from '../../src/lib/oauth/guest-oauth-helper.mjs'
+import { CRAG_CLAUDE_VERSION } from '../../src/lib/vm/slot-engine.mjs'
+
+test('OAuth without native telemetry uses the persisted bound exit without starting the slot', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-oauth-legacy-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  fs.mkdirSync(path.join(root, 'vms'))
+  for (const health of [{ ok: true }, { ok: true, vm_telemetry: true, telemetry_ready: false }]) {
+    for (const proxy of [{ id: 'px-bound', host: '127.0.0.1', port: 20881 }, { id: 'px-local' }]) {
+      const vm = { id: 'vm-01', runtime: { type: 'docker' }, status: 'running', schedulable: false, proxy }
+      const vmFile = path.join(root, 'vms', `${vm.id}.json`)
+      const before = JSON.stringify(vm)
+      fs.writeFileSync(vmFile, before)
+      const inputs = []
+      for (const payload of [
+        { operation: 'exchange_code', code: 'fixture-code', code_verifier: 'fixture-verifier', state: 'fixture-state' },
+        { operation: 'session_key', session_key: 'sk-ant-sid-fixture', runtime_mode: 'setup-token' },
+      ]) {
+        const credential = await runGuestOAuthAuthService(
+          { ...payload, proxy_url: 'socks5h://127.0.0.1:1' },
+          {
+            exec: {
+              projectRoot: root,
+              vmId: vm.id,
+              vm: { ...vm, proxy: { id: 'px-stale', host: '127.0.0.1', port: 1 } },
+            },
+            prepare: (options) =>
+              prepareSlotOAuth({
+                ...options,
+                readHealth: async () => health,
+                startReady: async () => assert.fail('OAuth must not start or restart a legacy slot'),
+              }),
+            runDocker: async () => assert.fail('Legacy OAuth must not execute in the slot'),
+            postTelemetry: async () => assert.fail('Missing telemetry must not delay OAuth'),
+            runNative: async (input) => {
+              inputs.push(input)
+              return { access_token: 'fixture-access', refresh_token: 'fixture-refresh' }
+            },
+          },
+        )
+        assert.equal(credential.access_token, 'fixture-access')
+        assert.equal(await finishOAuthImport(credential, true), null)
+        assert.deepEqual(inputs.at(-1), {
+          ...payload,
+          proxy_url: proxy.id === 'px-local' ? '' : 'socks5h://127.0.0.1:20881',
+        })
+      }
+      assert.equal(inputs.length, 2)
+      assert.equal(fs.readFileSync(vmFile, 'utf8'), before)
+    }
+  }
+})
 
 test('guest OAuth helper delegates egress selection to the slot network', async () => {
   const inputs = []
@@ -21,6 +79,7 @@ test('guest OAuth helper delegates egress selection to the slot network', async 
         code: 'fixture-code',
         code_verifier: 'fixture-verifier',
         proxy_url: 'socks5h://127.0.0.1:1',
+        claude_version: '2.1.303',
       },
       {
         exec,
@@ -51,5 +110,52 @@ test('guest OAuth helper delegates egress selection to the slot network', async 
   for (const input of inputs) {
     assert.equal(input.proxy_url, '')
     assert.equal(input.code, 'fixture-code')
+    assert.equal(input.claude_version, '2.1.303')
   }
+})
+
+test('guest OAuth takes the version from the locked crag entrypoint, without an extra exec', async () => {
+  const exec = {
+    projectRoot: '/srv/vm2api',
+    vmId: 'vm-01',
+    vm: { id: 'vm-01', dataplane: 'crag', crag_kernel_version: 'v2', runtime_type: 'kvm' },
+  }
+  const calls = []
+  const run = (vm) =>
+    runGuestOAuthAuthService(
+      // A caller-supplied version must not win over the entrypoint's own.
+      { operation: 'exchange_code', claude_version: '0.0.0' },
+      {
+        exec: { ...exec, vm },
+        prepare: async () => ({
+          exec: { ...exec, vm },
+          host: {
+            bakedKernel: true,
+            bins: { oauthAuth: '/usr/local/bin/kin-oauth-auth', cli: '/opt/kin/cli-node' },
+            dockerEnv: () => ({}),
+            execUser: () => 'kincli',
+          },
+          configDir: '/home/kincli/.claude',
+          home: '/home/kincli',
+        }),
+        postTelemetry: async () => ({ ok: true }),
+        runDocker: async (argv, { stdin }) => {
+          calls.push({ argv, stdin })
+          return { code: 0, stdout: JSON.stringify({ ok: true, credential: { access_token: 'fixture-access' } }) }
+        },
+      },
+    )
+
+  const credential = await run(exec.vm)
+  assert.equal(credential.access_token, 'fixture-access')
+  assert.equal(JSON.parse(calls[0].stdin).claude_version, CRAG_CLAUDE_VERSION)
+  // One exec only: the helper itself. Reading the version back off the CLI cost an
+  // exec per exchange and refused valid exchanges when it failed.
+  assert.equal(calls.length, 1)
+  assert.ok(!calls.some((call) => call.argv.includes('--version')))
+
+  // A non-crag slot has no locked entrypoint, so the caller's value stands.
+  await run({ ...exec.vm, dataplane: 'wrap' })
+  assert.equal(JSON.parse(calls[1].stdin).claude_version, '0.0.0')
+  assert.equal(calls.length, 2)
 })

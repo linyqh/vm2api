@@ -2,9 +2,11 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
   buildAnthropicSseError,
+  buildRetryableTruncationError,
   createAnthropicSseErrorRemapper,
   createAnthropicStreamTracker,
   isRecoverableTruncation,
+  truncationReason,
 } from '../../src/lib/protocol/stream-truncation.mjs'
 
 test('a cut tool call closes as max_tokens and a thinking block does not', () => {
@@ -54,6 +56,19 @@ test('a worker timeout is not closed as max_tokens', () => {
   )
 })
 
+test('a failed native handoff never manufactures a max_tokens terminal', () => {
+  for (const body of [undefined, { error: { type: 'api_error', message: 'native terminal unavailable' } }]) {
+    assert.equal(isRecoverableTruncation({ ok: false, nativeHandoff: true, committed: true, body }), false)
+  }
+})
+
+test('an unconfirmed cluster turn is never closed as max_tokens', () => {
+  assert.equal(
+    isRecoverableTruncation({ body: { error: { code: 'cluster_delivery_unconfirmed' } }, committed: true }),
+    false,
+  )
+})
+
 test('streaming Usage Policy SSE error remaps to policy_blocked / refusal_guard (#503)', () => {
   const msg =
     'provider error: provider error: API Error: Claude Code is unable to respond to this request, which appears to violate our Usage Policy (https://www.anthropic.com/legal/aup). Try rephrasing the request'
@@ -75,8 +90,43 @@ test('streaming Usage Policy SSE error remaps to policy_blocked / refusal_guard 
   assert.equal(payload.error.details?.retryable, false)
 })
 
+test('streaming third-party extra-usage SSE error remaps to third_party_client, not a refusal', () => {
+  const msg = 'Third-party apps now draw from your extra usage, not your plan limits. Add more at claude.ai/settings/usage and keep going.'
+  const upstream = JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: msg } })
+  const remapper = createAnthropicSseErrorRemapper()
+  remapper.remapLine('event: error\n')
+  const payload = JSON.parse(remapper.remapLine(`data: ${upstream}\n`).trim().slice(5))
+  assert.equal(payload.error.type, 'invalid_request_error')
+  assert.equal(payload.error.code, 'third_party_client')
+  assert.equal(payload.error.details?.upstream_message, msg)
+  assert.equal(payload.error.details?.retryable, false)
+  assert.notEqual(payload.error.code, 'refusal_guard')
+})
+
 test('non-error SSE lines pass through the Anthropic error remapper unchanged', () => {
   const remapper = createAnthropicSseErrorRemapper()
   const line = 'data: {"type":"message_start","message":{"id":"msg_1","content":[]}}\n'
   assert.equal(remapper.remapLine(line), line)
+})
+
+test('an unclosable started stream gets a retryable rate_limit_error and a logged cause', () => {
+  const thinking = createAnthropicStreamTracker()
+  thinking.observe('data: {"type":"message_start","message":{"usage":{"output_tokens":1}}}\n\n')
+  thinking.observe('data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}\n\n')
+  assert.equal(thinking.openBlockType(), 'thinking')
+  assert.equal(truncationReason({ ok: false }, thinking), 'thinking_open')
+
+  const timeout = { body: { error: { code: 'worker_timeout', message: 'slot worker idle timeout' } } }
+  assert.equal(truncationReason(timeout, thinking), 'timeout')
+
+  const text = createAnthropicStreamTracker()
+  text.observe('data: {"type":"message_start","message":{"usage":{"output_tokens":1}}}\n\n')
+  text.observe('data: {"type":"content_block_start","index":0,"content_block":{"type":"text"}}\n\n')
+  assert.equal(truncationReason(timeout, text), 'timeout')
+  assert.match(text.closingEvents(), /"stop_reason":"max_tokens"/)
+
+  const event = buildRetryableTruncationError()
+  assert.match(event, /^event: error\ndata: /)
+  const payload = JSON.parse(event.split('\n')[1].slice(5).trim())
+  assert.equal(payload.error.type, 'rate_limit_error')
 })

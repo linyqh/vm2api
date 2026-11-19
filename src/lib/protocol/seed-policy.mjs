@@ -60,6 +60,7 @@ export const TELEMETRY_KILL_ENV_KEYS = Object.freeze([...Object.keys(TELEMETRY_K
  */
 export const LEGACY_SCRIPT_ENV_KEYS = Object.freeze([
   ...TELEMETRY_KILL_ENV_KEYS,
+  'CLAUDE_CODE_DISABLE_TELEMETRY',
   ...Object.keys(CLOUD_PROVIDER_OFF_ENV),
   NONESSENTIAL_TRAFFIC_ENV_KEY,
   'ANTHROPIC_BASE_URL',
@@ -168,13 +169,13 @@ export function defaultSeedPolicy(partial = {}) {
 }
 
 /**
- * New slots default to telemetry off. Only an explicit override enables uploads.
+ * New slots follow `routing.telemetry.default_enabled`. Missing or false keeps telemetry off.
+ * When `defaultEnabled` is true it overrides a packaged `telemetry_disabled`.
+ * When it is false, an explicit `telemetry_disabled` in `partial` still wins.
  */
-export function standardSeedPolicy(partial = {}) {
-  return defaultSeedPolicy({
-    telemetry_disabled: true,
-    ...partial,
-  })
+export function standardSeedPolicy(partial = {}, { defaultEnabled = false } = {}) {
+  const telemetryDisabled = defaultEnabled === true ? false : !isTelemetryEnabled(partial)
+  return defaultSeedPolicy({ ...partial, telemetry_disabled: telemetryDisabled })
 }
 
 /**

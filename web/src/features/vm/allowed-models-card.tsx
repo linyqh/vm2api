@@ -3,7 +3,6 @@ import type { Vm } from '@/types/panel-vm'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
 import { catalogForVm, isAntigravityVm, isCodexVm } from '@/lib/vm-kind'
-import { claudeTier } from '@/lib/vm-status'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -64,7 +63,6 @@ function allowedListOf(vm: Vm): string[] | null {
 }
 
 function isChecked(vm: Vm, id: string) {
-  if (isFableId(id) && claudeTier(vm).key === 'pro') return false
   const allowed = allowedListOf(vm)
   if (!allowed) return true
   return allowed.some((a) => matchesAllowedModel(id, a))
@@ -82,7 +80,6 @@ function NativeAllowedModelsCard({ vm }: { vm: Vm }) {
   const qc = useQueryClient()
   const me = useQuery(meQueryOptions())
   const canEdit = me.data?.role === 'admin'
-  const pro = claudeTier(vm).key === 'pro'
   const inherit = !allowedListOf(vm)
   const gpt = isCodexVm(vm)
 
@@ -124,18 +121,14 @@ function NativeAllowedModelsCard({ vm }: { vm: Vm }) {
       next = items
         .map((m) => m.id)
         .filter((mid) => {
-          if (pro && isFableId(mid)) return false
           if (mid === id) return checked
           return true
         })
     } else {
       next = toggleAllowedModel(current, id, checked)
-      if (pro) next = next.filter((a) => !isFableId(a))
     }
     // selecting everything is the same as inheriting — store null, not a full list
-    const expected = items
-      .filter((m) => !(pro && isFableId(m.id)))
-      .map((m) => m.id)
+    const expected = items.map((m) => m.id)
     const covers =
       expected.length &&
       expected.every((mid) => next.some((a) => matchesAllowedModel(mid, a)))
@@ -154,7 +147,6 @@ function NativeAllowedModelsCard({ vm }: { vm: Vm }) {
               ? '未限制，继承 GPT 模型矩阵'
               : '未限制，继承全局模型矩阵'
             : '仅下列模型可打入此凭证'}
-          {pro && !gpt ? ' · Pro 账号无 Fable' : ''}
         </p>
         {!canEdit ? (
           inherit ? null : (
@@ -167,14 +159,13 @@ function NativeAllowedModelsCard({ vm }: { vm: Vm }) {
         ) : items.length ? (
           <div className='flex flex-wrap gap-x-4 gap-y-2'>
             {items.map((m) => {
-              const locked = pro && isFableId(m.id)
               const id = `slot-model-${m.id}`
               return (
                 <div key={m.id} className='flex items-center gap-2'>
                   <Checkbox
                     id={id}
                     checked={isChecked(vm, m.id)}
-                    disabled={locked || !canEdit || save.isPending}
+                    disabled={!canEdit || save.isPending}
                     onCheckedChange={(v) => toggle(m.id, v === true)}
                   />
                   <Label

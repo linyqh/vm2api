@@ -32,35 +32,45 @@ VM2API_DB_SECRET='再一串'
 
 KVM 槽需要宿主 `/dev/kvm` 可读写（控制面在容器内时，用一次 `--device /dev/kvm` 的探测容器确认）。runner 降权给槽位用户跑 QEMU 时会带上 `/dev/kvm` 的设备组，属组与槽位主 GID 不同也能用。已有 KVM 槽要更新 `kin-kvm-*` 镜像并重建一次。没有 KVM 时不要在生产打开 `vm.allow_tcg`：那是 TCG 软件模拟，仅供测试。
 
+KVM 的 `kin-guest-exec` 前台命令由调用方控制执行时限，包含官方 Claude Code 初装的 hello / 用量步骤；SSH 建连仍保留 3 秒超时。后台启动（`-d`）保留 8 秒上限，超时返回 `124` 并提示命令启动超时，SSH 失败才提示 `guest ssh unavailable`。修复旧 runner 的前台 8 秒限制需要更新 `docker/kin-kvm` 镜像并在维护窗口按官方流程重建相关 KVM 容器；只升级控制面不会替换已运行容器内的脚本。不要重置或删除槽的家目录、凭据、指纹与虚拟磁盘。
+
 出现 `native stdin: Broken pipe` 时同时检查容器 OOM 事件与 CLI 子进程，不能只看 Rust PID 1 是否存活。CLI 退出或输出管道关闭后，内核必须清零 `cli_pid` / `ready_slots`、终止在途请求并拒绝新任务，由宿主 watchdog 恢复槽；不重放已发送的推理请求。
 
 CRAG V2 的资产、工作区和设备授权目录分别使用 Linux 私有 run 映射下的 `/run/kin/crag-native-assets`、`/run/kin/work`、`/run/kin/crag-license`；配置重写不能改回 DrvFS 家目录。目录归槽 UID 所有、权限 `0700`，设备文件/注册码为 `0600`。本机 Docker 创建 CRAG V2 容器时加载 `src/lib/vm/crag-v2-seccomp.json` 的默认拒绝策略，仅增加 `unshare(0x10020000)` 和 `mount` 标志 `0x44000` / `0x1000` / `0x1021` 所需例外；继续非 root、cap-drop ALL、no-new-privileges，不允许额外网络命名空间。创建/启动流程仅对缺少该策略的旧容器按需保留数据重建，已有精确策略的容器复用；单纯 Docker restart 不会更改 seccomp。不要用 privileged、cap-add SYS_ADMIN 或 seccomp=unconfined 替代。可用 `docker exec <槽容器> unshare --user --map-root-user --mount -- /home/kincli/.kin/crag-v2/claude-code-2.1.321/claude --version` 做无模型流量探针；仅看内核 PID 1 或空闲健康状态不足以证明 CLI 能启动。
 
 挂 `docker.sock`，`network_mode: host`。安装目录不再限定 `/opt/vm2api`：控制面自省 `docker inspect vm2api` 的 Mounts，把槽的 `-v` 源换算成宿主路径；也可用 `VM2API_HOST_ROOT` 显式指定。
 
-「内核」页拉取的二进制以独立缓存发布：默认内核使用 `share/wrap-cli-releases`，CRAG 使用 `share/crag/kernels/v2` 的 packages 子目录及原子 `current-<arch>.json` 指针。完成对应包校验后才切换，保留当前与上一快照；无指针时沿用出厂包，已有指针损坏时拒绝而不静默降级。只读出厂挂载无需改权限。镜像默认的 `KIN_KERNEL_BIN=<项目>/bin/kin-kernel` 支持更新，真正外部自定义路径覆盖仍固定，不会被拉取替换。CRAG 首次信任须由供应方配置完整官方出厂包和发行公钥，后续包必须使用相同发行公钥；发布源缺少授权归档时可继续安装本地有效包，但不能用 legacy ELF 代替。
+「内核」页拉取的二进制以独立缓存发布：默认内核使用 `share/wrap-cli-releases`，CRAG 使用 `share/crag/kernels/v2` 的 packages 子目录及原子 `current-<arch>.json` 指针。完成对应包校验后才切换，保留当前与上一快照；无指针时沿用出厂包，已有指针损坏时拒绝而不静默降级。只读出厂挂载无需改权限。镜像默认的 `KIN_KERNEL_BIN=<项目>/bin/kin-kernel` 支持更新，真正外部自定义路径覆盖仍固定，不会被拉取替换。amd64 镜像首次启动会把镜像内完整签名 CRAG 出厂包校验后落入空的 `share/crag/kernels/v2/amd64`，提供首次信任锚；已有出厂包、下载指针和显式 `KIN_CRAG_V2_ROOT` 覆盖不改写，后续包必须使用相同发行公钥。发布源缺少授权归档时可继续使用本地有效包，但自动获取返回失败，不能用 legacy ELF 代替。
 
 ### CRAG V2 二进制更新
 
-CRAG 签名加密包的附件名为 `crag-v2-licensed-amd64.tar.gz`，包含原版 Claude Code 2.1.321。若 `deploy/payload.json` 固定了 `crag_release`，不指定 tag 时从对应 vm2api Release 拉取配套包；旧版本及显式指定的其他 tag 仍走供应仓 `dofastted/claude-code`。`manifest.version` 的 `v2` 是协议族，实际发行版本见缓存指针的 `release.tag`。原生进程使用非 bare 的 CC TUI。
+vm2api 从自己的公开 payload Release 下载 `crag-v2-licensed-amd64.tar.gz` 签名加密包，无需私有供应仓凭据。「内核」页默认提供 3.1.4 标准版，也可选择 3.1.2、3.1.3 原发行和 Compact 修复版。这些发行使用同一授权身份，已激活的槽不必重新输入许可或增加占位就能升降级。下载只更新共用下载指针，不影响运行中的槽；确认安装后才应用。启用 `CRAGH2` 后不要回滚到 3.1.1 及更早内核。
 
-已有可信出厂包后，可在服务器独立更新，不升级或重启控制面：
+宿主配额按同时运行和正在启动的订阅槽计算，不按已下载的版本数计算。原槽更新只占一个位置；正式停机后保留原绑定，其他槽需要座席时才回收已确认停止且不在操作中的 `CRAGH2` 座席。机况未知不算已停止；`CRAGH1` 不支持回收。单设备许可不消耗订阅槽。由 vm2api 负责受管 CRAG 的重启，避免 Docker 自行恢复绕过槽位准入。
+
+旧授权资产只作历史恢复：`payload-2026.11.16-crag-3.1.2-legacy` 使用不同载荷密钥，现行官方版本不接受该密钥的历史 `CRAGU1`、`CRAGL1` 或 `CRAGS1`。为仍有效的旧许可可通过明确完整标签保留兼容包；常规更新不会预先重签或撤销旧槽。`manifest.version` 的 `v2` 是协议族，实际下载发行版见指针的 `release.payload_tag`。
+
+amd64 默认一键安装/升级会自动完成出厂包初始化和最新版获取，不需要先在面板手动拉取。也可在服务器独立更新，不升级或重启控制面：
 
 ```bash
-sudo bash /opt/vm2api/deploy/install.sh crag-update --crag-version v2.0.1
-# 省略 --crag-version：拉取应用固定的配套包，未固定时拉供应仓最新版
+sudo bash /opt/vm2api/deploy/install.sh crag-update --crag-version payload-2026.11.17-crag-3.1.4
+# 仅用于历史授权恢复；正常面板版本列表不提供这个版本
+sudo bash /opt/vm2api/deploy/install.sh crag-update --crag-version payload-2026.11.16-crag-3.1.2-legacy
+# 省略 --crag-version：从 vm2api 公开 payload Release 选最新完整签名包
 sudo bash /opt/vm2api/deploy/install.sh crag-update
 ```
 
-需要包含 `scripts/update-crag.mjs` 的消费端源码/镜像；只下载一个新版 shell 到旧镜像不足以补齐 Node 更新器。支持已有 Docker 控制面和主机 Node 部署；读取进程环境或 `.env` 的 `VM2API_API_KEY` / `KIN_API_KEY`。无 `.env` 的主机 systemd 部署可由 root 从既有 `vm2api.service` 进程环境读取 key/port，不复制或打印完整环境；也可用进程环境 `PORT` 指定本地控制面端口。普通 `install` / `upgrade` 发现可信 CRAG 出厂包时也执行该步骤；`--no-start` / `--no-sync-wrap` 跳过，显式 `crag-update --no-start` 报错。
+需要包含 `scripts/seed-crag.mjs`、`scripts/update-crag.mjs` 的消费端源码/镜像；只下载一个新版 shell 到旧镜像不足以补齐 Node 更新器。支持已有 Docker 控制面和主机 Node 部署；读取进程环境或 `.env` 的 `VM2API_API_KEY` / `KIN_API_KEY`。无 `.env` 的主机 systemd 部署可由 root 从既有 `vm2api.service` 进程环境读取 key/port，不复制或打印完整环境；也可用进程环境 `PORT` 指定本地控制面端口。普通 amd64 `install` / `upgrade` 即使没有 CRAG 缓存也执行获取；`--no-start` / `--no-sync-wrap` 跳过，显式 `crag-update --no-start` 报错。当前 CRAG 发行包仅支持 amd64，ARM64 一键安装明确提示并跳过 CRAG 获取，不影响原有安装路径。缺少有效出厂包时，拉取只信任随官方 vm2api 交付的 `deploy/payload.json` 固定公钥摘要；未携带此摘要的部署仍需可信出厂包。
 
-更新顺序：供应仓完整包下载和原信任锚签名/成员 SHA/ELF 校验 → 原子切换下载指针 → 全槽清点 → 检查已有 CRAG V2 槽 → 有变化时以唯一标记暂停调度并排空在途请求 → 确认原生 `active_requests`、`queued`、`continuations` 全为 0 → 受管同步/必要时重载对应槽 → 核验实际运行 memfd SHA 与签名 payload 承诺一致。安装目录哈希相同不能视为已更新运行进程。
+更新顺序：从 vm2api 公开 Release 下载完整包，以原信任锚校验签名、成员 SHA 与 ELF → 原子切换下载指针 → 全槽清点 → 检查已有 CRAG V2 槽 → 有变化时以唯一标记暂停调度并排空在途请求 → 确认原生 `active_requests`、`queued`、`continuations` 全为 0 → 受管同步或重载对应槽 → 核验运行中 memfd 的 SHA 与签名 payload 承诺一致。安装目录哈希相同不能证明运行进程已更新。
 
 不改变内核选择：CRAG V2 槽更新运行内核；已停止槽只更新磁盘，不开机；非 CRAG 本地槽若留有 `crag-v2` 缓存，仅原子更新该目录，不碰 wrapper、配置和进程；无副本的槽、Codex 槽不安装 CRAG。非 CRAG 集群槽标为 skip，不宣称替换其远端文件；当前物化器不支持的集群/KVM CRAG V2 目标在下载/停调度前失败。报告逐槽列出 `sync` / `cache` / `skip`。
 
 下载或信任校验失败不覆盖旧包、不停槽；未完成工具续接时拒绝强制重启。更新锁为 `share/crag/kernels/v2/.update-lock`，并发更新失败；强杀后须先确认无更新进程再清理锁。调度 hold 使用本次唯一 `crag_update_*` 标记，正常退出时只恢复自己的 hold；断电/强杀不承诺自动恢复。失败返回非零，不伪装成功。回滚用保留的前一完整包，仍须验证原发行公钥、空闲/续接状态并显式重载；禁止轮换授权身份、用 legacy ELF 降级或仅改指针后宣称已回滚。
 
-新重装接口在替换文件前停止对应服务，设置 Docker restart policy 为 no 并持久化 stopped/调度关闭，完成后不会自动开机。显式启动再恢复正常策略；重装不删除容器、家目录、凭据、指纹或工作区。
+当前重装接口在同一槽生命周期锁内排空请求、停止服务、关闭 Docker 自动重启、替换文件并验证重启；成功报告 `restarted: true`、`stopped: false`、`status: running`，无需再发一次启动请求。失败可能保持 stopped，须按逐槽错误和实际运行状态处理，不能用 HTTP 200 判断成功。较旧控制面可能只安装并保持停止，按实际部署版本核对；详见[托管节点内核排障与验收](managed-kernel-troubleshooting.md)。安装不主动重置家目录、凭据、指纹或工作区；启动阶段若需更新容器布局可能保留持久目录重建，不能承诺容器 ID 恒定。
+
+CRAG 历史密钥不匹配且无法安全迁移时，在停槽前拒绝安装。
 
 ## 安装
 
@@ -141,6 +151,8 @@ kin-<槽> 容器 → keg* 网桥 → 宿主机 kin-egress（网关 IP:端口）�
 本机 SOCKS5 槽位（Docker / KVM）的重启策略为 `no`：由控制面的内核自动恢复流程负责进程崩溃和开机恢复，Docker 不再独立启动槽位。控制面启动时通过现有自动恢复流程，先安装阻断与代理规则，再启动记录为运行中的槽位；如果控制面启动失败、代理不可用或关闭了内核自动恢复，槽位保持停止，需恢复控制面或在面板手动启动。暂停的槽位不会被开机恢复。本地直连出口和远端节点的启动策略不变。
 
 升级时控制面会用 `docker update --restart no` 原地迁移已有本机代理槽位（包括暂停槽位的容器），不重建槽位、不改凭据。请先升级并确认控制面成功启动，再重启 Docker。迁移失败会阻止控制面启动并打印错误；不能仅凭版本号认定已启用保护。该保护针对 Docker 守护进程重启；不要手工 `docker start` 代理槽位或清除其防火墙规则，`live-restore` 场景也不在此启动顺序保证范围内。
+
+宿主机 `kin-egress` 的运行方式（v1.4.134 起）：控制面在 Docker 中运行（compose 设置 `VM2API_CONTAINER_NAME` 并挂载 `docker.sock`）时，每个代理的 `kin-egress` 作为独立的 host 网络容器 `kin-cp-egress-<代理>`（`--restart unless-stopped`）运行，控制面重启不会打断槽位 DNS；其他情况作为控制面子进程运行。可用 `KIN_EGRESS_RUNTIME=process|container` 强制指定。从容器方式切回进程方式时，控制面会先删除同一代理遗留的 `kin-cp-egress-*` 容器再占用端口；降级到 v1.4.133 及更早版本前，请先执行 `docker ps -aq --filter name=kin-cp-egress- | xargs -r docker rm -f`，否则旧版本看不到这些容器的进程，会一直等待端口释放。
 
 控制面用 iptables 把容器的 TCP 和 DNS 重定向到宿主机上的 `kin-egress`。这一跳的目的地是宿主机本身，要经过宿主机 **INPUT** 链。UFW 默认入站 `DROP`，而 vm2api 不改你的 INPUT 规则，所以需要手动放行：
 
@@ -271,6 +283,16 @@ sudo bash /opt/vm2api/deploy/install.sh check
 ```
 
 面板：`GET /api/panel/version`、`GET /api/panel/changelog`、`POST /api/panel/update`。确认更新后，控制面会通过已挂载的 `docker.sock` 自省当前 Compose 项目和全部配置文件，拉起独立升级助手。助手记录更新前正常运行的槽位，按源码/镜像模式更新，保留已有 `src/config` 配置并 `--force-recreate` 控制面；通过健康检查、版本接口和槽位详情接口确认后端版本正确、此前健康的槽内内核仍能通过控制面鉴权，完成后才报告成功。忙碌但进程健康的槽位不视为故障；更新前已故障或停止的槽位不计入本次回归检查。助手失败时保留 `docker logs vm2api-upgrade-<project>`；容器里没有可识别的 Compose 服务时返回 `409 host_upgrade_required`，响应里带同一条 curl 命令。槽位内核健康检查不调用模型，不消耗上游额度。
+
+CRAG 订阅使用宿主 ID，不使用容器自己的机器 ID、网卡地址或每次启动随机生成的值。Linux 原生控制面依次读取 `/etc/machine-id` 和 `/var/lib/dbus/machine-id`；也可通过 `KIN_CRAG_HOST_ID_FILE` 指定可信的宿主 ID 文件。已有订阅继续使用原有 ID 摘要；如果多个 Linux 来源中存在与原订阅匹配的值，优先保留原绑定。
+
+Docker 的宿主 ID 文件须只读挂载到控制面的 `/run/crag-host-machine-id`。从宿主运行新版 `deploy/install.sh` 时，Linux（含 ARM64）优先使用原有 machine ID，其次使用 D-Bus、DMI UUID 或设备树序列号；macOS 的 Docker Desktop 场景由宿主通过 `ioreg` 读取 `IOPlatformUUID`，不使用 Desktop Linux 虚拟机的 ID。DMI、设备树和 macOS 使用安装目录中的固定快照，不会在检测到不同宿主时覆盖。Docker Desktop/WSL 共享文件即使显示为合成权限，也必须能核实该文件在容器内实际是只读挂载。这里支持的是 macOS 宿主采集和 Linux 容器内的订阅，不代表所有槽位运行时可原生运行在 macOS。
+
+手动部署可先在宿主运行 `sudo bash deploy/install.sh prepare-crag-host --dir <安装目录>`。这一步不重启服务；新版 Compose 从 `.env` 的 `VM2API_CRAG_HOST_ID_FILE` 读取挂载源（默认 `/etc/machine-id`）。自定义或旧 Compose 必须对齐该挂载后，仅重建控制面。面板镜像升级助手会补齐缺失挂载，但不会覆盖已有自定义挂载或替宿主采集 ID。
+
+如果原来曾用不同来源完成付款或绑定，请先恢复原来的宿主 ID 来源，再用同一浏览器操作原订单；不要删除订阅数据或重新付款。订单和授权私有目录仍须位于控制面可验证的 Linux 本地文件系统；Docker Desktop 的桌面共享目录可能不满足要求，新的安装可将控制面的 `data` 放在 Docker Linux VM 内的本地卷。已有订单迁移时必须一并保留原收据密钥，不要直接用空卷替换现有数据。
+
+如果服务健康但本机 CRAG 订阅显示「状态不可用」，用 `namei -l` 核对实际数据目录的每级父目录。CRAG 会拒绝组或其他用户可写的父目录；确认安装根目录无需组写权限后，只移除该目录的组写位，不要递归修改数据目录和槽位权限。
 
 ## 已部署机升级到 1.2.22
 
@@ -609,3 +631,26 @@ curl -sS -X POST http://127.0.0.1:8787/api/panel/wrap-cli/sync \
 ---
 
 交流见仓库 [README](../README.md)。
+
+### Ubuntu AppArmor 与 Docker 原生 Claude
+
+在 `kernel.apparmor_restrict_unprivileged_userns=1` 的宿主上，单独设置
+`apparmor=unconfined` 仍可能使原生 Claude 在创建 user/mount namespace 后进入
+`unprivileged_userns` 限制，导致 bind mount 返回 `Permission denied (os error 13)`。
+
+安装/升级脚本在启动控制面前，加载并持久保存 `vm2api-crag-docker` AppArmor
+profile，显式允许 `userns`。不关闭宿主 sysctl，不授予槽位 privileged 或额外
+capability，现有 seccomp 和 `no-new-privileges` 保持不变。策略检查或加载失败会
+终止安装，并保留错误信息；已有同名非托管策略不会被覆盖。
+
+手动 Compose 部署需先在 **Docker 宿主机** 执行新版本安装脚本中的准备命令：
+
+```bash
+sudo bash deploy/install.sh prepare-native
+```
+
+随后更新控制面，并通过面板重载正在使用的 CRAG v2 槽位。Docker restart 无法
+更改 AppArmor profile；旧 `unconfined` 槽位会在正常重载/启动路径中重建。
+已停用槽位不会由准备命令启动，在下次手动启动时应用新配置。profile 未加载时
+Docker 会明确拒绝创建槽位，不退回 `unconfined`。命令必须在 Docker daemon
+所在宿主执行，不能在控制面容器或远端 Docker 客户端机器上执行。

@@ -68,6 +68,7 @@ const RESTRICTED_SLOT = [
   },
   { match: /^node_offline$/, text: '节点离线' },
   { match: /^kernel_faulted$/, text: '内核故障' },
+  { match: /^license_crag_host_over_quota$/, text: '宿主订阅满额' },
   { match: /^worker_unhealthy$/, text: '槽服务异常' },
   { match: /^maintenance$/, text: '维护中' },
   { match: /^rest_period$/, text: '休息时段' },
@@ -79,6 +80,7 @@ const RESTRICTED_NEW_SESSION = [
   { match: /^gate_(5h|7d)_draining$/, text: '临近闸线', soft: true },
   { match: /^seats_full$/, text: '席位满', soft: false },
   { match: /^sessions_full$/, text: '对话窗口满', soft: false },
+  // Machine memory (host-memory-pressure.mjs): tight still takes new conversations when no machine has room.
 ]
 
 /**
@@ -87,13 +89,13 @@ const RESTRICTED_NEW_SESSION = [
  * request waits, and local transport errors.
  */
 const STATELESS = [
-  /^(distill_blocked|policy_blocked|refusal_guard|hard_regex.*|jev.*|decision_model.*)$/,
-  /^(content_filter_refusal|content_policy_refusal|usage_policy_refusal|invalid_request|entitlement_required|http_\d+)$/,
+  /^(distill_blocked|policy_blocked|crag_policy_blocked|crag_opaque_429|refusal_guard|hard_regex.*|jev.*|decision_model.*)$/,
+  /^(content_filter_refusal|content_policy_refusal|usage_policy_refusal|third_party_client|invalid_request|entitlement_required|http_\d+)$/,
   /_repairable$/,
   /^(concurrency_limit|concurrency_disabled|rpm_limit|slot_busy|quota_band_inflight|refresh_pending)$/,
-  /^(model_cooldown|fable_cooldown|fable_concurrency|fable_timeout|fable_plan_denied|fable_rate_limited|fable_requires_max|model_not_allowed|platform_mismatch|codex_vm)$/,
-  /^(quota_guard_request_too_large|no_eligible_accounts|pool_overload_cooldown|pool_rate_limited|vm_unschedulable)$/,
-  /^(wrap_connection_error|worker_transport_failure|worker_timeout|upstream_network_error|stream_interrupted|empty_response|incomplete_assistant|downstream_committed_or_incomplete|provider_timeout|client_cancelled|oauth_unconfirmed)$/,
+  /^(model_cooldown|fable_cooldown|fable_concurrency|fable_timeout|fable_plan_denied|fable_credits_required|fable_rate_limited|fable_requires_max|model_not_allowed|platform_mismatch|codex_vm)$/,
+  /^(quota_guard_request_too_large|no_eligible_accounts|pool_overload_cooldown|pool_rate_limited|rate_limited_request|vm_unschedulable)$/,
+  /^(wrap_connection_error|worker_transport_failure|worker_timeout|worker_process_exit|upstream_network_error|stream_interrupted|empty_response|incomplete_assistant|downstream_committed_or_incomplete|provider_timeout|client_cancelled|oauth_unconfirmed)$/,
   // Seat placement labels (why this VM was picked), not a slot condition.
   /^sticky$/,
 ]
@@ -151,6 +153,10 @@ export const CLEAR_BY = Object.freeze([
   'proxy_rebind',
   'recover_ok',
   'credential_present',
+  // A stale runtime_start_failed lock while the kernel probes healthy is a
+  // leftover from a start attempt that timed out on a flaky node link — the
+  // container never died. Health is a fact, not a verdict, same as above.
+  'runtime_recovered',
 ])
 
 // ---------------------------------------------------------------------------
@@ -173,7 +179,7 @@ export function deriveScheduleFields(vm, { preserveStatus = true } = {}) {
   const schedulable = !off && !bad && !hold
   vm.schedulable = schedulable
   vm.schedule_manual = off
-  vm.schedule_disabled_reason = off ? vm.schedule_off_reason || 'disabled' : bad || hold || null
+  vm.schedule_disabled_reason = bad || (off ? vm.schedule_off_reason || 'disabled' : hold || null)
   const status = String(vm.status || '').toLowerCase()
   if (schedulable && status === 'paused') vm.status = 'running'
   if (!preserveStatus && !schedulable && status === 'running') vm.status = 'paused'
@@ -346,10 +352,13 @@ export function resolveSlotState({
     unschedulable_reason: reason,
     unschedulable_text: textOf(reason),
   })
-  if (vm.schedule_off === true || (vm.schedulable === false && vm.schedule_manual === true && !vm.unschedulable)) {
+  // A recorded deterministic failure (revoked, org disabled, …) outranks the
+  // operator's 调度关: a dead slot parked in 关闭调用 looks like a healthy one
+  // waiting to be switched back on.
+  if (vm.unschedulable?.reason) return unschedulable(vm.unschedulable.reason)
+  if (vm.schedule_off === true || (vm.schedulable === false && vm.schedule_manual === true)) {
     return { ...base, schedule_state: 'off' }
   }
-  if (vm.unschedulable?.reason) return unschedulable(vm.unschedulable.reason)
   // A record not yet migrated: its legacy reason decides.
   if (vm.schedulable === false && !vm.schedule_hold) {
     const legacy = stateOfReason(vm.schedule_disabled_reason)

@@ -1,3 +1,5 @@
+import { cragShopRoute } from './crag-shop.mjs'
+
 /**
  * Panel RBAC.
  *
@@ -26,11 +28,12 @@ export const PANEL_VIEWS = [
   'users',
   'wrap',
   'billing',
+  'crag-subscription',
 ]
 
 const ROLE_VIEWS = {
-  user: ['vm', 'keys', 'billing', 'logs', 'statistics'],
-  super: ['overview', 'cluster', 'logs', 'statistics', 'vm'],
+  user: ['vm', 'keys', 'billing', 'logs', 'statistics', 'crag-subscription'],
+  super: ['overview', 'cluster', 'logs', 'statistics', 'vm', 'crag-subscription'],
   admin: PANEL_VIEWS.slice(),
 }
 
@@ -175,6 +178,7 @@ function userVmPathAllowed(method, path) {
       rest === 'schedulable' ||
       rest === 'cooldown/clear' ||
       rest === 'circuit/reset' ||
+      rest === 'usage/query' ||
       rest === 'probe' ||
       rest === 'test-chat' ||
       rest === 'count-tokens' ||
@@ -224,6 +228,10 @@ export function authorizePanelRoute(method, path, role) {
   if (r === 'admin') return { ok: true, role: r }
   const m = String(method || 'GET').toUpperCase()
   const p = String(path || '')
+
+  const shopRoute = cragShopRoute(m, p)
+  if (shopRoute === 'apply-renewal') return { ok: false, role: r, code: 'forbidden', message: 'Forbidden' }
+  if (shopRoute) return { ok: true, role: r }
 
   if (/^\/api\/panel\/vms\/[^/]+\/migration(?:\/|$)/.test(p)) {
     return { ok: false, role: r, code: 'forbidden', message: '只有管理员可以迁移槽位' }

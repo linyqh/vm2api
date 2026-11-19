@@ -1,11 +1,12 @@
 export type KeyGroupType =
-  'all' | 'anthropic' | 'openai' | 'antigravity' | 'pool'
+  'all' | 'anthropic' | 'openai' | 'antigravity' | 'gemini' | 'pool'
 
 export const KEY_ALLOWED_MODELS_MAX = 200
 
 export type KeyLimitsDraft = {
   name: string
   category: 'oauth' | 'api'
+  api_endpoint_id?: string
   max_concurrency: number
   quota_requests: number
   quota_usd: number
@@ -37,7 +38,12 @@ export function parseModelList(text: string): string[] {
 }
 
 function groupTypeOf(value: string): KeyGroupType {
-  if (value === 'anthropic' || value === 'openai' || value === 'antigravity')
+  if (
+    value === 'anthropic' ||
+    value === 'openai' ||
+    value === 'antigravity' ||
+    value === 'gemini'
+  )
     return value
   return 'all'
 }
@@ -57,8 +63,16 @@ export function keyLimitsPayload(
     rpm: nonNegative(draft.rpm, 'RPM'),
   }
   const isApi = draft.category === 'api'
+  if (draft.group_type === 'gemini' && (!isAdmin || isApi)) {
+    throw new Error('Gemini 平台只允许管理员创建宿主机 OAuth 密钥')
+  }
   // API 直连不经过槽位，只有管理员可以设置
   if (isAdmin) body.category = draft.category
+  if (isAdmin && isApi && draft.api_endpoint_id !== undefined) {
+    const endpointId = draft.api_endpoint_id.trim()
+    if (mode === 'create' && !endpointId) throw new Error('请选择 API 渠道')
+    body.api_endpoint_id = endpointId || null
+  }
   if (isAdmin && draft.group_type === 'pool') {
     const vm_pool_id = String(draft.vm_pool_id || '').trim()
     if (!vm_pool_id) throw new Error('选择一个账号池')
@@ -68,10 +82,15 @@ export function keyLimitsPayload(
   } else {
     const group_type = groupTypeOf(draft.group_type)
     const allowed_vms =
-      group_type === 'all'
+      group_type === 'all' || group_type === 'gemini'
         ? []
         : [...new Set(draft.allowed_vms.map((id) => id.trim()).filter(Boolean))]
-    if (!isApi && group_type !== 'all' && allowed_vms.length === 0) {
+    if (
+      !isApi &&
+      group_type !== 'all' &&
+      group_type !== 'gemini' &&
+      allowed_vms.length === 0
+    ) {
       throw new Error('至少选择一台 VM')
     }
     body.group_type = group_type

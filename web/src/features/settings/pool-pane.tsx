@@ -428,6 +428,7 @@ export function PoolPane({
   pending = false,
 }: PoolPaneProps) {
   const strategy = pool.strategy === 'fill' ? 'fill' : 'balanced'
+  const resetPriority = pool.reset_priority !== false
   const seatCap = Math.min(
     SEAT_CAP_MAX,
     Math.max(1, numOf(inference, 'session_slots', SEAT_CAP_MAX))
@@ -499,9 +500,13 @@ export function PoolPane({
     if (open === 'strategy') {
       onPoolChange({
         strategy: poolDraft.strategy,
+        reset_priority: poolDraft.reset_priority !== false,
       })
     } else if (open === 'seats') {
-      onInferenceChange({ session_slots: inferenceDraft.session_slots })
+      onInferenceChange({
+        session_slots: inferenceDraft.session_slots,
+        prewarm_enabled: inferenceDraft.prewarm_enabled === true,
+      })
       onPoolChange({
         seat_grace_ms: poolDraft.seat_grace_ms,
         seat_budget_reserve_pct: poolDraft.seat_budget_reserve_pct,
@@ -557,7 +562,7 @@ export function PoolPane({
         <SummaryButton
           icon={Layers}
           title='分配策略'
-          value={strategy === 'fill' ? '填充' : '平衡'}
+          value={`${strategy === 'fill' ? '填充' : '平衡'}${resetPriority ? ' · 临近重置优先' : ''}`}
           desc='Claude 新 session 开席的优先顺序'
           pending={pending}
           disabled={saving}
@@ -654,6 +659,21 @@ export function PoolPane({
                   value={poolDraft.strategy === 'fill' ? 'fill' : 'balanced'}
                   onChange={(next) => updateDraft('pool', { strategy: next })}
                 />
+                <div className='flex items-center justify-between gap-4 rounded-md border px-3 py-2.5'>
+                  <div>
+                    <Label htmlFor='pool-reset-priority'>临近重置优先</Label>
+                    <p className='text-xs leading-5 text-muted-foreground'>
+                      开启：离周额度刷新越近的账号级别越高，先被用掉。关闭：所有自动级别的账号同一级，按上面的策略平均分配。手动级别不受影响。
+                    </p>
+                  </div>
+                  <Switch
+                    id='pool-reset-priority'
+                    checked={poolDraft.reset_priority !== false}
+                    onCheckedChange={(value) =>
+                      updateDraft('pool', { reset_priority: value })
+                    }
+                  />
+                </div>
               </>
             ) : null}
             {open === 'seats' ? (
@@ -689,6 +709,22 @@ export function PoolPane({
                         numOf(inferenceDraft, 'session_slots', SEAT_CAP_MAX)
                       )
                     )}
+                  />
+                </div>
+                <div className='flex items-center justify-between gap-4 rounded-md border px-3 py-2.5'>
+                  <div>
+                    <Label htmlFor='crag-prewarm'>CRAG 原生会话预热</Label>
+                    <p className='text-xs leading-5 text-muted-foreground'>
+                      开启后预热可运行槽位的一半，向下取整。VM
+                      内存不足时自动减少；关闭只停用预热，不关闭正常会话。保存后内核空闲时生效。
+                    </p>
+                  </div>
+                  <Switch
+                    id='crag-prewarm'
+                    checked={inferenceDraft.prewarm_enabled === true}
+                    onCheckedChange={(value) =>
+                      updateDraft('inference', { prewarm_enabled: value })
+                    }
                   />
                 </div>
                 <SliderSetting

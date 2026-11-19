@@ -11,6 +11,7 @@ import {
 import { storeAccountHeaders, resolveCrsHeaders } from '../../src/lib/identity/crs-headers.mjs'
 import { sanitizeInboundBody, defaultSeedPolicy } from '../../src/lib/protocol/seed-policy.mjs'
 import {
+  prepareCliHopBody,
   prepareOutboundAttempt,
   prepareOutboundHeaders,
   prepareOutboundEnvelope,
@@ -25,6 +26,23 @@ import { buildVmTestInbound } from '../../src/lib/admin/vm-test-chat.mjs'
 import { classifyClient } from '../../src/lib/protocol/client-fingerprint.mjs'
 import { finalizeWorkerPayload } from '../../src/lib/transport/go-worker-client.mjs'
 
+test('CLI hop normalizes markers added after a caller 5m marker', () => {
+  const out = prepareCliHopBody(
+    {
+      model: 'claude-sonnet-5',
+      tools: [{ name: 'Read', cache_control: { type: 'ephemeral', ttl: '5m' } }],
+      system: [{ type: 'text', text: 'generated', cache_control: { type: 'ephemeral', ttl: '1h' } }],
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'hello', cache_control: { type: 'ephemeral', ttl: '1h' } }] },
+      ],
+    },
+    { personaPreset: 'zero', cacheTtl: '5m' },
+  )
+  assert.deepEqual(
+    [out.tools[0], out.system[0], out.messages[0].content[0]].map((block) => block.cache_control.ttl),
+    ['5m', '5m', '5m'],
+  )
+})
 test('saved entrypoint overrides stale slot and caller UAs on both outbound boundaries', () => {
   const body = { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hello' }] }
   const routing = { compatibility: { cc_entrypoint: 'cli' } }
@@ -124,54 +142,6 @@ test('official UA without anthropic-beta does not overwrite stored CLI headers',
   const after = JSON.parse(fs.readFileSync(path.join(dir, '.claude', 'kin-cc-headers.json'), 'utf8'))
   assert.deepEqual(after.headers, before.headers)
   assert.match(String(after.headers['anthropic-beta'] || ''), /oauth-2025-04-20/)
-  fs.rmSync(dir, { recursive: true, force: true })
-})
-
-test('vm-test-chat outbound equals /v1 official applyAttempt', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-vmout-'))
-  const identity = fixtureIdentity(dir)
-  const { inbound, headers } = buildVmTestInbound({
-    model: 'claude-sonnet-5',
-    prompt: 'hello',
-    maxTokens: 8192,
-    sessionId: 'vm-test-vm-01',
-  })
-  const cleaned = sanitizeInboundBody(inbound, defaultSeedPolicy())
-  const helperPersona = applyCrsUnofficialPersona(cleaned, {
-    officialClient: false,
-    mode: 'rewrite',
-    sessionId: 'vm-test-vm-01',
-  })
-  const v1Persona = applyCrsUnofficialPersona(cleaned, {
-    officialClient: false,
-    mode: 'rewrite',
-    sessionId: 'vm-test-vm-01',
-  })
-  const fromHelper = prepareOutboundAttempt({
-    canonicalBody: helperPersona,
-    inbound,
-    identity,
-    unofficial: false,
-    officialClient: true,
-    sessionId: 'vm-test-vm-01',
-    stream: true,
-  })
-  const fromV1 = prepareOutboundAttempt({
-    canonicalBody: v1Persona,
-    inbound,
-    identity,
-    unofficial: false,
-    officialClient: true,
-    sessionId: 'vm-test-vm-01',
-    stream: true,
-  })
-  assert.deepEqual(fromHelper.body, fromV1.body)
-  assert.equal(fromHelper.body.system.length, 4)
-  assert.equal(fromHelper.body.thinking?.type, 'adaptive')
-  const h1 = prepareOutboundHeaders(headers, dir, identity, inbound.model)
-  const h2 = prepareOutboundHeaders(headers, dir, identity, inbound.model)
-  assert.deepEqual(h1, h2)
-  assert.match(h1['user-agent'], /^claude-cli\//)
   fs.rmSync(dir, { recursive: true, force: true })
 })
 

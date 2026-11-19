@@ -32,8 +32,12 @@ export const REMOTE_KERNEL_ENTRY = `${REMOTE_LIVE_DIR}/kin-kernel`
 export const REMOTE_CLI_NODE_BIN = `${REMOTE_LIVE_DIR}/cli-node`
 export const REMOTE_CC_NODE_BIN = `${REMOTE_LIVE_DIR}/cc-node`
 export const REMOTE_CRAG_ENTRY = `${REMOTE_LIVE_DIR}/crag-kernel`
-export const REMOTE_CRAG_CLAUDE = `${REMOTE_LIVE_DIR}/crag-v2/claude-code-2.1.321/claude`
-export const LOCAL_CRAG_CLAUDE = '/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude'
+// The crag v2 entrypoint is version-locked: payload ships exactly this build
+// (share/crag/kernels/v2/<arch>/claude-code-<version>/claude), so the version is
+// known from the path and never has to be read back off the CLI.
+export const CRAG_CLAUDE_VERSION = '2.1.321'
+export const REMOTE_CRAG_CLAUDE = `${REMOTE_LIVE_DIR}/crag-v2/claude-code-${CRAG_CLAUDE_VERSION}/claude`
+export const LOCAL_CRAG_CLAUDE = `/home/kincli/.kin/crag-v2/claude-code-${CRAG_CLAUDE_VERSION}/claude`
 export const CONTAINER_CRAG_V2_CLAUDE = LOCAL_CRAG_CLAUDE
 
 export const KERNEL_NATIVE_SLOT_COUNT = 20
@@ -132,6 +136,7 @@ export function normalizeInferenceConfig(raw = {}) {
     health_ttl_ms: optionalTtlMs(raw.health_ttl_ms, 2000),
     tcp_nodelay: optionalBool(raw.tcp_nodelay, true),
     session_slots: normalizeSessionSlots(raw.session_slots),
+    prewarm_enabled: raw.prewarm_enabled === true,
     session_idle_ttl_seconds: normalizeSessionIdleTtlSeconds(raw.session_idle_ttl_seconds),
     dataplane: normalizeKernelDataplane(raw.dataplane),
     crag_kernel_version: normalizeCragKernelVersion(raw.crag_kernel_version) || 'v2',
@@ -192,11 +197,17 @@ export function resolveCragKernelVersion(vm, routing = {}) {
   return 'v2'
 }
 
-/** Terminal and OAuth must run the same CLI family as the selected kernel. */
+/** Resolve the CLI that serves inference for this kernel; native OAuth is independent. */
 export function resolveSlotClaude(vm, routing = {}, host = {}) {
   const dataplane = resolveKernelDataplane(vm, routing)
   const native = dataplane === 'crag' && resolveCragKernelVersion(vm, routing) === 'v2'
-  if (native) return { bin: host.bakedKernel ? REMOTE_CRAG_CLAUDE : LOCAL_CRAG_CLAUDE, native: true }
+  if (native) {
+    return {
+      bin: host.bakedKernel ? REMOTE_CRAG_CLAUDE : LOCAL_CRAG_CLAUDE,
+      native: true,
+      version: CRAG_CLAUDE_VERSION,
+    }
+  }
   return {
     bin: dataplane === 'wrap' ? host.bins?.cli || CONTAINER_CLI_NODE_BIN : host.bins?.cc || CONTAINER_CC_NODE_BIN,
     native: false,
@@ -399,6 +410,9 @@ export function validateInferenceRoutingPatch(body = {}) {
     if (!Number.isInteger(n) || n < SESSION_SLOT_MIN || n > SESSION_SLOT_MAX) {
       errors.push(`inference.session_slots 必须是 ${SESSION_SLOT_MIN}–${SESSION_SLOT_MAX} 的整数`)
     }
+  }
+  if (Object.hasOwn(body.inference, 'prewarm_enabled') && typeof body.inference.prewarm_enabled !== 'boolean') {
+    errors.push('inference.prewarm_enabled 必须是布尔值')
   }
   if (Object.prototype.hasOwnProperty.call(body.inference, 'session_idle_ttl_seconds')) {
     const n = body.inference.session_idle_ttl_seconds
