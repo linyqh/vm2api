@@ -326,10 +326,8 @@ H1 删除已绑定槽时，控制面保留最小私有回收记录，只有严�
 | `websocket.enabled` | `true` | 全局推理 WS 总闸，不影响面板终端或集群连接 |
 | `codex.websocket.enabled` | `true` | GPT 推理 WS 子闸；必须与总闸同时开启 |
 | `codex.upstream_transport` | `prefer_websocket` | `prefer_websocket` 或 `http`；入站与上游传输不是同一段连接 |
-| `codex.user_agent` | `codex_cli_rs/0.160.0 (linux x86_64)` | 上游客户端画像模板，不读取下游用户的系统信息。`Mac OS x.y.z` 形状的 UA 由每个槽位固定换成一个 macOS 版本（按安装 UUID 选定）；出站 `originator` / `version` 取槽位 UA 的 `名称/版本` 部分，不转发客户端自带的值 |
-| `codex.catalog_client_version` | `auto` | 没有槽位身份时模型目录同步使用的客户端版本；按槽位同步时用该槽 UA 的版本 |
-| `codex.user_agent` | `codex_cli_rs/0.167.1 (linux x86_64)` | 上游客户端画像，不读取下游用户的系统信息；originator/version 由内核按该画像生成，调用方不能覆盖 |
-| `codex.catalog_client_version` | `auto` | 模型目录同步的客户端版本，与推理 UA 分开 |
+| `codex.user_agent` | `codex_cli_rs/0.167.1 (linux x86_64)` | 上游客户端画像模板，不读取下游用户的系统信息。`Mac OS x.y.z` 形状的 UA 由每个槽位固定换成一个 macOS 版本（按安装 UUID 选定）；出站 `originator` / `version` 取槽位 UA 的 `名称/版本` 部分，调用方不能覆盖 |
+| `codex.catalog_client_version` | `auto` | 没有槽位身份时模型目录同步使用的客户端版本，与推理 UA 分开；按槽位同步时用该槽 UA 的版本 |
 | `codex.client_features.enabled` | `false` | 显式开启后上送槽位独立安装 UUID 与官方 `client_metadata`；不使用 VM/硬件指纹 |
 | `codex.analytics.enabled` | `false` | 显式开启后独立上报运行环境 Analytics，不是推理成功的前提 |
 | `codex.model_mappings` | 见下 | 入站 `model` 精确别名 → 上游 GPT id（对标 [codex-proxy-rs `modelMappings`](https://github.com/zyycn/codex-proxy-rs)）；保存后随 `routing.json` 热读，无需重启 Node |
